@@ -1,51 +1,108 @@
-"use client";
+'use client';
 
-import { useState, useEffect } from "react";
-import { generateClient } from "aws-amplify/data";
-import type { Schema } from "@/amplify/data/resource";
-import "./../app/app.css";
-import { Amplify } from "aws-amplify";
-import outputs from "@/amplify_outputs.json";
-import "@aws-amplify/ui-react/styles.css";
+import { useState } from 'react';
 
-Amplify.configure(outputs);
+export default function Home() {
+  const [prompt, setPrompt] = useState('');
+  const [result, setResult] = useState('');
 
-const client = generateClient<Schema>();
+  const generateApp = () => {
+    setResult(`
+Project Request:
 
-export default function App() {
-  const [todos, setTodos] = useState<Array<Schema["Todo"]["type"]>>([]);
+${prompt}
 
-  function listTodos() {
-    client.models.Todo.observeQuery().subscribe({
-      next: (data) => setTodos([...data.items]),
-    });
-  }
+Status:
+✅ Request received.
 
-  useEffect(() => {
-    listTodos();
-  }, []);
-
-  function createTodo() {
-    client.models.Todo.create({
-      content: window.prompt("Todo content"),
-    });
-  }
+Next Step:
+Connect this interface to an AI model (OpenAI, Claude, AWS Bedrock, etc.) so it can generate websites and apps automatically.
+    `);
+  };
 
   return (
-    <main>
-      <h1>My todos</h1>
-      <button onClick={createTodo}>+ new</button>
-      <ul>
-        {todos.map((todo) => (
-          <li key={todo.id}>{todo.content}</li>
-        ))}
-      </ul>
-      <div>
-        🥳 App successfully hosted. Try creating a new todo.
-        <br />
-        <a href="https://docs.amplify.aws/nextjs/start/quickstart/nextjs-app-router-client-components/">
-          Review next steps of this tutorial.
-        </a>
+    <main
+      style={{
+        minHeight: '100vh',
+        background: '#0f172a',
+        color: 'white',
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: '20px',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: '900px',
+          background: '#1e293b',
+          padding: '30px',
+          borderRadius: '20px',
+        }}
+      >
+        <h1
+          style={{
+            fontSize: '40px',
+            marginBottom: '10px',
+            textAlign: 'center',
+          }}
+        >
+          Bright VibeCode AI
+        </h1>
+
+        <p
+          style={{
+            textAlign: 'center',
+            marginBottom: '20px',
+          }}
+        >
+          Describe the website or app you want to build.
+        </p>
+
+        <textarea
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="Example: Build me a hotel booking app with online payments and admin dashboard"
+          style={{
+            width: '100%',
+            height: '200px',
+            padding: '15px',
+            borderRadius: '10px',
+            fontSize: '16px',
+          }}
+        />
+
+        <button
+          onClick={generateApp}
+          style={{
+            marginTop: '20px',
+            width: '100%',
+            padding: '15px',
+            fontSize: '18px',
+            background: '#2563eb',
+            color: 'white',
+            border: 'none',
+            borderRadius: '10px',
+            cursor: 'pointer',
+          }}
+        >
+          Generate App
+        </button>
+
+        {result && (
+          <div
+            style={{
+              marginTop: '20px',
+              background: '#334155',
+              padding: '20px',
+              borderRadius: '10px',
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            {result}
+          </div>
+        )}
       </div>
     </main>
   );
