@@ -138,6 +138,9 @@ function BuilderInner() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewKey, setPreviewKey] = useState(0);
   const [previewLoading, setPreviewLoading] = useState(false);
+  // True when the preview iframe is confirmed to be showing the scaffold/placeholder page.
+  // Blocks "● Live" / "verified" UI and shows a re-generating overlay instead.
+  const [scaffoldDetected, setScaffoldDetected] = useState(false);
 
   // Project sidebar
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
@@ -1803,6 +1806,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     setPreviewTab('preview');
     setPreviewUrl(null);        // clear previous project's URL so progress tracker shows
     setPreviewLoading(false);
+    setScaffoldDetected(false);
     setBuildingProjectName('');
     setResearchActivity(null); // clear research panel when building
     // Store args so the user can click "Retry Build" if the connection drops
@@ -2257,9 +2261,11 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         // targeted → Sonnet minimal patch; broader → Strongest with provider registry context;
         // rewrite → Strongest rewrites the full route with correct provider integration.
         'provider-misconfigured':  ['targeted', 'broader', 'rewrite'],
-        // scaffold-placeholder: the main page is still showing the AI generation loading screen.
-        // The only repair is to regenerate — agent-fix rewrites app/page.tsx with the correct app.
-        'scaffold-placeholder':    ['broader', 'rewrite'],
+        // scaffold-placeholder: the main page is still the "Building your app" placeholder.
+        // NEVER fixable by patching files — the full codebase was not generated.
+        // 'regen'       → full re-generation from original prompt with SONNET
+        // 'regen-strong' → same with STRONGEST if SONNET also failed
+        'scaffold-placeholder':    ['regen', 'regen-strong'],
         'unknown':                 ['cache-clear', 'targeted', 'broader'],
       };
 
@@ -2302,6 +2308,22 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         const passedNow = verifyData.checks.filter(c => c.passed).length;
         const totalChecks = verifyData.checks.length;
         appendLog(`📊 ${passedNow}/${totalChecks} checks passing`);
+
+        // ── 30-second scaffold watchdog ────────────────────────────────────
+        // If iteration 1 gets only timeouts, Next.js is still doing its first compile
+        // (which takes 25–40s). Wait 30s and re-verify BEFORE running any AI fix —
+        // prevents wasting a repair strategy on a transient compile delay.
+        if (iter === 1 && verifyData.checks.length > 0 &&
+            verifyData.checks.every(c => !c.passed && c.rootCause?.kind === 'timeout')) {
+          appendLog('⏳ All checks timed out on first iteration — waiting 30s for Next.js first compile…');
+          narrate(`⏳ Next.js is doing its first compile — waiting up to 30s before verification…`);
+          await new Promise(r => setTimeout(r, 30_000));
+          appendLog('🔄 Re-verifying after first-compile wait…');
+          try {
+            verifyData = await api({ action: 'verify-app', port, projectPath: path });
+            setLastVerification(verifyData);
+          } catch { break; }
+        }
 
         if (verifyData.verified) {
           appendLog('✅ All checks pass');
@@ -2490,6 +2512,84 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           setPreviewKey(k => k + 1);
           browserContextCache = '';
           continue;
+        }
+
+        // ── FIX X: Scaffold placeholder — full re-generation, not a patch ──────
+        // The AI generation placeholder is NOT fixable by agent-fix (which patches
+        // individual files without knowing what the user originally asked for).
+        // The only correct repair is a complete re-generation from the original prompt.
+        const scaffoldErrors = codeErrors.filter(c => c.rootCause?.kind === 'scaffold-placeholder');
+        if (scaffoldErrors.length > 0) {
+          // Remove from codeErrors so FIX D doesn't also process them with agent-fix
+          codeErrors.splice(0, codeErrors.length, ...codeErrors.filter(c => c.rootCause?.kind !== 'scaffold-placeholder'));
+          setScaffoldDetected(true);
+
+          const scaffoldStrategy = consumeStrategy('scaffold-placeholder');
+
+          if (scaffoldStrategy === null) {
+            // Both regen tiers exhausted — this is a hard failure
+            appendLog('❌ All re-generation tiers exhausted — placeholder cannot be replaced');
+            narrate(
+              `❌ **Generation failed** — the preview is still showing a placeholder after multiple attempts.\n\n` +
+              `Please start a new build or rephrase your request. If the problem persists, check that AWS Bedrock is reachable.`
+            );
+            setBuildProgress(p => ({
+              ...p!,
+              step: 'error',
+              message: `❌ ${projectName} — generation incomplete (all re-gen tiers failed)`,
+              logs: [...(p?.logs ?? []), '❌ Scaffold placeholder could not be replaced after SONNET + STRONGEST attempts'],
+            }));
+            break;
+          }
+
+          const regenTier = scaffoldStrategy === 'regen' ? 'SONNET' : 'STRONGEST';
+          appendLog(`🔄 Scaffold detected — re-generating with ${regenTier} from original prompt…`);
+          narrate(
+            `⚠️ Preview is still showing a placeholder page — the app wasn't fully generated. ` +
+            `Re-generating with **${regenTier}** from your original request…`
+          );
+          setBuildProgress(p => ({
+            ...p!,
+            step: 'generating',
+            message: `🔄 Re-generating with ${regenTier}…`,
+            logs: [...(p?.logs ?? []), `🔄 Re-gen ${regenTier}: scaffold placeholder detected, restarting generation`],
+          }));
+
+          try {
+            const regenData = await api({ action: 'generate', messages: conversationHistory, tier: regenTier });
+            if (regenData.success && regenData.projectData && !regenData.scaffoldFallback) {
+              const regenFileCount = regenData.projectData.files?.length ?? 0;
+              appendLog(`✅ ${regenTier} succeeded (${regenFileCount} files) — applying to existing project…`);
+              const applyResult = await api({
+                action: 'apply-generated-files',
+                projectPath: path,
+                files: regenData.projectData.files,
+              });
+              if (applyResult.success && applyResult.filesWritten > 0) {
+                appendLog(`✅ ${applyResult.filesWritten} files written — clearing cache and restarting server…`);
+                narrate(`✅ App re-generated (${regenFileCount} files)! Restarting server with real code…`);
+                await api({ action: 'clear-cache', projectPath: path });
+                setBuildProgress(p => ({ ...p!, step: 'starting', message: '⚙️ Restarting with new app…', logs: p?.logs ?? [] }));
+                const restRegen = await api({ action: 'start-server', projectPath: path, force: true });
+                if (restRegen.port) { port = restRegen.port; setPreviewUrl(`http://localhost:${port}`); }
+                const wRegen = await api({ action: 'wait-for-server', port, timeout: 90000 });
+                if (!wRegen.crashed) {
+                  setScaffoldDetected(false); // server is now running real code — clear overlay
+                  setPreviewLoading(true);    // show loading overlay while new app does first compile
+                  setPreviewKey(k => k + 1); // force iframe to reload with new content
+                }
+                browserContextCache = '';
+                setBuildProgress(p => ({ ...p!, step: 'verifying', message: '🔍 Verification running…', logs: p?.logs ?? [] }));
+                continue;
+              }
+              appendLog('⚠️ apply-generated-files returned 0 files written');
+            } else {
+              appendLog(`⚠️ ${regenTier} returned incomplete output (scaffoldFallback=${regenData.scaffoldFallback})`);
+            }
+          } catch (regenErr) {
+            appendLog(`⚠️ Re-generation error: ${regenErr instanceof Error ? regenErr.message.slice(0, 120) : 'unknown'}`);
+          }
+          continue; // loop picks up 'regen-strong' next
         }
 
         // ── FIX D: Code errors — pick the right strategy per error kind ────
@@ -2685,26 +2785,40 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           (c.passed && c.responsePreview && /Building your app|agent is generating|animate-pulse.*Generat/i.test(c.responsePreview))
         )
       ) ?? false;
-      if (isScaffold || scaffoldCheckFailed) {
+      const finalScaffoldPresent = isScaffold || scaffoldCheckFailed;
+      if (finalScaffoldPresent) {
+        setScaffoldDetected(true);
         healthBlockers.push(
           isScaffold
             ? 'AI generation was incomplete — the app is showing a placeholder page, not the generated application'
             : 'Preview is still showing the generation placeholder — app has not rendered yet'
         );
+      } else {
+        setScaffoldDetected(false); // clear overlay if scaffold is no longer present
       }
 
       // A project is only "verified" if all HTTP checks pass AND the health gate passes
       const isFullyVerified = verifyData.verified && healthBlockers.length === 0;
 
       setBuildDetailStep('complete');
+      // Never use 'done' when the scaffold placeholder is still showing —
+      // that would incorrectly display "Live" and "Build Complete" over a broken preview.
+      // Use 'error' so the UI shows the error state and the user can retry.
+      const finalStep: 'done' | 'error' = finalScaffoldPresent ? 'error' : 'done';
       setBuildProgress({
-        step: 'done',
-        message: isFullyVerified
-          ? `✅ ${projectName} is live and verified!`
-          : healthBlockers.length > 0
-            ? `⚠️ ${projectName} is running — credentials needed`
-            : `⚠️ ${projectName} is running (${passedChecks}/${totalChecks} checks passed)`,
-        logs: [`✅ Running on port ${port}`, ...verifyLogs, ...healthBlockers.map(b => `⚠️ Health gate: ${b}`)],
+        step: finalStep,
+        message: finalScaffoldPresent
+          ? `❌ ${projectName} — preview stuck on placeholder (re-generation failed)`
+          : isFullyVerified
+            ? `✅ ${projectName} is live and verified!`
+            : healthBlockers.length > 0
+              ? `⚠️ ${projectName} is running — credentials needed`
+              : `⚠️ ${projectName} is running (${passedChecks}/${totalChecks} checks passed)`,
+        logs: [
+          finalScaffoldPresent ? '❌ Scaffold placeholder present — re-generation exhausted' : `✅ Running on port ${port}`,
+          ...verifyLogs,
+          ...healthBlockers.map(b => `⚠️ Health gate: ${b}`),
+        ],
         projectName, projectPath: path, port,
       });
 
@@ -2722,7 +2836,17 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         ? `Remaining issues: ${failedChecks.map(c => c.name + (c.error ? ` (${c.error.slice(0, 60)})` : '')).join('; ')}`
         : 'Remaining issues: None';
 
-      if (isFullyVerified) {
+      if (finalScaffoldPresent) {
+        // Scaffold is still showing — generation completely failed
+        narrate(
+          `❌ **Generation failed** — the preview is still showing the "Building your app" placeholder after all repair attempts.\n\n` +
+          `The AI was unable to fully generate your app. Here's what you can do:\n` +
+          `• **Retry** — click "New Build" and describe your app again\n` +
+          `• **Be more specific** — e.g. "A task tracker with a list view, add-task form, and SQLite storage"\n` +
+          `• **Check Bedrock** — if AWS Bedrock is unavailable in your region, generation will always fail\n\n` +
+          `The server is still running at port ${port} if you want to inspect the placeholder.`
+        );
+      } else if (isFullyVerified) {
         const nextStep = `Next step: The preview is live on the right. Click any page to interact with it. Ask me to add features, fix the design, connect a real database, or help with deployment.`;
         narrate(
           `🎉 **${projectName} is live!**\n\n` +
@@ -4014,7 +4138,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                   client-side only
                 </span>
               )}
-              {previewUrl && <span style={{ color: '#4ade80', fontSize: '11px' }}>● Live</span>}
+              {previewUrl && !scaffoldDetected && buildProgress?.step !== 'error' && <span style={{ color: '#4ade80', fontSize: '11px' }}>● Live</span>}
+              {scaffoldDetected && <span style={{ color: '#f59e0b', fontSize: '11px' }}>⚠ Re-generating</span>}
               <span style={{ padding: '1px 6px', borderRadius: '3px', background: '#0c1a2e', border: '1px solid #1e3a5f', color: '#4ade80', fontSize: '10px' }}>
                 Memory Active
               </span>
@@ -4915,7 +5040,23 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                       title="App Preview"
                       onLoad={() => setPreviewLoading(false)}
                     />
-                    {previewLoading && (
+                    {/* Scaffold overlay — shown while the re-generation loop is replacing the
+                        placeholder with real app code. Sits above the iframe so the user
+                        never mistakenly thinks the "Building your app" scaffold is real UI. */}
+                    {scaffoldDetected && buildProgress?.step !== 'error' && (
+                      <div style={{ position: 'absolute', inset: 0, background: 'rgba(7,15,28,0.96)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '18px', zIndex: 20 }}>
+                        <div style={{ width: '44px', height: '44px', border: '3px solid #1e3a5f', borderTop: '3px solid #f59e0b', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+                        <div style={{ textAlign: 'center', maxWidth: '320px' }}>
+                          <div style={{ color: '#fbbf24', fontSize: '14px', fontWeight: '700', marginBottom: '8px' }}>Re-generating your app…</div>
+                          <div style={{ color: '#94a3b8', fontSize: '12px', lineHeight: '1.6' }}>
+                            The preview showed a placeholder — the AI is re-generating your full application now.
+                          </div>
+                          <div style={{ color: '#475569', fontSize: '11px', marginTop: '8px' }}>This may take 30–60 seconds</div>
+                        </div>
+                        <a href={previewUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: '11px', color: '#3b82f6', textDecoration: 'underline' }}>Open raw preview ↗</a>
+                      </div>
+                    )}
+                    {previewLoading && !scaffoldDetected && (
                       <div style={{ position: 'absolute', inset: 0, background: '#070f1c', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', animation: 'slidein 0.3s ease', zIndex: 10 }}>
                         <div style={{ width: '40px', height: '40px', border: '3px solid #1e3a5f', borderTop: '3px solid #3b82f6', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
                         <div style={{ textAlign: 'center' }}>

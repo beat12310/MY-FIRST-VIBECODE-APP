@@ -1384,6 +1384,36 @@ Complete, working, production-quality code. No placeholders.`;
       });
     }
 
+    // ── apply-generated-files: overwrite files in an existing project path ─────
+    // Used by the scaffold re-generation path when the engineering loop detects
+    // that the preview is still showing the "Building your app" placeholder and
+    // needs to apply a freshly generated full codebase to the running project.
+    // Skips lib/managed/* (always correct) and returns count of written files.
+    if (action === 'apply-generated-files') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const genFiles: Array<{ path: string; content: string }> = body.files || [];
+      if (!Array.isArray(genFiles) || genFiles.length === 0) {
+        return NextResponse.json({ success: false, error: 'No files provided' }, { status: 400 });
+      }
+      let filesWritten = 0;
+      const written: string[] = [];
+      const errors: string[] = [];
+      for (const f of genFiles) {
+        if (!f.path || f.content === undefined) continue;
+        if (f.path.startsWith('lib/managed/')) continue; // never overwrite managed services
+        try {
+          const abs = join(projectPath, f.path);
+          await mkdir(dirname(abs), { recursive: true });
+          await writeFile(abs, f.content, 'utf-8');
+          filesWritten++;
+          written.push(f.path);
+        } catch (e) {
+          errors.push(`${f.path}: ${e instanceof Error ? e.message : 'unknown'}`);
+        }
+      }
+      return NextResponse.json({ success: true, filesWritten, written, errors });
+    }
+
     // ── file-create: create a new file in a project ─────────────────────────
     if (action === 'file-create') {
       const { filePath, content: fileContent = '' } = body;
