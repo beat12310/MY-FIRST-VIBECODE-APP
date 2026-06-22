@@ -1802,6 +1802,51 @@ Return ONLY the corrected file in this exact format:
       return NextResponse.json({ success: true });
     }
 
+    // ── timeout-repair: static analysis on a route that hung during verification
+    // Reads the route source, identifies WHERE it hangs, returns structured profile
+    // + engineering memory match. The repair loop uses this to generate a targeted fix
+    // (add AbortSignal timeout, add try/catch, add mock fallback) without guessing.
+    if (action === 'timeout-repair') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { analyzeRouteForTimeout } = await import('@/services/route-timeout-analyzer');
+      const { findMatchingRepair, formatPatternForPrompt } = await import('@/services/engineering-memory');
+
+      const routeRelPath: string = body.routeFile || '';
+      const urlPath: string = body.urlPath || '';
+      if (!routeRelPath) return NextResponse.json({ success: false, error: 'Missing routeFile' }, { status: 400 });
+
+      const absoluteRoutePath = join(projectPath, routeRelPath);
+      const [profile, memoryMatch] = await Promise.all([
+        analyzeRouteForTimeout(absoluteRoutePath, urlPath),
+        findMatchingRepair(`${urlPath} handler hung timeout ${body.errorText ?? ''}`, []),
+      ]);
+
+      const memoryContext = memoryMatch ? formatPatternForPrompt(memoryMatch) : null;
+
+      // Build the full repair prompt so agent-fix gets all the context
+      const agentFixContext =
+        profile.repairContext +
+        (memoryContext ? `\n\n${memoryContext}` : '') +
+        `\n\nTIMING INSTRUMENTATION TO ADD:\n${profile.timingInstrumentation}` +
+        `\n\nMOCK RESPONSE SHAPE (use as fallback when all external APIs unavailable):\n${profile.mockResponseShape}`;
+
+      return NextResponse.json({
+        success: true,
+        profile,
+        memoryMatch: memoryMatch ? {
+          confidence: memoryMatch.confidence,
+          rootCause: memoryMatch.pattern.rootCause,
+          fixApproach: memoryMatch.pattern.fixApproach,
+          successfulTier: memoryMatch.pattern.successfulTier,
+        } : null,
+        memoryContext,
+        agentFixContext,
+        // Quick summary for status display
+        summary: `${profile.primaryCause}: ${profile.hangLocation}`,
+        canSoftPass: profile.canSoftPass,
+      });
+    }
+
     // ── pre-repair-check: diagnose BEFORE touching any files ─────────────────
     // Detects missing packages, route method mismatches, DB init gaps, tsconfig
     // issues, and OCR setup problems. Returns a structured diagnostic so the

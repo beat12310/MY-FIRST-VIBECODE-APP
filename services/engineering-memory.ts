@@ -143,6 +143,83 @@ const BUILTIN_PATTERNS: RepairPattern[] = [
     successfulTier: 'HAIKU',
     successCount: 0,
   },
+
+  // ── Timeout patterns ──────────────────────────────────────────────────────
+  {
+    id: 'platform-proxy-timeout-too-long',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'platform-proxy-timeout|AbortSignal\\.timeout\\(1[5-9]\\d{3}|[2-9]\\d{4}\\)|handler hung.*proxy|Timed out.*proxy',
+    rootCause: 'Platform proxy timeout too long — exceeds 10s verification window',
+    fixApproach:
+      'The route calls the DWOMOH platform proxy with a timeout LONGER than the verification window (10s). ' +
+      'Change: AbortSignal.timeout(15000) → AbortSignal.timeout(4000) on the proxy fetch. ' +
+      'The proxy is a BEST-EFFORT enhancement — if it times out, fall through to the direct API call. ' +
+      'Ensure the platform proxy call is ALWAYS in a try/catch that falls through silently.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+  },
+  {
+    id: 'external-api-timeout-no-abort',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'external-api-timeout|fetch.*without.*timeout|handler hung.*fetch|no timeout.*fetch',
+    rootCause: 'External API fetch() without AbortController — can hang indefinitely',
+    fixApproach:
+      'Every fetch() to an external API MUST have a timeout. ' +
+      'Pattern: const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers }); ' +
+      'Wrap in try/catch: if AbortError, return NextResponse.json({ data: [], _timeout: true }, { status: 503 }). ' +
+      'Add a top-level API key check BEFORE any fetch: if (!key) return NextResponse.json({ data: [], _note: "API not configured" }). ' +
+      'This prevents the route from hanging on every unconfigured request.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'SONNET',
+    successCount: 0,
+  },
+  {
+    id: 'missing-rapidapi-key-timeout',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'RAPIDAPI_KEY.*undefined|Sports API not configured|missing.*api.*key|key.*undefined.*fetch',
+    rootCause: 'RAPIDAPI_KEY not set — route makes external call that may hang or return 401/403',
+    fixApproach:
+      'Add at the top of the route handler (BEFORE any fetch): ' +
+      'const key = process.env.RAPIDAPI_KEY; ' +
+      'if (!key) return NextResponse.json({ matches: [], standings: [], _mock: true, _note: "Configure RAPIDAPI_KEY for live data" }); ' +
+      'This immediately returns mock data instead of hanging on an unauthenticated external call.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+  },
+  {
+    id: 'infinite-retry-loop',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'infinite-retry-loop|while.*true.*fetch|recursive.*retry|handler hung.*retry',
+    rootCause: 'Infinite loop or recursive retry — route never exits',
+    fixApproach:
+      'Replace while(true) retry with a bounded retry: let attempts = 0; while (attempts < 3) { attempts++; ... break; } ' +
+      'Add exponential backoff: await new Promise(r => setTimeout(r, attempts * 500)). ' +
+      'After max retries, return a safe error response instead of throwing.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'SONNET',
+    successCount: 0,
+  },
+  {
+    id: 'database-lock-sqlite',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'database.*locked|SQLITE_BUSY|database-lock|handler hung.*db|db.*timeout',
+    rootCause: 'SQLite database lock — concurrent writes without WAL mode',
+    fixApproach:
+      'Enable WAL mode for concurrent access: db.pragma("journal_mode = WAL"); db.pragma("busy_timeout = 5000"); ' +
+      'Add these pragmas immediately after opening the database connection. ' +
+      'WAL mode allows concurrent reads and prevents "database is locked" errors. ' +
+      'busy_timeout tells SQLite to wait up to 5s before throwing SQLITE_BUSY.',
+    targetFiles: ['lib/managed/db.ts'],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+  },
 ];
 
 // ─── Storage ──────────────────────────────────────────────────────────────────

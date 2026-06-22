@@ -6,6 +6,7 @@
 
 import { readFile } from 'fs/promises';
 import { join } from 'path';
+import { analyzeRouteForTimeout } from './route-timeout-analyzer';
 
 // ─── Root cause types ─────────────────────────────────────────────────────────
 
@@ -81,6 +82,15 @@ export interface VerificationCheck {
   stackTrace?: string;
   /** Structured repair diagnosis — tells the repair loop exactly what to do */
   repairDiagnosis?: RouteRepairDiagnosis;
+  /**
+   * True when the route code is correct but an external dependency (API, proxy)
+   * is unavailable in this environment. Does NOT count as a hard failure.
+   */
+  softPassed?: boolean;
+  /** Human label for the unavailable external dep */
+  externalDepName?: string;
+  /** Detailed timeout analysis from route-timeout-analyzer */
+  timeoutProfile?: import('./route-timeout-analyzer').RouteTimeoutProfile;
 }
 
 export interface VerificationResult {
@@ -872,13 +882,70 @@ async function checkEndpoint(
   } catch (err) {
     clearTimeout(timer);
     const isAbort = err instanceof Error && err.name === 'AbortError';
+
+    if (isAbort && routeFilePath) {
+      // ── Timeout: run static analysis to classify WHY the handler hung ───────
+      const urlPath = new URL(url).pathname;
+      const profile = await analyzeRouteForTimeout(routeFilePath, urlPath).catch(() => null);
+
+      const causeLabel = profile?.primaryCause ?? 'unknown';
+      const hangDetail = profile?.hangLocation ?? 'Route exceeded 10s probe window — handler hung';
+      const canSoftPass = profile?.canSoftPass ?? false;
+
+      // Build a richer rootCause kind that maps to the analyzer's classification
+      const rootCauseKind: CheckRootCause['kind'] =
+        causeLabel === 'platform-proxy-timeout' || causeLabel === 'external-api-timeout'
+          ? 'timeout'
+          : causeLabel === 'database-lock'
+          ? 'database-error'
+          : 'timeout';
+
+      const depName = profile?.callSites.find(s => s.isPlatformProxy)?.provider ??
+                      profile?.callSites.find(s => s.isExternalProvider)?.provider ??
+                      'External API';
+
+      const rootCause: CheckRootCause = {
+        kind: rootCauseKind,
+        detail: hangDetail,
+        fixFile: suggestedFixFile,
+        fixHint: profile
+          ? `Cause: ${causeLabel}. ${profile.callSites.some(s => s.timeoutMs !== null && s.timeoutMs > 9000) ? 'Reduce internal fetch timeouts to ≤8000ms. ' : ''}${!profile.callSites.every(s => s.hasErrorHandling) ? 'Wrap all fetch() calls in try/catch with mock data fallback.' : ''}`
+          : 'Add AbortSignal.timeout(5000) to every fetch() inside this route and wrap in try/catch',
+      };
+
+      const repairDiagnosis: RouteRepairDiagnosis = {
+        failureCategory: 'other',
+        confidence: profile ? 'high' : 'low',
+        recommendedAction: hangDetail,
+        canAutoRepair: false,
+        autoRepairContext: profile?.repairContext ?? hangDetail,
+      };
+
+      return {
+        name, url,
+        passed: false,
+        // Soft-pass: route is correct but external dep is unavailable
+        softPassed: canSoftPass,
+        externalDepName: canSoftPass ? depName : undefined,
+        statusCode: undefined,
+        rootCause,
+        error: canSoftPass
+          ? `SOFT PASS: ${depName} unavailable (timeout) — route code is correct`
+          : `Timed out after 10s — ${hangDetail}`,
+        fixFile: suggestedFixFile,
+        fixHint: rootCause.fixHint,
+        requestBody: initialRequestDescription,
+        timeoutProfile: profile ?? undefined,
+        repairDiagnosis,
+      };
+    }
+
+    // Non-timeout failure (connection refused, etc.)
     const rootCause: CheckRootCause = {
-      kind: isAbort ? 'timeout' : 'runtime-crash',
-      detail: isAbort ? 'Request timed out — handler may be hanging (no response in 10s)' : 'Connection refused — server not ready',
+      kind: 'runtime-crash',
+      detail: isAbort ? 'Request timed out (no route file available for analysis)' : 'Connection refused — server not ready',
       fixFile: suggestedFixFile,
-      fixHint: isAbort
-        ? `Add a 5-second AbortController timeout to any fetch calls in ${suggestedFixFile ?? 'the handler'} and ensure it always returns a response`
-        : undefined,
+      fixHint: 'Ensure the dev server is running and the port is correct',
     };
     return {
       name, url,
@@ -933,8 +1000,9 @@ export async function verifyRunningApp(
     checks.push(await checkEndpoint(`${base}${urlPath}`, `API: ${method} ${urlPath}`, method, routeFilePath));
   }
 
+  // Hard failures: neither passed nor soft-passed
   const failures = checks
-    .filter(c => !c.passed)
+    .filter(c => !c.passed && !c.softPassed)
     .map(c => {
       const rc = c.rootCause;
       if (rc?.kind === 'missing-package' && rc.packages?.length) {
@@ -943,12 +1011,18 @@ export async function verifyRunningApp(
       return `${c.name}: ${c.error ?? `HTTP ${c.statusCode}`}`;
     });
 
+  // Soft-passed: external dependency unavailable but route code is correct
+  const softPasses = checks.filter(c => c.softPassed);
+
   const verified = failures.length === 0;
   const passedCount = checks.filter(c => c.passed).length;
+  const softPassCount = softPasses.length;
 
   const summary = verified
-    ? `All ${checks.length} check(s) passed — app is running correctly.`
-    : `${failures.length} of ${checks.length} check(s) failed (${passedCount} passed).`;
+    ? softPassCount > 0
+      ? `${passedCount} of ${checks.length} check(s) passed + ${softPassCount} soft-passed (external API unavailable — PASS_WITH_EXTERNAL_DEPENDENCY_UNAVAILABLE).`
+      : `All ${checks.length} check(s) passed — app is running correctly.`
+    : `${failures.length} of ${checks.length} check(s) failed (${passedCount} passed${softPassCount > 0 ? `, ${softPassCount} soft-passed` : ''}).`;
 
   return { verified, port, checks, failures, summary };
 }

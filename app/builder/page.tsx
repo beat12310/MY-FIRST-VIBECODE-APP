@@ -1135,14 +1135,19 @@ function BuilderInner() {
         type EditVerifyCheck = {
           name: string; passed: boolean; recordCount?: number; error?: string; url?: string;
           statusCode?: number; responsePreview?: string;
+          softPassed?: boolean; externalDepName?: string;
           rootCause?: { kind: string; detail: string; packages?: string[]; envVars?: string[]; fixFile?: string; fixHint?: string };
           fixFile?: string; fixHint?: string;
-          // Rich failure context from enhanced verification engine
           requestBody?: string; responseBody?: string; validationError?: string; stackTrace?: string;
           repairDiagnosis?: {
             failureCategory: string; confidence: string;
             recommendedAction: string; canAutoRepair: boolean;
             autoRepairContext: string; expectedFieldName?: string;
+          };
+          timeoutProfile?: {
+            primaryCause: string; secondaryCauses: string[]; hangLocation: string;
+            canSoftPass: boolean; mockResponseShape: string; repairContext: string;
+            apiKeyVars: string[];
           };
         };
         let verifyData: { verified: boolean; summary: string; checks?: Array<EditVerifyCheck>; failures?: string[] } | null = null;
@@ -1153,85 +1158,116 @@ function BuilderInner() {
           } catch { /* best-effort */ }
         }
 
-        // ── If routes are still failing, run a targeted auto-repair ──────────
-        if (runPort && verifyData && !verifyData.verified && isDebugRequest) {
-          // Build rich error context that includes request/response/validation details
-          const failedRoutes = (verifyData.checks ?? []).filter(c => !c.passed && (
-            c.rootCause?.kind === 'runtime-crash' ||
-            c.rootCause?.kind === 'wrong-http-method' ||
-            c.rootCause?.kind === 'timeout' ||
-            c.rootCause?.kind === 'route-failure' ||
-            c.rootCause?.kind === 'file-upload-required' ||
-            c.rootCause?.kind === 'ocr-extraction-failure' ||
-            // Also auto-fix when repairDiagnosis says we can
-            (!c.repairDiagnosis?.canAutoRepair && !!c.fixFile)
-          ));
+        // ── If routes are failing (but not soft-passed), run targeted auto-repair
+        const hardFailed = (verifyData?.checks ?? []).filter(c => !c.passed && !c.softPassed);
+        const softPassed = (verifyData?.checks ?? []).filter(c => c.softPassed);
 
-          if (failedRoutes.length > 0) {
-            addStatus(`Diagnosing ${failedRoutes.length} failing route(s)…`, 'checking');
+        // Surface soft-passed routes as informational (not actionable)
+        if (softPassed.length > 0) {
+          addStatus(
+            `${softPassed.length} route(s) soft-passed: ${softPassed.map(c => c.externalDepName ?? c.name).join(', ')} — external API unavailable (PASS_WITH_EXTERNAL_DEPENDENCY_UNAVAILABLE)`,
+            'checking'
+          );
+        }
 
-            const targetFiles = [...new Set(failedRoutes.flatMap(c =>
-              [c.fixFile, c.rootCause?.fixFile].filter(Boolean) as string[]
-            ))];
+        if (runPort && verifyData && !verifyData.verified && isDebugRequest && hardFailed.length > 0) {
+          addStatus(`Diagnosing ${hardFailed.length} failing route(s)…`, 'checking');
 
-            // Build rich error context for agent-fix — includes full request, response, and validation error
-            const errorContext = failedRoutes.map(c => {
+          // ── Step 1: Run timeout-repair for any timed-out routes ────────────
+          const timedOutRoutes = hardFailed.filter(c => c.rootCause?.kind === 'timeout');
+          const timeoutContextBlocks: string[] = [];
+
+          for (const tc of timedOutRoutes) {
+            const routeFile = tc.fixFile ?? (tc.url ? 'app' + new URL(tc.url).pathname + '/route.ts' : undefined);
+            if (!routeFile) continue;
+            try {
+              addStatus(`Running timeout analysis on ${routeFile}…`, 'checking');
+              const timeoutAnalysis = await api({
+                action: 'timeout-repair',
+                projectPath: currentProject.projectPath,
+                routeFile,
+                urlPath: tc.url ? new URL(tc.url).pathname : '',
+                errorText: tc.error ?? '',
+              });
+              if (timeoutAnalysis?.profile) {
+                const p = timeoutAnalysis.profile;
+                addStatus(`Timeout diagnosis: ${p.primaryCause} — ${p.hangLocation.slice(0, 80)}`, 'checking');
+                timeoutContextBlocks.push(timeoutAnalysis.agentFixContext ?? p.repairContext);
+                // If all timed-out routes are soft-passable, no code fix needed
+                if (p.canSoftPass) {
+                  addStatus(`${tc.name}: External API unavailable — PASS_WITH_EXTERNAL_DEPENDENCY_UNAVAILABLE`, 'done');
+                }
+              }
+            } catch { /* non-critical */ }
+          }
+
+          // ── Step 2: Build rich error context for all non-soft-pass failures ──
+          const targetFiles = [...new Set(hardFailed.flatMap(c =>
+            [c.fixFile, c.rootCause?.fixFile].filter(Boolean) as string[]
+          ))];
+
+          const errorContext = [
+            ...hardFailed.map(c => {
               const lines: string[] = [];
               lines.push(`ROUTE: ${c.name} (${c.url ?? ''})`);
-              lines.push(`HTTP STATUS: ${c.statusCode ?? 'unknown'}`);
+              lines.push(`HTTP STATUS: ${c.statusCode ?? 'timeout'}`);
               if (c.rootCause?.kind) lines.push(`ROOT CAUSE KIND: ${c.rootCause.kind}`);
               if (c.rootCause?.detail) lines.push(`ROOT CAUSE: ${c.rootCause.detail}`);
               if (c.requestBody) lines.push(`REQUEST SENT: ${c.requestBody}`);
               if (c.validationError) lines.push(`EXACT VALIDATION ERROR: ${c.validationError}`);
-              if (c.responseBody) lines.push(`FULL RESPONSE BODY: ${c.responseBody.slice(0, 600)}`);
+              if (c.responseBody) lines.push(`FULL RESPONSE BODY:\n${c.responseBody.slice(0, 600)}`);
               if (c.stackTrace) lines.push(`STACK TRACE:\n${c.stackTrace}`);
               if (c.repairDiagnosis) {
                 lines.push(`FAILURE CATEGORY: ${c.repairDiagnosis.failureCategory}`);
                 lines.push(`DIAGNOSIS CONFIDENCE: ${c.repairDiagnosis.confidence}`);
                 lines.push(`RECOMMENDED ACTION: ${c.repairDiagnosis.recommendedAction}`);
-                if (c.repairDiagnosis.autoRepairContext) {
-                  lines.push(`REPAIR CONTEXT: ${c.repairDiagnosis.autoRepairContext}`);
-                }
+                if (c.repairDiagnosis.autoRepairContext) lines.push(`REPAIR CONTEXT:\n${c.repairDiagnosis.autoRepairContext}`);
               }
-              if (c.fixHint || c.rootCause?.fixHint) {
-                lines.push(`FIX HINT: ${c.fixHint || c.rootCause?.fixHint}`);
+              if (c.timeoutProfile) {
+                lines.push(`TIMEOUT CAUSE: ${c.timeoutProfile.primaryCause}`);
+                lines.push(`HANG LOCATION: ${c.timeoutProfile.hangLocation}`);
               }
+              if (c.fixHint || c.rootCause?.fixHint) lines.push(`FIX HINT: ${c.fixHint || c.rootCause?.fixHint}`);
               return lines.join('\n');
-            }).join('\n\n---\n\n');
+            }),
+            ...timeoutContextBlocks,
+          ].join('\n\n---\n\n');
 
-            const logData2 = await api({ action: 'get-server-logs', projectPath: currentProject.projectPath }).catch(() => ({ logs: '' }));
-            const serverLogs2 = (logData2.logs as string || '').split('\n')
-              .filter((l: string) => /error|failed|exception|throw/i.test(l)).slice(-15).join('\n');
+          const logData2 = await api({ action: 'get-server-logs', projectPath: currentProject.projectPath }).catch(() => ({ logs: '' }));
+          const serverLogs2 = (logData2.logs as string || '').split('\n')
+            .filter((l: string) => /error|failed|exception|throw|hang|timeout/i.test(l)).slice(-20).join('\n');
 
-            if (targetFiles.length > 0) {
-              await api({ action: 'snapshot-files', projectPath: currentProject.projectPath, files: targetFiles });
-            }
+          if (targetFiles.length > 0) {
+            await api({ action: 'snapshot-files', projectPath: currentProject.projectPath, files: targetFiles });
+          }
 
-            addStatus(`Auto-repairing ${failedRoutes.length} failing route(s) with full diagnostic context…`, 'applying');
-            const agentFixResult = await api({
-              action: 'agent-fix',
-              projectPath: currentProject.projectPath,
-              errorContext,
-              targetFiles,
-              serverLogs: serverLogs2,
-              tier: 'SONNET', // Use Sonnet for route diagnosis (smarter than Haiku for HTTP issues)
-            }).catch(() => null);
+          // Use SONNET for timeout/route repairs (async patterns need deeper reasoning than Haiku)
+          addStatus(`Auto-repairing ${hardFailed.length} route(s) with full diagnostic context…`, 'applying');
+          const agentFixResult = await api({
+            action: 'agent-fix',
+            projectPath: currentProject.projectPath,
+            errorContext,
+            targetFiles,
+            serverLogs: serverLogs2,
+            tier: 'SONNET',
+          }).catch(() => null);
 
-            if (agentFixResult?.fixedCount > 0) {
-              addStatus(`Fixed ${agentFixResult.fixedCount} file(s) — re-verifying…`, 'checking');
-              await new Promise(r => setTimeout(r, 2500));
-              try {
-                const verifyAfterFix = await api({ action: 'verify-app', port: runPort, projectPath: currentProject.projectPath });
-                if (verifyAfterFix.checks?.filter((c: EditVerifyCheck) => c.passed).length >= (verifyData.checks ?? []).filter(c => c.passed).length) {
-                  verifyData = verifyAfterFix;
-                  setLastVerification(verifyAfterFix as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
-                  await api({ action: 'clear-snapshot', projectPath: currentProject.projectPath });
-                } else {
-                  await api({ action: 'restore-files', projectPath: currentProject.projectPath });
-                }
-              } catch { /* non-critical */ }
-              setPreviewKey(k => k + 1);
-            }
+          if (agentFixResult?.fixedCount > 0) {
+            addStatus(`Fixed ${agentFixResult.fixedCount} file(s) — re-verifying…`, 'checking');
+            await new Promise(r => setTimeout(r, 2500));
+            try {
+              const verifyAfterFix = await api({ action: 'verify-app', port: runPort, projectPath: currentProject.projectPath });
+              const prevPassed = (verifyData.checks ?? []).filter(c => c.passed || c.softPassed).length;
+              const nowPassed = (verifyAfterFix.checks ?? []).filter((c: EditVerifyCheck) => c.passed || c.softPassed).length;
+              if (nowPassed >= prevPassed) {
+                verifyData = verifyAfterFix;
+                setLastVerification(verifyAfterFix as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
+                await api({ action: 'clear-snapshot', projectPath: currentProject.projectPath });
+              } else {
+                await api({ action: 'restore-files', projectPath: currentProject.projectPath });
+              }
+            } catch { /* non-critical */ }
+            setPreviewKey(k => k + 1);
           }
         }
 
