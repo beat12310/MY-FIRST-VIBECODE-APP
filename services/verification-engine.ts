@@ -4,6 +4,9 @@
  * Always read the response body on failure to find the REAL root cause.
  */
 
+import { readFile } from 'fs/promises';
+import { join } from 'path';
+
 // ─── Root cause types ─────────────────────────────────────────────────────────
 
 export interface CheckRootCause {
@@ -302,6 +305,28 @@ function urlToFixFile(urlPath: string): string | undefined {
   return undefined;
 }
 
+// ─── Route method detection ───────────────────────────────────────────────────
+
+/**
+ * Read a route.ts file and return the first HTTP method it exports.
+ * Used so verification probes the route with the correct method rather than
+ * defaulting to GET and getting a 405 that masks the real behaviour.
+ */
+async function detectRouteMethod(
+  absoluteFilePath: string,
+): Promise<'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH'> {
+  try {
+    const src = await readFile(absoluteFilePath, 'utf-8');
+    // Order matters: GET first (most common for data-fetch routes)
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const) {
+      if (new RegExp(`export\\s+(?:async\\s+)?function\\s+${method}\\b`).test(src)) {
+        return method;
+      }
+    }
+  } catch { /* file missing or unreadable — fall back to GET */ }
+  return 'GET';
+}
+
 // ─── Endpoint checker ─────────────────────────────────────────────────────────
 
 function apiRouteFileToUrlPath(routeFile: string): string | null {
@@ -311,10 +336,12 @@ function apiRouteFileToUrlPath(routeFile: string): string | null {
     .replace(/\/route\.(ts|tsx|js|jsx)$/, '');
 }
 
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
+
 async function checkEndpoint(
   url: string,
   name: string,
-  method: 'GET' | 'POST' = 'GET',
+  method: HttpMethod = 'GET',
 ): Promise<VerificationCheck> {
   const urlPath = new URL(url).pathname;
   const suggestedFixFile = urlToFixFile(urlPath);
@@ -322,12 +349,15 @@ async function checkEndpoint(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
 
+  // Methods that send a body
+  const hasBody = (method === 'POST' || method === 'PUT' || method === 'PATCH');
+
   try {
     const fetchOpts: RequestInit = {
       method,
       signal: controller.signal,
       headers: { Accept: 'application/json, text/html', 'Content-Type': 'application/json' },
-      ...(method === 'POST' ? { body: JSON.stringify({}) } : {}),
+      ...(hasBody ? { body: JSON.stringify({}) } : {}),
     };
 
     const res = await fetch(url, fetchOpts);
@@ -336,11 +366,15 @@ async function checkEndpoint(
     const ct = res.headers.get('content-type') || '';
     const bodyText = await res.text().catch(() => '');
 
-    // ── 405: wrong HTTP method — automatically try the other common methods ──
+    // ── 405: wrong HTTP method ───────────────────────────────────────────────
+    // When GET returns 405, probe POST to learn what the route actually accepts,
+    // then report a targeted failure. We never mark 405 as "passed" — the agent-fix
+    // loop must inspect both the route file and any calling client code to decide
+    // whether to add a GET export or change the fetch() call to POST.
     if (res.status === 405 && method === 'GET') {
-      // Try POST to see if route is POST-only (common for mutation routes)
       const postCtrl = new AbortController();
       const postTimer = setTimeout(() => postCtrl.abort(), 5000);
+      let postAccepted = false;
       try {
         const postRes = await fetch(url, {
           method: 'POST',
@@ -349,22 +383,21 @@ async function checkEndpoint(
           body: JSON.stringify({}),
         });
         clearTimeout(postTimer);
-        if (postRes.ok) {
-          // Route works via POST — this is a verification quirk, not a code bug
-          return {
-            name: `${name} (POST)`,
-            url,
-            passed: true,
-            statusCode: postRes.status,
-            dataFound: true,
-            responsePreview: '(POST endpoint — verified with POST probe)',
-          };
-        }
+        postAccepted = postRes.ok || postRes.status < 405;
       } catch { clearTimeout(postTimer); }
 
-      // Still 405 — the route file is missing the correct handler export
-      const rootCause = parseRootCause(bodyText, 405);
-      rootCause.fixFile = suggestedFixFile;
+      const routeFile = suggestedFixFile;
+      const rootCause: CheckRootCause = {
+        kind: 'wrong-http-method',
+        detail: postAccepted
+          ? `Route only accepts POST (GET → 405). Either add \`export async function GET\` to ${routeFile ?? 'the route file'}, or update the client fetch() to use POST.`
+          : `Route returned 405 for both GET and POST — the route file may be missing all HTTP method exports.`,
+        errorText: bodyText.slice(0, 200),
+        fixFile: routeFile,
+        fixHint: postAccepted
+          ? `Read ${routeFile ?? 'route.ts'} and the component that calls this URL. If this is a data-fetch route (called by useEffect/SWR), add "export async function GET". If it is a mutation route, ensure all callers use fetch(url, { method: 'POST' }).`
+          : `Add the missing HTTP method export to ${routeFile ?? 'route.ts'}: "export async function GET()" for read routes or "export async function POST()" for mutation routes.`,
+      };
       return {
         name,
         url,
@@ -372,8 +405,8 @@ async function checkEndpoint(
         statusCode: 405,
         rootCause,
         error: rootCause.detail,
-        fixFile: suggestedFixFile,
-        fixHint: `Check ${suggestedFixFile ?? 'the route file'} — ensure it exports "export async function GET" or the correct HTTP method`,
+        fixFile: routeFile,
+        fixHint: rootCause.fixHint,
       };
     }
 
@@ -526,7 +559,8 @@ async function checkEndpoint(
 
 export async function verifyRunningApp(
   port: number,
-  apiRoutes: string[]
+  apiRoutes: string[],
+  projectPath?: string,
 ): Promise<VerificationResult> {
   const base = `http://localhost:${port}`;
   const checks: VerificationCheck[] = [];
@@ -542,7 +576,14 @@ export async function verifyRunningApp(
   );
 
   for (const urlPath of urlPaths) {
-    checks.push(await checkEndpoint(`${base}${urlPath}`, `API: GET ${urlPath}`));
+    // Detect the actual HTTP method from the route file so we probe correctly
+    // instead of blindly using GET and triggering avoidable 405 errors.
+    let method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' = 'GET';
+    if (projectPath) {
+      const routeFile = join(projectPath, 'app', urlPath, 'route.ts');
+      method = await detectRouteMethod(routeFile);
+    }
+    checks.push(await checkEndpoint(`${base}${urlPath}`, `API: ${method} ${urlPath}`, method));
   }
 
   const failures = checks

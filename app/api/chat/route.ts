@@ -1221,7 +1221,7 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         } catch { /* non-critical — verify main page even without discovery */ }
       }
 
-      const result = await verifyRunningApp(port as number, apiRoutes);
+      const result = await verifyRunningApp(port as number, apiRoutes, projectPath as string | undefined);
 
       // TypeScript safety gate: only run tsc when HTTP checks all pass.
       // Running tsc on every loop iteration (15 × ~30s) would add 7+ minutes of overhead.

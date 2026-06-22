@@ -819,60 +819,111 @@ function BuilderInner() {
         return;
       }
 
-      // ── Safety Gate: handle regression detection (fix introduced new errors) ──
-      // The edit action runs a TypeScript check after applying changes.
-      // If new errors were introduced, it rolls back and returns regressionDetected=true.
+      // ── Safety Gate: regression detected — autonomous repair loop ────────────
+      // The edit action ran a TypeScript check server-side and found that the fix
+      // introduced new errors. It rolled back automatically. Now we run up to 3
+      // progressively-broader repair rounds without requiring any user input.
+      // Only if all rounds fail do we surface a clear, actionable message.
       if (editResult.regressionDetected) {
         const newErrors: string[] = editResult.newErrors ?? [];
-        const errorSample = newErrors.slice(0, 3).join('\n');
 
         advanceDebug && advanceDebug('failed', 0, {
-          rootCause: `Regression detected: ${newErrors.length} new error(s) introduced`,
+          rootCause: `Regression: ${newErrors.length} new TypeScript error(s) — auto-repairing`,
           buildLog: newErrors.slice(0, 5),
         });
         setEditDetailStep('error');
-
         addStatus(
-          `Rollback: fix introduced ${newErrors.length} new error(s) — restored to previous working state`,
+          `Rollback — ${newErrors.length} new error(s) introduced. Running autonomous repair…`,
           'error'
         );
 
-        // Notify the user clearly what happened and try a safer approach
-        addMsg('assistant',
-          `**Safety rollback triggered.**\n\n` +
-          `The fix I attempted introduced new TypeScript errors and was automatically rolled back. Your project is back to its previous state.\n\n` +
-          (errorSample ? `**Errors that were introduced:**\n\`\`\`\n${errorSample}\n\`\`\`\n\n` : '') +
-          `**What happened:** The AI changed files that introduced a syntax error ("${newErrors[0]?.slice(0, 80) ?? 'TypeScript error'}"). The platform detected this before it could break the preview and restored the previous version.\n\n` +
-          `**What I'll do instead:** Run a more targeted, minimal fix that only touches the specific file causing the issue.`
-        );
-
-        // Attempt a safer, more targeted retry using agent-fix with explicit files
         const runPort2 = buildProgress?.port || currentProject.port;
-        if (runPort2 && isDebugRequest) {
-          try {
-            addStatus('Attempting safer targeted fix…', 'applying');
-            const verifyBeforeRetry = await api({ action: 'verify-app', port: runPort2, projectPath: currentProject.projectPath });
-            const failedTargets = (verifyBeforeRetry?.checks ?? [])
-              .filter((c: { passed: boolean; fixFile?: string }) => !c.passed && c.fixFile)
-              .map((c: { fixFile: string }) => c.fixFile)
-              .filter(Boolean) as string[];
+        let repairSucceeded = false;
 
-            if (failedTargets.length > 0) {
-              const errorCtxSafe = newErrors.slice(0, 5).join('\n');
-              const saferFix = await api({
-                action: 'agent-fix',
-                projectPath: currentProject.projectPath,
-                errorContext: `Fix ONLY the specific error in the identified file. Do NOT refactor or rewrite. Minimum change only:\n\n${errorCtxSafe}`,
-                targetFiles: failedTargets.slice(0, 2),
-                strategy: 'targeted',
-              });
-              if (saferFix?.fixedCount > 0) {
-                addStatus(`Safer fix applied to ${saferFix.fixedCount} file(s) — verifying…`, 'checking');
-                await new Promise(r => setTimeout(r, 1500));
-                setPreviewKey(k => k + 1);
+        // Three rounds: targeted → broader (more context files) → rewrite (full file)
+        const REPAIR_ROUNDS: Array<{ strategy: 'targeted' | 'broader' | 'rewrite'; label: string }> = [
+          { strategy: 'targeted', label: 'minimum-change targeted fix' },
+          { strategy: 'broader',  label: 'broader context fix'         },
+          { strategy: 'rewrite',  label: 'full file rewrite'           },
+        ];
+
+        for (let round = 0; round < REPAIR_ROUNDS.length; round++) {
+          const { strategy, label } = REPAIR_ROUNDS[round];
+          addStatus(`Autonomous repair ${round + 1}/${REPAIR_ROUNDS.length}: ${label}…`, 'applying');
+          setEditDetailStep('writing');
+
+          // Identify which files are still failing so we can target them precisely
+          let failedTargets: string[] = [];
+          if (runPort2) {
+            try {
+              const snapVerify = await api({ action: 'verify-app', port: runPort2, projectPath: currentProject.projectPath });
+              failedTargets = (snapVerify?.checks ?? [])
+                .filter((c: { passed: boolean; fixFile?: string }) => !c.passed && c.fixFile)
+                .map((c: { fixFile: string }) => c.fixFile)
+                .filter(Boolean) as string[];
+            } catch { /* proceed with empty list */ }
+          }
+
+          // Tell the AI exactly what went wrong last time so it avoids repeating it
+          const avoidBlock =
+            `\n\n[AUTONOMOUS REPAIR — ROUND ${round + 1}]\n` +
+            `The previous fix introduced these TypeScript errors and was rolled back:\n` +
+            `${newErrors.slice(0, 5).join('\n')}\n` +
+            `Do NOT reproduce these patterns. Make only the minimum change to complete: ${userRequest}`;
+
+          try {
+            const repairResult = await api({
+              action: 'agent-fix',
+              projectPath: currentProject.projectPath,
+              errorContext: userRequest + avoidBlock,
+              targetFiles: failedTargets.slice(0, 3),
+              strategy,
+            });
+
+            if (repairResult?.fixedCount > 0) {
+              await new Promise(r => setTimeout(r, 2500));
+              setPreviewKey(k => k + 1);
+
+              if (runPort2) {
+                try {
+                  const verifyAfterRepair = await api({ action: 'verify-app', port: runPort2, projectPath: currentProject.projectPath });
+                  if (verifyAfterRepair?.verified) {
+                    setEditDetailStep('complete');
+                    setLastVerification(verifyAfterRepair as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
+                    if (isDebugRequest) advanceDebug('complete', DEBUG_TIMELINE.length - 1, { filesModified: repairResult.changedFiles ?? failedTargets });
+                    addStatus('✅ Autonomous repair complete — all checks passed.', 'done');
+                    addMsg('assistant',
+                      `**Repair complete** ✅\n\n` +
+                      `The fix was applied cleanly on autonomous repair round ${round + 1}/${REPAIR_ROUNDS.length} (${label}).\n\n` +
+                      verifyAfterRepair.summary
+                    );
+                    repairSucceeded = true;
+                    break;
+                  }
+                } catch { /* re-verify failed — try next round */ }
+              } else {
+                // No port to verify against — assume success if files changed
+                setEditDetailStep('complete');
+                addStatus('Repair applied — preview refresh triggered.', 'done');
+                addMsg('assistant', `Repair round ${round + 1} applied ${repairResult.fixedCount} file(s). Refresh the preview to confirm.`);
+                repairSucceeded = true;
+                break;
               }
             }
-          } catch { /* non-critical — targeted retry is best-effort */ }
+          } catch { /* round failed — try next */ }
+        }
+
+        if (!repairSucceeded) {
+          setEditDetailStep('error');
+          addMsg('assistant',
+            `**Could not complete automatically** — all ${REPAIR_ROUNDS.length} repair rounds introduced TypeScript errors.\n\n` +
+            `**TypeScript errors blocking this change:**\n\`\`\`\n${newErrors.slice(0, 5).join('\n')}\n\`\`\`\n\n` +
+            `Your project is **unchanged** — the previous working version has been kept.\n\n` +
+            `**To unblock this, try:**\n` +
+            `• Describe the change more specifically (e.g. "add a GET handler to /api/parse-bill that returns mock data")\n` +
+            `• Type \`rewrite [filename]\` to rebuild that file from scratch\n` +
+            `• Paste the exact error from the preview — I'll fix it directly`
+          );
         }
 
         return;
