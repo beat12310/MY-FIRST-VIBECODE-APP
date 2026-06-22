@@ -1819,6 +1819,10 @@ Return ONLY the corrected file in this exact format:
       const browserErrors: string = body.browserErrors || '';
       // strategy: 'targeted' = minimum change, 'broader' = more context, 'rewrite' = full file rewrite
       const strategy: 'targeted' | 'broader' | 'rewrite' = body.strategy || 'targeted';
+      // tier: explicit model override — caller drives escalation (HAIKU → SONNET → STRONGEST)
+      // Falls back to strategy-based selection when not provided.
+      const explicitTier: import('@/lib/constants').BedrockTier | undefined =
+        body.tier && ['HAIKU', 'SONNET', 'STRONGEST'].includes(body.tier) ? body.tier : undefined;
 
       // ── Build file context ─────────────────────────────────────────────────
       const fileContexts: string[] = [];
@@ -2038,8 +2042,10 @@ RULES:
 10. Output [EDIT_START] [FILE: path] <content> [EDIT_END] for each file.`;
       }
 
-      // broader/rewrite = repeated failures → escalate to Strongest model
-      const repairTier = (strategy === 'broader' || strategy === 'rewrite') ? 'STRONGEST' : 'SONNET';
+      // Tier selection: explicit caller override wins; otherwise escalate by strategy
+      const repairTier: import('@/lib/constants').BedrockTier =
+        explicitTier ?? ((strategy === 'broader' || strategy === 'rewrite') ? 'STRONGEST' : 'SONNET');
+      console.log(`[agent-fix] strategy=${strategy} tier=${repairTier} targets=${targetFiles.join(',')}`);
       const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT, repairTier);
 
       let fixedFiles = parseEditFormat(aiResponse);
@@ -2061,6 +2067,7 @@ RULES:
         changedFiles: applied.filesChanged,
         errors: applied.errors,
         strategy,
+        tier: repairTier,
       });
     }
 

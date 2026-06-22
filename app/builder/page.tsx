@@ -840,19 +840,28 @@ function BuilderInner() {
         const runPort2 = buildProgress?.port || currentProject.port;
         let repairSucceeded = false;
 
-        // Three rounds: targeted → broader (more context files) → rewrite (full file)
-        const REPAIR_ROUNDS: Array<{ strategy: 'targeted' | 'broader' | 'rewrite'; label: string }> = [
-          { strategy: 'targeted', label: 'minimum-change targeted fix' },
-          { strategy: 'broader',  label: 'broader context fix'         },
-          { strategy: 'rewrite',  label: 'full file rewrite'           },
+        // Escalation pipeline: each round uses a more capable model + broader strategy.
+        // Context accumulates across rounds so each model sees exactly what the previous
+        // model tried and why it failed — no information is lost between escalations.
+        const REPAIR_ROUNDS: Array<{
+          strategy: 'targeted' | 'broader' | 'rewrite';
+          tier: 'HAIKU' | 'SONNET' | 'STRONGEST';
+          label: string;
+        }> = [
+          { strategy: 'targeted', tier: 'HAIKU',    label: 'Haiku — minimum targeted fix'    },
+          { strategy: 'broader',  tier: 'SONNET',   label: 'Sonnet — broader context repair' },
+          { strategy: 'rewrite',  tier: 'STRONGEST', label: 'Opus — full file rewrite'       },
         ];
 
+        // Accumulate everything that was attempted so each escalation model has full history
+        const attemptHistory: string[] = [];
+
         for (let round = 0; round < REPAIR_ROUNDS.length; round++) {
-          const { strategy, label } = REPAIR_ROUNDS[round];
-          addStatus(`Autonomous repair ${round + 1}/${REPAIR_ROUNDS.length}: ${label}…`, 'applying');
+          const { strategy, tier, label } = REPAIR_ROUNDS[round];
+          addStatus(`Escalation ${round + 1}/${REPAIR_ROUNDS.length}: ${label}…`, 'applying');
           setEditDetailStep('writing');
 
-          // Identify which files are still failing so we can target them precisely
+          // Fresh verification snapshot each round — prior round may have partially changed files
           let failedTargets: string[] = [];
           if (runPort2) {
             try {
@@ -864,65 +873,95 @@ function BuilderInner() {
             } catch { /* proceed with empty list */ }
           }
 
-          // Tell the AI exactly what went wrong last time so it avoids repeating it
-          const avoidBlock =
-            `\n\n[AUTONOMOUS REPAIR — ROUND ${round + 1}]\n` +
-            `The previous fix introduced these TypeScript errors and was rolled back:\n` +
-            `${newErrors.slice(0, 5).join('\n')}\n` +
-            `Do NOT reproduce these patterns. Make only the minimum change to complete: ${userRequest}`;
+          // Build cumulative escalation context — full history of what was tried and why it failed
+          const historyBlock = attemptHistory.length > 0
+            ? `\n\n[ESCALATION HISTORY — WHAT PREVIOUS MODELS TRIED AND WHY THEY FAILED]\n` +
+              attemptHistory.map((h, i) => `Round ${i + 1}:\n${h}`).join('\n\n')
+            : '';
 
+          const errorContext =
+            `TASK: ${userRequest}\n\n` +
+            `TYPESCRIPT ERRORS THAT CAUSED ROLLBACK (from round 1 regression check):\n` +
+            `${newErrors.slice(0, 8).join('\n')}\n\n` +
+            `ESCALATION TIER: ${tier} (round ${round + 1}/${REPAIR_ROUNDS.length})\n` +
+            `STRATEGY: ${strategy}\n` +
+            `Do NOT reproduce the rollback errors listed above. Fix them surgically.` +
+            historyBlock;
+
+          let roundResult: { fixedCount?: number; changedFiles?: string[]; tier?: string } | null = null;
           try {
-            const repairResult = await api({
+            roundResult = await api({
               action: 'agent-fix',
               projectPath: currentProject.projectPath,
-              errorContext: userRequest + avoidBlock,
-              targetFiles: failedTargets.slice(0, 3),
+              errorContext,
+              targetFiles: failedTargets.slice(0, 4),
               strategy,
+              tier,
             });
+          } catch (err) {
+            attemptHistory.push(`${label}: API call failed — ${err instanceof Error ? err.message : 'unknown error'}`);
+            continue;
+          }
 
-            if (repairResult?.fixedCount > 0) {
-              await new Promise(r => setTimeout(r, 2500));
-              setPreviewKey(k => k + 1);
+          if (!roundResult?.fixedCount || roundResult.fixedCount < 1) {
+            attemptHistory.push(`${label}: produced no file changes`);
+            continue;
+          }
 
-              if (runPort2) {
-                try {
-                  const verifyAfterRepair = await api({ action: 'verify-app', port: runPort2, projectPath: currentProject.projectPath });
-                  if (verifyAfterRepair?.verified) {
-                    setEditDetailStep('complete');
-                    setLastVerification(verifyAfterRepair as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
-                    if (isDebugRequest) advanceDebug('complete', DEBUG_TIMELINE.length - 1, { filesModified: repairResult.changedFiles ?? failedTargets });
-                    addStatus('✅ Autonomous repair complete — all checks passed.', 'done');
-                    addMsg('assistant',
-                      `**Repair complete** ✅\n\n` +
-                      `The fix was applied cleanly on autonomous repair round ${round + 1}/${REPAIR_ROUNDS.length} (${label}).\n\n` +
-                      verifyAfterRepair.summary
-                    );
-                    repairSucceeded = true;
-                    break;
-                  }
-                } catch { /* re-verify failed — try next round */ }
-              } else {
-                // No port to verify against — assume success if files changed
+          // Files were changed — wait for hot-reload, then verify
+          await new Promise(r => setTimeout(r, 2500));
+          setPreviewKey(k => k + 1);
+
+          if (runPort2) {
+            try {
+              const verifyAfterRepair = await api({ action: 'verify-app', port: runPort2, projectPath: currentProject.projectPath });
+              if (verifyAfterRepair?.verified) {
                 setEditDetailStep('complete');
-                addStatus('Repair applied — preview refresh triggered.', 'done');
-                addMsg('assistant', `Repair round ${round + 1} applied ${repairResult.fixedCount} file(s). Refresh the preview to confirm.`);
+                setLastVerification(verifyAfterRepair as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
+                if (isDebugRequest) advanceDebug('complete', DEBUG_TIMELINE.length - 1, { filesModified: roundResult.changedFiles ?? failedTargets });
+                addStatus(`✅ Autonomous repair complete — ${label}.`, 'done');
+                addMsg('assistant',
+                  `**Repair complete** ✅\n\n` +
+                  `Completed on escalation round ${round + 1}/${REPAIR_ROUNDS.length} using **${label}**.\n\n` +
+                  verifyAfterRepair.summary +
+                  (round > 0 ? `\n\n_(Escalated through ${round} prior round(s) before succeeding.)_` : '')
+                );
                 repairSucceeded = true;
                 break;
+              } else {
+                // Verification failed after this round — record what happened for next model
+                const stillFailing = (verifyAfterRepair?.failures ?? []).slice(0, 3).join('; ');
+                attemptHistory.push(
+                  `${label}: changed ${roundResult.changedFiles?.join(', ') || 'unknown files'} ` +
+                  `but verification still failed: ${stillFailing || 'unknown reason'}`
+                );
               }
+            } catch {
+              attemptHistory.push(`${label}: changed files but re-verification threw an exception`);
             }
-          } catch { /* round failed — try next */ }
+          } else {
+            // No port — assume success if files were applied
+            setEditDetailStep('complete');
+            addStatus('Repair applied — preview refresh triggered.', 'done');
+            addMsg('assistant', `${label} applied ${roundResult.fixedCount} file(s). Refresh the preview to confirm.`);
+            repairSucceeded = true;
+            break;
+          }
         }
 
         if (!repairSucceeded) {
           setEditDetailStep('error');
+          const tierNames = REPAIR_ROUNDS.map(r => r.tier).join(' → ');
           addMsg('assistant',
-            `**Could not complete automatically** — all ${REPAIR_ROUNDS.length} repair rounds introduced TypeScript errors.\n\n` +
-            `**TypeScript errors blocking this change:**\n\`\`\`\n${newErrors.slice(0, 5).join('\n')}\n\`\`\`\n\n` +
+            `**All escalation tiers exhausted** (${tierNames}) — unable to complete without introducing TypeScript errors.\n\n` +
+            `**Rollback errors that blocked every tier:**\n\`\`\`\n${newErrors.slice(0, 5).join('\n')}\n\`\`\`\n\n` +
+            `**What each tier attempted:**\n` +
+            attemptHistory.map((h, i) => `${i + 1}. ${h}`).join('\n') + '\n\n' +
             `Your project is **unchanged** — the previous working version has been kept.\n\n` +
-            `**To unblock this, try:**\n` +
-            `• Describe the change more specifically (e.g. "add a GET handler to /api/parse-bill that returns mock data")\n` +
-            `• Type \`rewrite [filename]\` to rebuild that file from scratch\n` +
-            `• Paste the exact error from the preview — I'll fix it directly`
+            `**To unblock:**\n` +
+            `• Describe the change more specifically (e.g. "add a GET handler to app/api/parse-bill/route.ts")\n` +
+            `• Type \`rewrite app/api/parse-bill/route.ts\` to let me rebuild that file from scratch\n` +
+            `• Paste the exact TypeScript error — I'll fix it in isolation without touching other files`
           );
         }
 
