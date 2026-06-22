@@ -1802,6 +1802,88 @@ Return ONLY the corrected file in this exact format:
       return NextResponse.json({ success: true });
     }
 
+    // ── pre-repair-check: diagnose BEFORE touching any files ─────────────────
+    // Detects missing packages, route method mismatches, DB init gaps, tsconfig
+    // issues, and OCR setup problems. Returns a structured diagnostic so the
+    // repair loop can fix environmental issues without calling an AI model.
+    if (action === 'pre-repair-check') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { runPreRepairDiagnostics } = await import('@/services/pre-repair');
+      const { findMatchingRepair, formatPatternForPrompt } = await import('@/services/engineering-memory');
+      const userReq: string = body.userRequest || '';
+      const errorText: string = body.errorContext || body.errorText || '';
+      const tsErrors: string[] = body.tsErrors || [];
+
+      const [diagnostic, memoryMatch] = await Promise.all([
+        runPreRepairDiagnostics(projectPath, userReq, errorText, tsErrors),
+        findMatchingRepair(errorText, tsErrors),
+      ]);
+
+      const memoryContext = memoryMatch ? formatPatternForPrompt(memoryMatch) : null;
+
+      return NextResponse.json({
+        success: true,
+        ...diagnostic,
+        memoryMatch: memoryMatch ? {
+          confidence: memoryMatch.confidence,
+          rootCause: memoryMatch.pattern.rootCause,
+          fixApproach: memoryMatch.pattern.fixApproach,
+          targetFiles: memoryMatch.pattern.targetFiles,
+          successfulTier: memoryMatch.pattern.successfulTier,
+        } : null,
+        memoryContext,
+      });
+    }
+
+    // ── install-packages: install multiple npm packages at once ───────────────
+    if (action === 'install-packages') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const packages: string[] = body.packages || [];
+      if (packages.length === 0) return NextResponse.json({ success: true, installed: [], message: 'No packages specified' });
+
+      // Add packages to package.json first
+      const { readFile: rf, writeFile: wf } = await import('fs/promises');
+      const pkgPath = join(projectPath, 'package.json');
+      const added: string[] = [];
+      try {
+        const pkgJson = JSON.parse(await rf(pkgPath, 'utf-8'));
+        if (!pkgJson.dependencies) pkgJson.dependencies = {};
+        for (const pkg of packages) {
+          if (!pkgJson.dependencies[pkg] && !pkgJson.devDependencies?.[pkg]) {
+            pkgJson.dependencies[pkg] = 'latest';
+            added.push(pkg);
+          }
+        }
+        if (added.length > 0) await wf(pkgPath, JSON.stringify(pkgJson, null, 2) + '\n', 'utf-8');
+      } catch { /* proceed anyway */ }
+
+      const result = await installDependencies(projectPath, ['--legacy-peer-deps']);
+      return NextResponse.json({
+        success: result.success,
+        installed: packages,
+        addedToPackageJson: added,
+        output: result.logs?.slice(-10).join('\n'),
+      });
+    }
+
+    // ── save-repair-memory: persist a successful repair pattern ───────────────
+    if (action === 'save-repair-memory') {
+      const { saveRepairSuccess } = await import('@/services/engineering-memory');
+      const record = {
+        errorPattern:    body.errorPattern    || '',
+        rootCause:       body.rootCause       || 'unknown',
+        fixApproach:     body.fixApproach     || '',
+        targetFiles:     body.targetFiles     || [],
+        tsErrorsToAvoid: body.tsErrorsToAvoid || [],
+        successfulTier:  body.successfulTier  || 'SONNET',
+      };
+      if (!record.errorPattern || !record.fixApproach) {
+        return NextResponse.json({ success: false, error: 'Missing errorPattern or fixApproach' });
+      }
+      await saveRepairSuccess(record);
+      return NextResponse.json({ success: true, saved: record.rootCause });
+    }
+
     // ── agent-fix: targeted multi-file AI repair for the autonomous loop ──────
     // Unlike 'fix-file' (single file) or 'edit' (full discovery + user intent),
     // agent-fix is purpose-built for the engineer loop:

@@ -756,7 +756,111 @@ function BuilderInner() {
         advanceDebug('fixing', 3);
       }
 
-      // Inject root cause report + auto-gathered errors into the user request
+      // ── Pre-repair pipeline — runs BEFORE any file edit ───────────────────────
+      // Checks the environment (packages, route methods, DB init, tsconfig) and
+      // either fixes the issue directly (no AI needed) or builds rich diagnostic
+      // context that makes the AI edit far more accurate and less likely to regress.
+      let preRepairContext = '';
+      const runPort0 = buildProgress?.port || currentProject.port;
+
+      if (isDebugRequest || autoGatheredError) {
+        try {
+          addStatus('Checking environment before editing files…', 'checking');
+          const tsErrorsForDiag = dbgResult.tsErrors ?? [];
+
+          const diagResult = await api({
+            action: 'pre-repair-check',
+            projectPath: currentProject.projectPath,
+            userRequest,
+            errorContext: autoGatheredError,
+            tsErrors: tsErrorsForDiag,
+          });
+
+          // ── Engineering memory: known fix exists? ─────────────────────────
+          if (diagResult?.memoryMatch?.confidence === 'high' || diagResult?.memoryMatch?.confidence === 'medium') {
+            const match = diagResult.memoryMatch;
+            addStatus(`Engineering memory: known fix for "${match.rootCause}" (${match.confidence} confidence)`, 'checking');
+            if (diagResult.memoryContext) preRepairContext += `\n\n${diagResult.memoryContext}`;
+          }
+
+          // ── Auto-install missing packages (no AI needed) ──────────────────
+          if (diagResult?.missingPackages?.length > 0) {
+            const pkgs: string[] = diagResult.missingPackages;
+            addStatus(`Installing missing packages: ${pkgs.join(', ')}…`, 'applying');
+            const installResult = await api({
+              action: 'install-packages',
+              projectPath: currentProject.projectPath,
+              packages: pkgs,
+            });
+            if (installResult?.success) {
+              addStatus(`Installed ${pkgs.join(', ')} — re-verifying…`, 'checking');
+              await new Promise(r => setTimeout(r, 3000)); // wait for compilation
+              setPreviewKey(k => k + 1);
+
+              if (runPort0) {
+                try {
+                  const quickVerify = await api({ action: 'verify-app', port: runPort0, projectPath: currentProject.projectPath });
+                  if (quickVerify?.verified) {
+                    setEditDetailStep('complete');
+                    addStatus('✅ Fixed by installing missing packages.', 'done');
+                    addMsg('assistant',
+                      `**Fixed** ✅\n\nThe issue was missing npm package(s): **${pkgs.join(', ')}**\n\n` +
+                      `Installed and verified — no code changes needed.\n\n${quickVerify.summary}`
+                    );
+                    // Save to engineering memory
+                    await api({
+                      action: 'save-repair-memory',
+                      errorPattern: `Cannot find module '${pkgs[0]}'|Module not found.*${pkgs[0]}`,
+                      rootCause: `Missing package: ${pkgs.join(', ')}`,
+                      fixApproach: `Install: npm install ${pkgs.join(' ')}`,
+                      targetFiles: [],
+                      tsErrorsToAvoid: ['TS2307'],
+                      successfulTier: 'HAIKU',
+                    }).catch(() => {});
+                    return;
+                  }
+                } catch { /* continue to code repair */ }
+              }
+              // Packages installed but verify didn't pass — continue with code repair
+              // but now the package is present so code edits should not regress on missing modules
+              autoGatheredError = (autoGatheredError ? autoGatheredError + '\n' : '') +
+                `[PACKAGES INSTALLED: ${pkgs.join(', ')} — imports should now resolve]`;
+            }
+          }
+
+          // ── Auto-fix tsconfig issues (no AI needed) ───────────────────────
+          if (diagResult?.tsConfigIssues?.length > 0) {
+            addStatus('Removing invalid tsconfig options…', 'applying');
+            await api({
+              action: 'agent-fix',
+              projectPath: currentProject.projectPath,
+              errorContext: `Fix these tsconfig.json issues by removing the invalid options:\n${diagResult.tsConfigIssues.join('\n')}\nOnly remove the invalid options — do not change anything else.`,
+              targetFiles: ['tsconfig.json'],
+              strategy: 'targeted',
+              tier: 'HAIKU',
+            }).catch(() => {});
+          }
+
+          // ── Build diagnostic context for the AI edit ──────────────────────
+          if (diagResult?.enrichedContext) {
+            preRepairContext += `\n\n${diagResult.enrichedContext}`;
+          }
+
+          // Surface findings to debug timeline
+          if (diagResult?.rootCause && diagResult.rootCause !== 'unknown') {
+            advanceDebug && advanceDebug('analyzing', 2, {
+              rootCause: `Pre-repair: ${diagResult.rootCauseDetail}`,
+              buildLog: [
+                ...(diagResult.missingPackages.map((p: string) => `Missing: ${p}`)),
+                ...(diagResult.routeMethodIssues.map((r: { issue: string }) => `Route: ${r.issue}`)),
+                ...(diagResult.dbIssues.map((d: { issue: string }) => `DB: ${d.issue}`)),
+              ],
+            });
+          }
+        } catch { /* pre-repair is non-critical — always continue to edit */ }
+      }
+
+      // Inject root cause report + auto-gathered errors + pre-repair diagnostics
       // so the AI engineer always knows the layer to target before touching files.
       const enrichedRequest = (() => {
         let req = userRequest;
@@ -765,6 +869,9 @@ function BuilderInner() {
         }
         if (rootCauseContext) {
           req += rootCauseContext;
+        }
+        if (preRepairContext) {
+          req += preRepairContext;
         }
         return req;
       })();
@@ -926,6 +1033,17 @@ function BuilderInner() {
                   verifyAfterRepair.summary +
                   (round > 0 ? `\n\n_(Escalated through ${round} prior round(s) before succeeding.)_` : '')
                 );
+                // Persist this pattern so future identical errors skip the escalation loop
+                api({
+                  action: 'save-repair-memory',
+                  errorPattern: newErrors.slice(0, 3).join('|').slice(0, 200)
+                    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+                  rootCause: `Regression repair: ${newErrors[0]?.slice(0, 80) ?? 'TS error'}`,
+                  fixApproach: `${strategy} via ${tier}: ${userRequest.slice(0, 120)}`,
+                  targetFiles: roundResult?.changedFiles ?? [],
+                  tsErrorsToAvoid: newErrors.slice(0, 5),
+                  successfulTier: tier,
+                }).catch(() => { /* non-critical */ });
                 repairSucceeded = true;
                 break;
               } else {
@@ -1081,6 +1199,21 @@ function BuilderInner() {
           verifyLine +
           (verifyData?.failures?.length ? `\n\nFailed checks:\n${verifyData.failures.map((f: string) => `• ${f}`).join('\n')}` : '')
         );
+
+        // ── Save successful repair to engineering memory ───────────────────
+        // When verification passed, persist the repair approach so future
+        // identical errors are fixed faster without running the full loop.
+        if (verifyData?.verified && autoGatheredError && changed.length > 0) {
+          api({
+            action: 'save-repair-memory',
+            errorPattern: autoGatheredError.slice(0, 200).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+            rootCause: `Repair: ${userRequest.slice(0, 80)}`,
+            fixApproach: `Changed files: ${changed.join(', ')}. ${userRequest.slice(0, 120)}`,
+            targetFiles: changed,
+            tsErrorsToAvoid: tsResult.errors?.slice(0, 3) ?? [],
+            successfulTier: 'SONNET',
+          }).catch(() => { /* non-critical */ });
+        }
 
         try {
           const disc = await api({ action: 'discover', projectPath: currentProject.projectPath });
