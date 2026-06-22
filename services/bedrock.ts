@@ -2,7 +2,7 @@ import {
   BedrockRuntimeClient,
   InvokeModelWithResponseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { BEDROCK_CONFIG } from '@/lib/constants';
+import { BEDROCK_CONFIG, BEDROCK_MODELS, type BedrockTier } from '@/lib/constants';
 import { logError, ErrorCode, createError } from '@/lib/error-handler';
 
 export type MultimodalBlock =
@@ -131,13 +131,14 @@ function initializeClient(): BedrockRuntimeClient {
 // so a connection drop only loses the last partial chunk — not the entire body.
 
 async function invokeStreaming(
-  messages: ConversationTurn[],
+  messages:     ConversationTurn[],
   systemPrompt: string,
-  maxTokens: number
+  maxTokens:    number,
+  modelId:      string = BEDROCK_MODELS.HAIKU
 ): Promise<string> {
   const client  = initializeClient();
   const command = new InvokeModelWithResponseStreamCommand({
-    modelId:     BEDROCK_CONFIG.DEFAULT_MODEL,
+    modelId,
     contentType: 'application/json',
     accept:      'application/json',
     body: JSON.stringify({
@@ -181,10 +182,13 @@ async function invokeWithRetry(
   messages:     ConversationTurn[],
   systemPrompt: string,
   maxTokens:    number,
-  context:      string
+  context:      string,
+  modelId:      string = BEDROCK_MODELS.HAIKU
 ): Promise<string> {
   const timeoutMs = maxTokens > 5_000 ? TIMEOUT_BUILD_MS : TIMEOUT_CHAT_MS;
   let lastErr: Error = new Error('Unknown Bedrock error');
+
+  console.log(`[Bedrock][${context}] model=${modelId.split('.').pop()} maxTokens=${maxTokens}`);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     if (attempt > 1) {
@@ -198,7 +202,7 @@ async function invokeWithRetry(
 
     try {
       const result = await Promise.race([
-        invokeStreaming(messages, systemPrompt, maxTokens),
+        invokeStreaming(messages, systemPrompt, maxTokens, modelId),
         new Promise<never>((_, reject) =>
           setTimeout(
             () => reject(new Error(`BEDROCK_TIMEOUT: ${context} timed out after ${timeoutMs / 1000}s`)),
@@ -228,16 +232,41 @@ async function invokeWithRetry(
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────
+//
+// Model routing summary:
+//
+//   HAIKU    → converseWithEngineer (simple chat / quick explanations)
+//              generateLogoWithAI   (SVG generation — no reasoning needed)
+//              editWithAI when tier='HAIKU' (small UI edits)
+//
+//   SONNET   → buildWithAI          (app generation, research, API integration)
+//              fixErrorsWithAI      (TypeScript fixes, targeted repair loop)
+//              editWithAI (default) (backend/API edits, upgrades)
+//              analyzeImageWithAI   (vision — Haiku does not support multimodal here)
+//
+//   STRONGEST → fixErrorsWithAI when tier='STRONGEST'
+//               (advanced repair engine — broader/rewrite strategy, repeated failures,
+//                platform-level architecture changes)
+//
+// All functions accept an optional `tier` parameter so call sites can escalate.
+
+/** @deprecated Use BEDROCK_MODELS directly. Kept for external consumers. */
+export { BEDROCK_MODELS, type BedrockTier };
 
 /**
  * Multi-turn conversation with the AI product engineer persona.
+ * Uses Haiku — chat responses are short and don't need heavy reasoning.
  */
 export async function converseWithEngineer(
   messages:     ConversationTurn[],
-  systemPrompt: string
+  systemPrompt: string,
+  tier:         BedrockTier = 'HAIKU'
 ): Promise<string> {
   try {
-    return await invokeWithRetry(messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse');
+    return await invokeWithRetry(
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse',
+      BEDROCK_MODELS[tier]
+    );
   } catch (error) {
     logError('Bedrock conversation failed', error);
     throw error;
@@ -246,14 +275,20 @@ export async function converseWithEngineer(
 
 /**
  * Single-turn build call — generates a full project from a build spec.
+ * Uses Sonnet — full-stack app generation requires strong code synthesis.
  */
-export async function buildWithAI(userMessage: string, systemPrompt: string): Promise<string> {
+export async function buildWithAI(
+  userMessage:  string,
+  systemPrompt: string,
+  tier:         BedrockTier = 'SONNET'
+): Promise<string> {
   try {
     return await invokeWithRetry(
       [{ role: 'user', content: userMessage }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
-      'build'
+      'build',
+      BEDROCK_MODELS[tier]
     );
   } catch (error) {
     logError('Bedrock build failed', error);
@@ -262,15 +297,26 @@ export async function buildWithAI(userMessage: string, systemPrompt: string): Pr
 }
 
 /**
- * Single-turn call for fixing TypeScript errors in generated files.
+ * Single-turn call for fixing TypeScript errors / repair loops.
+ *
+ * Default tier: SONNET (targeted fixes, single-pass TypeScript repair)
+ * Pass tier='STRONGEST' for broader/rewrite strategy or repeated failures.
  */
-export async function fixErrorsWithAI(prompt: string, systemPrompt: string): Promise<string> {
+export async function fixErrorsWithAI(
+  prompt:       string,
+  systemPrompt: string,
+  tier:         BedrockTier = 'SONNET'
+): Promise<string> {
+  const maxTokens = tier === 'STRONGEST'
+    ? BEDROCK_CONFIG.MAX_TOKENS_REPAIR
+    : BEDROCK_CONFIG.MAX_TOKENS_BUILD;
   try {
     return await invokeWithRetry(
       [{ role: 'user', content: prompt }],
       systemPrompt,
-      BEDROCK_CONFIG.MAX_TOKENS_BUILD,
-      'fix-errors'
+      maxTokens,
+      'fix-errors',
+      BEDROCK_MODELS[tier]
     );
   } catch (error) {
     logError('Bedrock error-fix failed', error);
@@ -280,14 +326,22 @@ export async function fixErrorsWithAI(prompt: string, systemPrompt: string): Pro
 
 /**
  * Single-turn call for editing existing project files.
+ *
+ * Default tier: SONNET (API integration, backend edits, upgrades)
+ * Pass tier='HAIKU' for small cosmetic/UI-only edits.
  */
-export async function editWithAI(contextMessage: string, systemPrompt: string): Promise<string> {
+export async function editWithAI(
+  contextMessage: string,
+  systemPrompt:   string,
+  tier:           BedrockTier = 'SONNET'
+): Promise<string> {
   try {
     return await invokeWithRetry(
       [{ role: 'user', content: contextMessage }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
-      'edit'
+      'edit',
+      BEDROCK_MODELS[tier]
     );
   } catch (error) {
     logError('Bedrock edit failed', error);
@@ -297,13 +351,15 @@ export async function editWithAI(contextMessage: string, systemPrompt: string): 
 
 /**
  * Single-turn multimodal call — analyzes an image with an optional text instruction.
+ * Uses Sonnet — Haiku's vision quality is insufficient for code-related screenshots.
  * imageBase64 must be raw base64 (no data-URL prefix).
  */
 export async function analyzeImageWithAI(
-  imageBase64: string,
-  mediaType: string,
-  instruction: string,
-  systemPrompt: string
+  imageBase64:  string,
+  mediaType:    string,
+  instruction:  string,
+  systemPrompt: string,
+  tier:         BedrockTier = 'SONNET'
 ): Promise<string> {
   const messages: ConversationTurn[] = [{
     role: 'user',
@@ -313,7 +369,10 @@ export async function analyzeImageWithAI(
     ],
   }];
   try {
-    return await invokeWithRetry(messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision');
+    return await invokeWithRetry(
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision',
+      BEDROCK_MODELS[tier]
+    );
   } catch (error) {
     logError('Bedrock image analysis failed', error);
     throw error;
@@ -322,14 +381,20 @@ export async function analyzeImageWithAI(
 
 /**
  * Generate SVG logo options — returns raw text from Claude containing SVG blocks.
+ * Uses Haiku — SVG generation is a structured low-complexity task.
  */
-export async function generateLogoWithAI(prompt: string, systemPrompt: string): Promise<string> {
+export async function generateLogoWithAI(
+  prompt:       string,
+  systemPrompt: string,
+  tier:         BedrockTier = 'HAIKU'
+): Promise<string> {
   try {
     return await invokeWithRetry(
       [{ role: 'user', content: prompt }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_CHAT,
-      'logo-gen'
+      'logo-gen',
+      BEDROCK_MODELS[tier]
     );
   } catch (error) {
     logError('Bedrock logo generation failed', error);

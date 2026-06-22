@@ -1855,7 +1855,9 @@ RULES:
 10. Output [EDIT_START] [FILE: path] <content> [EDIT_END] for each file.`;
       }
 
-      const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT);
+      // broader/rewrite = repeated failures → escalate to Strongest model
+      const repairTier = (strategy === 'broader' || strategy === 'rewrite') ? 'STRONGEST' : 'SONNET';
+      const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT, repairTier);
 
       let fixedFiles = parseEditFormat(aiResponse);
       if (fixedFiles.length === 0) {

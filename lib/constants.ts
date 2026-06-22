@@ -6,16 +6,50 @@ export const APP_NAME = 'DWOMOH Vibe Code';
 export const APP_VERSION = '1.0.0';
 
 /**
+ * AWS Bedrock Model Routing
+ *
+ * Three tiers — each env var lets you override the default for that tier:
+ *
+ *   BEDROCK_MODEL_HAIKU   — simple chat, quick explanations, small UI edits, logo gen
+ *   BEDROCK_MODEL_SONNET  — app generation, API integration, debugging, TypeScript fixes,
+ *                           provider selection, verification repair loop, generated-app fixing
+ *   BEDROCK_MODEL_OPUS    — advanced repair engine, repeated failures (broader/rewrite
+ *                           strategy), platform-level architecture changes
+ *
+ * BEDROCK_MODEL_ID is kept as a legacy fallback — if set it overrides the Haiku default
+ * only; Sonnet and Opus defaults are always their own IDs unless their own env vars are set.
+ */
+export const BEDROCK_MODELS = {
+  // Haiku 4.5 — fast, cheap, good for conversational and trivial generation
+  HAIKU: process.env.BEDROCK_MODEL_HAIKU ||
+    process.env.BEDROCK_MODEL_ID ||
+    'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+
+  // Sonnet 4.5 — the default Build Mode and Fix Mode model
+  SONNET: process.env.BEDROCK_MODEL_SONNET ||
+    'us.anthropic.claude-sonnet-4-5-20251001-v1:0',
+
+  // Opus 4 — strongest available; used only when Sonnet has failed repeatedly
+  STRONGEST: process.env.BEDROCK_MODEL_OPUS ||
+    'us.anthropic.claude-opus-4-20250514-v1:0',
+} as const;
+
+export type BedrockTier = keyof typeof BEDROCK_MODELS;
+
+/**
  * AWS Bedrock Configuration
+ *
+ * DEFAULT_MODEL is kept for legacy callers (services/bedrock.ts invokeStreaming).
+ * All new callers should pass a tier explicitly.
  */
 export const BEDROCK_CONFIG = {
-  DEFAULT_MODEL:
-    process.env.BEDROCK_MODEL_ID ||
-    'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+  /** @deprecated Use BEDROCK_MODELS.HAIKU / .SONNET / .STRONGEST instead */
+  DEFAULT_MODEL: BEDROCK_MODELS.HAIKU,
   DEFAULT_REGION:
     process.env.AWS_REGION || 'us-east-1',
   MAX_TOKENS_CHAT: 2000,
   MAX_TOKENS_BUILD: 24000,
+  MAX_TOKENS_REPAIR: 32000,  // repair/rewrite passes need more room
   TEMPERATURE: 0.7,
   ANTHROPIC_VERSION: 'bedrock-2023-05-31',
 };
