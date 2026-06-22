@@ -1,0 +1,338 @@
+import {
+  BedrockRuntimeClient,
+  InvokeModelWithResponseStreamCommand,
+} from '@aws-sdk/client-bedrock-runtime';
+import { BEDROCK_CONFIG } from '@/lib/constants';
+import { logError, ErrorCode, createError } from '@/lib/error-handler';
+
+export type MultimodalBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+export interface ConversationTurn {
+  role: 'user' | 'assistant';
+  content: string | MultimodalBlock[];
+}
+
+// ─── Error classification ──────────────────────────────────────────────────
+
+export type BedrockErrorKind =
+  | 'NETWORK_INTERRUPTION'
+  | 'TIMEOUT'
+  | 'THROTTLED'
+  | 'AUTH_ERROR'
+  | 'QUOTA_EXCEEDED'
+  | 'INVALID_RESPONSE'
+  | 'UNKNOWN';
+
+export function classifyBedrockError(message: string): BedrockErrorKind {
+  const m = message.toLowerCase();
+  if (
+    m.includes('connection closed') ||
+    m.includes('econnreset') ||
+    m.includes('socket hang up') ||
+    m.includes('econnrefused') ||
+    m.includes('epipe') ||
+    m.includes('mid-response') ||
+    m.includes('aborted') ||
+    m.includes('network error') ||
+    m.includes('fetch failed')
+  ) return 'NETWORK_INTERRUPTION';
+  if (
+    m.includes('timeout') ||
+    m.includes('timed out') ||
+    m.includes('etimedout') ||
+    m.includes('bedrock_timeout')
+  ) return 'TIMEOUT';
+  if (
+    m.includes('throttl') ||
+    m.includes('too many requests') ||
+    m.includes('limitexceeded') ||
+    m.includes('429')
+  ) return 'THROTTLED';
+  if (
+    m.includes('credential') ||
+    m.includes('unauthorized') ||
+    m.includes('forbidden') ||
+    m.includes('accessdenied') ||
+    m.includes('403') ||
+    m.includes('401')
+  ) return 'AUTH_ERROR';
+  if (
+    m.includes('quota') ||
+    m.includes('limit exceeded') ||
+    m.includes('service quota')
+  ) return 'QUOTA_EXCEEDED';
+  if (
+    m.includes('invalid') ||
+    m.includes('malformed') ||
+    m.includes('no content')
+  ) return 'INVALID_RESPONSE';
+  return 'UNKNOWN';
+}
+
+export function bedrockErrorMessage(kind: BedrockErrorKind, attempt: number, max: number): string {
+  switch (kind) {
+    case 'NETWORK_INTERRUPTION':
+      return `Network connection interrupted (attempt ${attempt}/${max}) — retrying…`;
+    case 'TIMEOUT':
+      return `Request timed out (attempt ${attempt}/${max}) — retrying…`;
+    case 'THROTTLED':
+      return `Rate limit hit (attempt ${attempt}/${max}) — waiting before retry…`;
+    case 'AUTH_ERROR':
+      return 'Authentication failed — check AWS credentials in .env.local';
+    case 'QUOTA_EXCEEDED':
+      return 'Bedrock service quota exceeded — try again in a few minutes';
+    case 'INVALID_RESPONSE':
+      return `AI returned an unexpected format (attempt ${attempt}/${max}) — retrying…`;
+    default:
+      return `Unexpected error (attempt ${attempt}/${max}) — retrying…`;
+  }
+}
+
+// ─── Retry configuration ───────────────────────────────────────────────────
+
+const MAX_RETRIES       = 3;
+const RETRY_DELAYS_MS   = [2_000, 4_000, 8_000]; // 2s → 4s → 8s exponential backoff
+const TIMEOUT_CHAT_MS   =  60_000;  // 60 s — chat responses are short
+const TIMEOUT_BUILD_MS  = 270_000;  // 4.5 min — code-gen can be very large
+
+// ─── Client singleton ──────────────────────────────────────────────────────
+
+let bedrockClient: BedrockRuntimeClient | null = null;
+
+function initializeClient(): BedrockRuntimeClient {
+  if (bedrockClient) return bedrockClient;
+
+  const region          = process.env.AWS_REGION         || BEDROCK_CONFIG.DEFAULT_REGION;
+  const accessKeyId     = process.env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+
+  if (!accessKeyId || !secretAccessKey) {
+    throw createError(
+      ErrorCode.MISSING_CREDENTIALS,
+      'AWS credentials not configured. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env.local',
+      401
+    );
+  }
+
+  bedrockClient = new BedrockRuntimeClient({
+    region,
+    credentials: { accessKeyId, secretAccessKey },
+    // Increase socket timeout so long builds don't get cut by the SDK default
+    requestHandler: { requestTimeout: TIMEOUT_BUILD_MS + 30_000 },
+  });
+  return bedrockClient;
+}
+
+// ─── Streaming core ────────────────────────────────────────────────────────
+// Using InvokeModelWithResponseStreamCommand instead of InvokeModelCommand.
+// Streaming reads the response in small chunks as the model generates them,
+// so a connection drop only loses the last partial chunk — not the entire body.
+
+async function invokeStreaming(
+  messages: ConversationTurn[],
+  systemPrompt: string,
+  maxTokens: number
+): Promise<string> {
+  const client  = initializeClient();
+  const command = new InvokeModelWithResponseStreamCommand({
+    modelId:     BEDROCK_CONFIG.DEFAULT_MODEL,
+    contentType: 'application/json',
+    accept:      'application/json',
+    body: JSON.stringify({
+      anthropic_version: BEDROCK_CONFIG.ANTHROPIC_VERSION,
+      max_tokens:        maxTokens,
+      temperature:       BEDROCK_CONFIG.TEMPERATURE,
+      system:            systemPrompt,
+      messages,
+    }),
+  });
+
+  const response = await client.send(command);
+  if (!response.body) throw new Error('Empty response stream from Bedrock');
+
+  const decoder = new TextDecoder();
+  let text = '';
+
+  for await (const event of response.body) {
+    if (event.chunk?.bytes) {
+      try {
+        const chunk = JSON.parse(decoder.decode(event.chunk.bytes));
+        if (chunk.type === 'content_block_delta' && chunk.delta?.type === 'text_delta') {
+          text += chunk.delta.text ?? '';
+        }
+        if (chunk.type === 'message_stop') break;
+      } catch {
+        // Malformed chunk — skip and keep accumulating
+      }
+    }
+  }
+
+  if (!text) throw new Error('Bedrock stream produced no content — invalid response');
+  return text;
+}
+
+// ─── Retry wrapper ─────────────────────────────────────────────────────────
+// 3 attempts, exponential backoff, per-call timeout.
+// Auth errors are never retried (they won't self-resolve).
+
+async function invokeWithRetry(
+  messages:     ConversationTurn[],
+  systemPrompt: string,
+  maxTokens:    number,
+  context:      string
+): Promise<string> {
+  const timeoutMs = maxTokens > 5_000 ? TIMEOUT_BUILD_MS : TIMEOUT_CHAT_MS;
+  let lastErr: Error = new Error('Unknown Bedrock error');
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 1) {
+      const delay = RETRY_DELAYS_MS[attempt - 2];
+      const kind  = classifyBedrockError(lastErr.message);
+      console.warn(
+        `[Bedrock][${context}] ${bedrockErrorMessage(kind, attempt - 1, MAX_RETRIES)}  → waiting ${delay / 1000}s before retry ${attempt}…`
+      );
+      await new Promise(r => setTimeout(r, delay));
+    }
+
+    try {
+      const result = await Promise.race([
+        invokeStreaming(messages, systemPrompt, maxTokens),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`BEDROCK_TIMEOUT: ${context} timed out after ${timeoutMs / 1000}s`)),
+            timeoutMs
+          )
+        ),
+      ]);
+
+      if (attempt > 1) {
+        console.log(`[Bedrock][${context}] Recovered on attempt ${attempt}/${MAX_RETRIES}`);
+      }
+      return result;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      const kind = classifyBedrockError(lastErr.message);
+      console.error(
+        `[Bedrock][${context}] Attempt ${attempt}/${MAX_RETRIES} FAILED — [${kind}] ${lastErr.message}`
+      );
+      // Auth errors will not fix themselves on retry
+      if (kind === 'AUTH_ERROR' || kind === 'QUOTA_EXCEEDED') break;
+    }
+  }
+
+  // Enrich the final error with its classification so callers can act on it
+  const kind = classifyBedrockError(lastErr.message);
+  throw new Error(`[${kind}] ${lastErr.message}`);
+}
+
+// ─── Public API ────────────────────────────────────────────────────────────
+
+/**
+ * Multi-turn conversation with the AI product engineer persona.
+ */
+export async function converseWithEngineer(
+  messages:     ConversationTurn[],
+  systemPrompt: string
+): Promise<string> {
+  try {
+    return await invokeWithRetry(messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse');
+  } catch (error) {
+    logError('Bedrock conversation failed', error);
+    throw error;
+  }
+}
+
+/**
+ * Single-turn build call — generates a full project from a build spec.
+ */
+export async function buildWithAI(userMessage: string, systemPrompt: string): Promise<string> {
+  try {
+    return await invokeWithRetry(
+      [{ role: 'user', content: userMessage }],
+      systemPrompt,
+      BEDROCK_CONFIG.MAX_TOKENS_BUILD,
+      'build'
+    );
+  } catch (error) {
+    logError('Bedrock build failed', error);
+    throw error;
+  }
+}
+
+/**
+ * Single-turn call for fixing TypeScript errors in generated files.
+ */
+export async function fixErrorsWithAI(prompt: string, systemPrompt: string): Promise<string> {
+  try {
+    return await invokeWithRetry(
+      [{ role: 'user', content: prompt }],
+      systemPrompt,
+      BEDROCK_CONFIG.MAX_TOKENS_BUILD,
+      'fix-errors'
+    );
+  } catch (error) {
+    logError('Bedrock error-fix failed', error);
+    throw error;
+  }
+}
+
+/**
+ * Single-turn call for editing existing project files.
+ */
+export async function editWithAI(contextMessage: string, systemPrompt: string): Promise<string> {
+  try {
+    return await invokeWithRetry(
+      [{ role: 'user', content: contextMessage }],
+      systemPrompt,
+      BEDROCK_CONFIG.MAX_TOKENS_BUILD,
+      'edit'
+    );
+  } catch (error) {
+    logError('Bedrock edit failed', error);
+    throw error;
+  }
+}
+
+/**
+ * Single-turn multimodal call — analyzes an image with an optional text instruction.
+ * imageBase64 must be raw base64 (no data-URL prefix).
+ */
+export async function analyzeImageWithAI(
+  imageBase64: string,
+  mediaType: string,
+  instruction: string,
+  systemPrompt: string
+): Promise<string> {
+  const messages: ConversationTurn[] = [{
+    role: 'user',
+    content: [
+      { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+      { type: 'text', text: instruction },
+    ],
+  }];
+  try {
+    return await invokeWithRetry(messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision');
+  } catch (error) {
+    logError('Bedrock image analysis failed', error);
+    throw error;
+  }
+}
+
+/**
+ * Generate SVG logo options — returns raw text from Claude containing SVG blocks.
+ */
+export async function generateLogoWithAI(prompt: string, systemPrompt: string): Promise<string> {
+  try {
+    return await invokeWithRetry(
+      [{ role: 'user', content: prompt }],
+      systemPrompt,
+      BEDROCK_CONFIG.MAX_TOKENS_CHAT,
+      'logo-gen'
+    );
+  } catch (error) {
+    logError('Bedrock logo generation failed', error);
+    throw error;
+  }
+}

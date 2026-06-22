@@ -1,0 +1,127 @@
+{
+  "the-following-conversation-led-to-this-b-1782073544423": {
+    "projectId": "the-following-conversation-led-to-this-b-1782073544423",
+    "projectPath": "",
+    "createdAt": "2026-06-21T20:25:44.470Z",
+    "updatedAt": "2026-06-21T20:25:49.510Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T20:25:46.994Z",
+        "errorMessage": "No working provider found"
+      },
+      {
+        "category": "sports",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T20:25:46.994Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782074023204": {
+    "projectId": "the-following-conversation-led-to-this-b-1782074023204",
+    "projectPath": "",
+    "createdAt": "2026-06-21T20:33:43.349Z",
+    "updatedAt": "2026-06-21T20:33:43.350Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T20:33:43.350Z",
+        "errorMessage": "No working provider found"
+      },
+      {
+        "category": "sports",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T20:33:43.350Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782078427749": {
+    "projectId": "the-following-conversation-led-to-this-b-1782078427749",
+    "projectPath": "",
+    "createdAt": "2026-06-21T21:47:07.823Z",
+    "updatedAt": "2026-06-21T21:47:07.826Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T21:47:07.825Z",
+        "errorMessage": "No working provider found"
+      },
+      {
+        "category": "sports",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T21:47:07.825Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782083981269": {
+    "projectId": "the-following-conversation-led-to-this-b-1782083981269",
+    "projectPath": "",
+    "createdAt": "2026-06-21T23:19:47.116Z",
+    "updatedAt": "2026-06-21T23:19:47.119Z",
+    "apis": [
+      {
+        "category": "video_downloader",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T23:19:47.118Z",
+        "errorMessage": "No working provider found"
+      },
+      {
+        "category": "sports",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-21T23:19:47.118Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782119751539": {
+    "projectId": "the-following-conversation-led-to-this-b-1782119751539",
+    "projectPath": "",
+    "createdAt": "2026-06-22T09:16:01.206Z",
+    "updatedAt": "2026-06-22T09:16:01.210Z",
+    "apis": [
+      {
+        "category": "music",
+        "providerId": "deezer",
+        "providerName": "Deezer",
+        "rapidApiHost": "deezerdevs-deezer.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T09:16:01.209Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-22T09:16:01.209Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  }
+}
