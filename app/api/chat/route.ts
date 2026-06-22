@@ -519,6 +519,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ success: false, error: 'No prompt or conversation provided' }, { status: 400 });
       }
 
+      // ── RapidAPI registry sync — pick up newly subscribed APIs before planning ──
+      // Runs a lightweight background refresh (uses in-process cache if < 30 min old).
+      // This means every new generate call automatically sees the latest subscriptions
+      // without any manual intervention. The scan is non-blocking and non-fatal.
+      try {
+        const { getRegistry } = await import('@/services/dynamic-registry');
+        await getRegistry(); // warm the cache; triggers a real scan only if stale
+      } catch { /* non-fatal — API Manager will fall back to cached registry */ }
+
       // ── API Manager — detect + plan APIs before AI generation ──────────────────
       // Routes in plan.routes are injected directly into the generated project below
       // (they are not left to the AI to guess from text instructions alone).
@@ -585,13 +594,20 @@ Keep it simple — 5 to 8 files total. Required files:
 Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       ];
 
+      // The caller (builder escalation) may request a specific tier when retrying after
+      // a scaffold fallback — e.g. tier='SONNET' or tier='STRONGEST'.
+      const generateTier: import('@/lib/constants').BedrockTier =
+        body.tier === 'STRONGEST' ? 'STRONGEST'
+        : body.tier === 'SONNET' ? 'SONNET'
+        : 'SONNET'; // default for generation — Haiku is too weak for full app codegen
+
       let projectData = null;
       let lastRawError = '';
 
       for (let attempt = 0; attempt < buildStrategies.length; attempt++) {
         try {
           const strategyPrompt = buildStrategies[attempt]();
-          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT);
+          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, generateTier);
           const parsed = parseProjectFormat(aiResponse);
 
           if (parsed && parsed.files.length > 0 && hasRequiredFiles(parsed)) {
@@ -711,10 +727,15 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         }
       }
 
+      const isScaffoldResponse = !projectData.files.some(
+        (f: { path: string; content: string }) => f.path === 'app/page.tsx' && !f.content.includes('Generating…')
+      );
       return NextResponse.json({
         success: true,
         projectData,
-        scaffoldFallback: !projectData.files.some((f: { path: string; content: string }) => f.path === 'app/page.tsx' && !f.content.includes('Generating…')),
+        scaffoldFallback: isScaffoldResponse,
+        scaffoldReason: isScaffoldResponse ? (lastRawError || 'AI generation returned empty or unparseable output') : undefined,
+        modelTier: generateTier,
         // Surface API plan status to the builder for user messaging
         apiPlan: {
           resolved: apiPlanResolved,

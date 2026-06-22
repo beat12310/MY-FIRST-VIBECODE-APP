@@ -34,7 +34,7 @@ interface DisplayMessage {
 }
 
 type BuildPhase = 'idle' | 'conversing' | 'building' | 'previewing';
-type BuildStep = 'generating' | 'creating' | 'installing' | 'validating' | 'starting' | 'done' | 'error';
+type BuildStep = 'generating' | 'creating' | 'installing' | 'validating' | 'starting' | 'verifying' | 'done' | 'error';
 
 interface UploadedAsset {
   id: string;
@@ -1835,8 +1835,44 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
       setBuildDetailStep('designing');
       setBuildingProjectName(genData.projectData.projectName || 'your application');
-      const plannedFiles: number = genData.projectData.files?.length ?? 0;
-      const isScaffold = genData.scaffoldFallback === true;
+      let plannedFiles: number = genData.projectData.files?.length ?? 0;
+      let isScaffold = genData.scaffoldFallback === true;
+
+      // ── Scaffold recovery: if Haiku failed to generate, escalate to Sonnet → Strongest ──
+      // Never accept a placeholder page as the final build output. The scaffold is only
+      // a structural safety net — we must attempt a real AI generation before continuing.
+      if (isScaffold) {
+        const scaffoldReason = genData.scaffoldReason ?? 'AI returned an unexpected or empty response';
+        appendLog(`⚠️ Initial generation incomplete (${scaffoldReason}) — escalating to Sonnet…`);
+        narrate(
+          `⚠️ The AI returned an unexpected response. Automatically escalating to a stronger model to complete your app…`
+        );
+        setBuildProgress(p => ({ ...p!, step: 'generating', message: '🔄 Re-generating with Sonnet…', logs: [...(p?.logs ?? []), `⚠️ Haiku incomplete — retrying with Sonnet`] }));
+
+        for (const escalationTier of ['SONNET', 'STRONGEST'] as const) {
+          try {
+            const regenData = await api({ action: 'generate', messages: conversationHistory, tier: escalationTier });
+            if (regenData.success && regenData.projectData && !regenData.scaffoldFallback) {
+              genData.projectData = regenData.projectData;
+              isScaffold = false;
+              plannedFiles = regenData.projectData.files?.length ?? 0;
+              appendLog(`✅ Regeneration with ${escalationTier} succeeded — ${plannedFiles} files`);
+              narrate(`✅ **${escalationTier}** generated your app successfully — proceeding with full build.`);
+              break;
+            }
+            appendLog(`⚠️ ${escalationTier} also returned incomplete output — ${escalationTier === 'SONNET' ? 'trying strongest model…' : 'proceeding with scaffold'}`);
+          } catch (e) {
+            appendLog(`⚠️ ${escalationTier} escalation error: ${e instanceof Error ? e.message.slice(0, 100) : 'unknown'}`);
+          }
+        }
+
+        if (isScaffold) {
+          narrate(
+            `⚠️ All AI tiers returned incomplete output. Proceeding with project structure — the engineering loop will attempt to repair and fill in the codebase automatically.`
+          );
+        }
+        setBuildProgress(p => ({ ...p!, step: 'creating', message: '📂 Writing project files…', logs: p?.logs ?? [] }));
+      }
 
       // Surface API plan status — tell the user which APIs are live vs. using free fallbacks
       const apiPlanData: { resolved?: Array<{ category: string; providerName: string }>; missing?: string[]; rapidApiConfigured?: boolean } = genData.apiPlan ?? {};
@@ -2193,10 +2229,12 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       // ═══════════════════════════════════════════════════════════════════════
       setBuildDetailStep('verifying');
       narrate(`Testing the app now — running full verification suite…`);
-      setBuildProgress(p => ({ ...p!, step: 'done', message: '🔍 Autonomous engineering loop active…', logs: [...(p?.logs ?? []), '🤖 Agent loop starting…'] }));
+      // Use 'verifying' — NOT 'done'. The UI must not show ✅ or "Live and Verified"
+      // until the loop has actually completed and all checks have passed.
+      setBuildProgress(p => ({ ...p!, step: 'verifying', message: '🔍 Verification running…', logs: [...(p?.logs ?? []), '🤖 Agent loop starting…'] }));
 
       type RootCause = { kind: string; detail: string; packages?: string[]; envVars?: string[]; errorText?: string; fixFile?: string; fixHint?: string };
-      type VerifyCheck = { name: string; passed: boolean; recordCount?: number; error?: string; rootCause?: RootCause; fixFile?: string; fixHint?: string };
+      type VerifyCheck = { name: string; passed: boolean; recordCount?: number; error?: string; responsePreview?: string; rootCause?: RootCause; fixFile?: string; fixHint?: string };
       type VerifyData = { verified: boolean; summary: string; checks: VerifyCheck[]; failures?: string[] };
 
       // ── Strategy sequences per error kind ─────────────────────────────────
@@ -2218,8 +2256,11 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         // provider-misconfigured: wrong endpoint, bad auth headers, mismatched response schema.
         // targeted → Sonnet minimal patch; broader → Strongest with provider registry context;
         // rewrite → Strongest rewrites the full route with correct provider integration.
-        'provider-misconfigured': ['targeted', 'broader', 'rewrite'],
-        'unknown':               ['cache-clear', 'targeted', 'broader'],
+        'provider-misconfigured':  ['targeted', 'broader', 'rewrite'],
+        // scaffold-placeholder: the main page is still showing the AI generation loading screen.
+        // The only repair is to regenerate — agent-fix rewrites app/page.tsx with the correct app.
+        'scaffold-placeholder':    ['broader', 'rewrite'],
+        'unknown':                 ['cache-clear', 'targeted', 'broader'],
       };
 
       // Per-kind strategy cursor: how many strategies we've consumed for each kind
@@ -2634,6 +2675,23 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           }
         }
       } catch { /* non-critical — proceed with verification result as-is */ }
+
+      // Block "verified" if the main page is still showing the scaffold placeholder.
+      // This catches the case where Bedrock failed during generation and the app
+      // is serving the "Building your app — the agent is generating…" loading page.
+      const scaffoldCheckFailed = verifyData.checks?.some(
+        c => c.name.includes('Main page') && (
+          c.rootCause?.kind === 'scaffold-placeholder' ||
+          (c.passed && c.responsePreview && /Building your app|agent is generating|animate-pulse.*Generat/i.test(c.responsePreview))
+        )
+      ) ?? false;
+      if (isScaffold || scaffoldCheckFailed) {
+        healthBlockers.push(
+          isScaffold
+            ? 'AI generation was incomplete — the app is showing a placeholder page, not the generated application'
+            : 'Preview is still showing the generation placeholder — app has not rendered yet'
+        );
+      }
 
       // A project is only "verified" if all HTTP checks pass AND the health gate passes
       const isFullyVerified = verifyData.verified && healthBlockers.length === 0;

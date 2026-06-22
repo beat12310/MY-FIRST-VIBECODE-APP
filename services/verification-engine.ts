@@ -7,7 +7,7 @@
 // ─── Root cause types ─────────────────────────────────────────────────────────
 
 export interface CheckRootCause {
-  kind: 'missing-package' | 'auth-misconfigured' | 'missing-env' | 'typescript-error' | 'runtime-crash' | 'route-failure' | 'wrong-http-method' | 'timeout' | 'database-error' | 'preview-blank' | 'provider-misconfigured' | 'unknown';
+  kind: 'missing-package' | 'auth-misconfigured' | 'missing-env' | 'typescript-error' | 'runtime-crash' | 'route-failure' | 'wrong-http-method' | 'timeout' | 'database-error' | 'preview-blank' | 'provider-misconfigured' | 'scaffold-placeholder' | 'unknown';
   detail: string;           // plain-English description
   packages?: string[];      // for missing-package: npm package names to install
   envVars?: string[];       // for missing-env: env var names to add
@@ -89,6 +89,18 @@ const PREVIEW_BLANK_PATTERNS = [
   /Text content does not match/i,
   /Minified React error/i,
   /Cannot read propert(?:y|ies) of (?:undefined|null)/i,
+];
+
+// Patterns that identify the DWOMOH scaffold placeholder page — the "Building your app"
+// loading screen that is served when AI generation was incomplete or failed. A 200 on
+// this page must NOT count as a passing verification check.
+const SCAFFOLD_PLACEHOLDER_PATTERNS = [
+  /Building your app.*the agent is generating/i,
+  /the agent is generating the full codebase/i,
+  /animate-pulse.*Generating/i,
+  /Generating….*animate-pulse/i,
+  // Matches the exact text in the scaffold page.tsx
+  /the agent is generating the full codebase now/i,
 ];
 
 // Patterns that indicate a route is failing because of a bad external API integration,
@@ -448,7 +460,31 @@ async function checkEndpoint(
         responsePreview = '(non-JSON body)';
       }
     } else {
-      responsePreview = bodyText.slice(0, 120).replace(/\n/g, ' ');
+      responsePreview = bodyText.slice(0, 200).replace(/\n/g, ' ');
+      // ── Scaffold placeholder detection ──────────────────────────────────
+      // The DWOMOH scaffold fallback serves a valid Next.js HTML page with HTTP 200
+      // when Bedrock generation failed. We must NOT count this as a passing check.
+      // The page text reveals it's still in "generating" state.
+      for (const re of SCAFFOLD_PLACEHOLDER_PATTERNS) {
+        if (re.test(bodyText)) {
+          return {
+            name,
+            url,
+            passed: false,
+            statusCode: res.status,
+            responsePreview,
+            rootCause: {
+              kind: 'scaffold-placeholder',
+              detail: 'Preview is showing the AI generation placeholder ("Building your app…"). The real application has not rendered yet.',
+              fixFile: 'app/page.tsx',
+              fixHint: 'AI generation was incomplete. Trigger a re-generation with a stronger model or ask the user to retry the build.',
+            },
+            error: 'Scaffold placeholder detected — app has not rendered',
+            fixFile: 'app/page.tsx',
+            fixHint: 'Re-generate with Sonnet or Strongest model',
+          };
+        }
+      }
       dataFound = true;
     }
 
