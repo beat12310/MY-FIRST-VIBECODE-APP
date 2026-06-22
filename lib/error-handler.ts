@@ -8,7 +8,7 @@ export class AppError extends Error {
     public code: string,
     message: string,
     public statusCode: number = 500,
-    public details?: any
+    public details?: unknown
   ) {
     super(message);
     this.name = 'AppError';
@@ -76,7 +76,7 @@ export function handleError(error: unknown): {
   message: string;
   code: string;
   statusCode: number;
-  details?: any;
+  details?: unknown;
 } {
   console.error('Error:', error);
 
@@ -187,7 +187,7 @@ export function createError(
   code: ErrorCode,
   message: string,
   statusCode: number = 500,
-  details?: any
+  details?: unknown
 ): AppError {
   return new AppError(code, message, statusCode, details);
 }
@@ -264,7 +264,7 @@ export async function retryOperation<T>(
 export function logError(
   context: string,
   error: unknown,
-  additionalInfo?: Record<string, any>
+  additionalInfo?: Record<string, unknown>
 ): void {
   const timestamp = new Date().toISOString();
   const message = formatErrorMessage(error);
