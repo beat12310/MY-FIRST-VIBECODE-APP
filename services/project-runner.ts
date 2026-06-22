@@ -58,39 +58,53 @@ async function writeServerState(state: ServerState): Promise<void> {
 
 async function killPreviousServer(logs: string[]): Promise<void> {
   const state = await readServerState();
-  if (!state) return;
 
-  logs.push(`🔪 Stopping previous server (pid ${state.pid}, port ${state.port})…`);
+  if (state) {
+    logs.push(`🔪 Stopping previous server (pid ${state.pid}, port ${state.port})…`);
 
-  // Kill the entire process GROUP (negative PID) so Next.js grandchild processes
-  // die along with the npm parent. Without this, next-server survives and keeps
-  // holding the port — causing the new project's server to fail with EADDRINUSE.
-  try {
-    process.kill(-state.pid, 'SIGTERM');
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    try { process.kill(-state.pid, 'SIGKILL'); } catch { /* already dead */ }
-    logs.push(`✓ Process group ${state.pid} stopped`);
-  } catch {
-    logs.push(`ℹ️ Process group already stopped`);
+    // Kill the entire process GROUP (negative PID) so Next.js grandchild processes
+    // die along with the npm parent. Without this, next-server survives and keeps
+    // holding the port — causing the new project's server to fail with EADDRINUSE.
+    try {
+      process.kill(-state.pid, 'SIGTERM');
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      try { process.kill(-state.pid, 'SIGKILL'); } catch { /* already dead */ }
+      logs.push(`✓ Process group ${state.pid} stopped`);
+    } catch {
+      logs.push(`ℹ️ Process group already stopped`);
+    }
+
+    // Belt-and-suspenders: kill any surviving process still holding the port.
+    if (state.port) {
+      try {
+        const pids = execSync(`lsof -ti :${state.port}`, { encoding: 'utf-8', timeout: 3000 }).trim();
+        if (pids) {
+          for (const pid of pids.split('\n').filter(Boolean)) {
+            try { process.kill(Number(pid), 'SIGKILL'); } catch { /* ignore */ }
+          }
+          logs.push(`✓ Port ${state.port} forcibly cleared`);
+        }
+      } catch { /* lsof found nothing on that port */ }
+    }
   }
 
-  // Belt-and-suspenders: kill any surviving process still holding the port.
-  // This catches next-server instances that were started outside this runner
-  // (e.g. manual `npm run dev`) or that escaped the process group kill.
-  if (state.port) {
+  // Sweep the port range used by generated-project servers (3001–3020).
+  // This catches orphaned servers that were started in a previous session and
+  // were never tracked in the state file (e.g. manual `npm run dev` runs).
+  for (let p = PROJECT_CONFIG.PORT_RANGE_START + 1; p <= PROJECT_CONFIG.PORT_RANGE_START + 20; p++) {
     try {
-      const pids = execSync(`lsof -ti :${state.port}`, { encoding: 'utf-8', timeout: 3000 }).trim();
+      const pids = execSync(`lsof -ti :${p}`, { encoding: 'utf-8', timeout: 2000 }).trim();
       if (pids) {
         for (const pid of pids.split('\n').filter(Boolean)) {
-          try { process.kill(Number(pid), 'SIGKILL'); } catch { /* ignore */ }
+          try { process.kill(Number(pid), 'SIGKILL'); } catch { /* already gone */ }
         }
-        logs.push(`✓ Port ${state.port} forcibly cleared`);
+        logs.push(`✓ Cleared orphaned process(es) on port ${p}`);
       }
-    } catch { /* lsof found nothing on that port */ }
+    } catch { /* lsof found nothing */ }
   }
 
   // Give the OS time to release the port before the caller probes for availability
-  await new Promise(resolve => setTimeout(resolve, 600));
+  await new Promise(resolve => setTimeout(resolve, 800));
 }
 
 // ── Install dependencies ───────────────────────────────────────────────────

@@ -604,11 +604,13 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       let projectData = null;
       let lastRawError = '';
+      // Track if the requested tier was unavailable — used to fall back to HAIKU
+      let activeTier: import('@/lib/constants').BedrockTier = generateTier;
 
       for (let attempt = 0; attempt < buildStrategies.length; attempt++) {
         try {
           const strategyPrompt = buildStrategies[attempt]();
-          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, generateTier);
+          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, activeTier);
           const parsed = parseProjectFormat(aiResponse);
 
           if (parsed && parsed.files.length > 0 && hasRequiredFiles(parsed)) {
@@ -624,6 +626,30 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         } catch (err) {
           lastRawError = err instanceof Error ? err.message : `Strategy ${attempt + 1} threw`;
           console.error('[generate] Strategy', attempt + 1, 'threw:', lastRawError);
+
+          // If the requested model tier is unavailable, fall back to HAIKU and immediately
+          // retry THIS strategy before moving on. "invalid model identifier" means the
+          // model ID doesn't exist in this account/region — Haiku 4.5 is the most
+          // widely available cross-region model.
+          if (activeTier !== 'HAIKU' && (lastRawError.toLowerCase().includes('model identifier is invalid') || lastRawError.includes('provided model identifier'))) {
+            console.warn(`[generate] ${activeTier} model unavailable — retrying strategy ${attempt + 1} with HAIKU`);
+            activeTier = 'HAIKU';
+            try {
+              const retryResponse = await buildWithAI(buildStrategies[attempt](), BUILD_SYSTEM_PROMPT, 'HAIKU');
+              const retryParsed = parseProjectFormat(retryResponse);
+              if (retryParsed && retryParsed.files.length > 0 && hasRequiredFiles(retryParsed)) {
+                projectData = retryParsed;
+                break;
+              }
+              lastRawError = retryParsed
+                ? `Strategy ${attempt + 1} (HAIKU retry): Missing root page file`
+                : `Strategy ${attempt + 1} (HAIKU retry): No [START_PROJECT] block`;
+              console.error(`[generate] ${lastRawError}`);
+            } catch (retryErr) {
+              lastRawError = retryErr instanceof Error ? retryErr.message : `HAIKU retry threw`;
+              console.error('[generate] HAIKU retry threw:', lastRawError);
+            }
+          }
         }
 
         if (attempt < buildStrategies.length - 1) {
@@ -771,6 +797,41 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       const ownerUserId = createAuthUser?.sub ?? 'anonymous';
 
       const result = await generateProject(projectData.projectName, projectData.files);
+
+      // Force-write a known-good Next.js tsconfig immediately after file creation.
+      // AI models hallucinate non-existent compiler options (e.g. useDefineForEnumMembers)
+      // that cause TS5023 and crash `next dev` before the first page loads.
+      // We preserve any extra `paths` the AI added so module aliases still work.
+      {
+        const tsconfigPath = join(result.projectPath, 'tsconfig.json');
+        const SAFE_TSCONFIG = {
+          compilerOptions: {
+            lib: ['dom', 'dom.iterable', 'esnext'],
+            allowJs: true,
+            skipLibCheck: true,
+            strict: true,
+            noEmit: true,
+            esModuleInterop: true,
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            resolveJsonModule: true,
+            isolatedModules: true,
+            jsx: 'preserve',
+            incremental: true,
+            plugins: [{ name: 'next' }],
+            paths: { '@/*': ['./*'] } as Record<string, string[]>,
+          },
+          include: ['next-env.d.ts', '**/*.ts', '**/*.tsx', '.next/types/**/*.ts'],
+          exclude: ['node_modules'],
+        };
+        try {
+          const existing = JSON.parse(await readFile(tsconfigPath, 'utf-8').catch(() => '{}'));
+          if (existing.compilerOptions?.paths) {
+            Object.assign(SAFE_TSCONFIG.compilerOptions.paths, existing.compilerOptions.paths);
+          }
+        } catch { /* ignore parse errors */ }
+        await writeFile(tsconfigPath, JSON.stringify(SAFE_TSCONFIG, null, 2) + '\n', 'utf-8').catch(() => {});
+      }
 
       // Save to project manifest — stamped with ownerUserId for per-user isolation
       const saved = await saveProject({
