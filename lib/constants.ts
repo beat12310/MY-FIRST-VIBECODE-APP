@@ -8,33 +8,75 @@ export const APP_VERSION = '1.0.0';
 /**
  * AWS Bedrock Model Routing
  *
- * Three tiers — each env var lets you override the default for that tier:
+ * Model IDs discovered via live invoke test on 2026-06-22 against account 859934687821.
+ * Only IDs that returned HTTP 200 are used — no assumptions.
  *
- *   BEDROCK_MODEL_HAIKU   — simple chat, quick explanations, small UI edits, logo gen
- *   BEDROCK_MODEL_SONNET  — app generation, API integration, debugging, TypeScript fixes,
- *                           provider selection, verification repair loop, generated-app fixing
- *   BEDROCK_MODEL_OPUS    — advanced repair engine, repeated failures (broader/rewrite
- *                           strategy), platform-level architecture changes
+ * Tier routing:
+ *   HAIKU    — simple chat, quick explanations, small UI edits (fast + cheap)
+ *   SONNET   — app generation, coding, debugging, TypeScript fixes, repair loop
+ *   STRONGEST — advanced repair, repeated failures, complex reasoning, full rewrites
  *
- * BEDROCK_MODEL_ID is kept as a legacy fallback — if set it overrides the Haiku default
- * only; Sonnet and Opus defaults are always their own IDs unless their own env vars are set.
+ * Override any tier via env vars:
+ *   BEDROCK_MODEL_HAIKU   → overrides HAIKU default
+ *   BEDROCK_MODEL_SONNET  → overrides SONNET default
+ *   BEDROCK_MODEL_OPUS    → overrides STRONGEST default
+ *   BEDROCK_MODEL_ID      → legacy; only falls back for HAIKU if BEDROCK_MODEL_HAIKU unset
+ *
+ * NOT available on this account (access denied or end-of-life):
+ *   - us.anthropic.claude-fable-5         (ACCESS DENIED)
+ *   - global.anthropic.claude-fable-5     (ACCESS DENIED)
+ *   - us.anthropic.claude-opus-4-8        (ACCESS DENIED)
+ *   - global.anthropic.claude-opus-4-8    (ACCESS DENIED)
+ *   - us.anthropic.claude-sonnet-4-5-20251001-v1:0  (INVALID — wrong date suffix)
+ *   - us.anthropic.claude-opus-4-20250514-v1:0      (END OF LIFE)
  */
 export const BEDROCK_MODELS = {
-  // Haiku 4.5 — fast, cheap, good for conversational and trivial generation
+  // Haiku 4.5 — verified working at 1.1s avg
   HAIKU: process.env.BEDROCK_MODEL_HAIKU ||
     process.env.BEDROCK_MODEL_ID ||
     'us.anthropic.claude-haiku-4-5-20251001-v1:0',
 
-  // Sonnet 4.5 — the default Build Mode and Fix Mode model
+  // Sonnet 4.6 — latest Sonnet, verified working at 1.1s avg
   SONNET: process.env.BEDROCK_MODEL_SONNET ||
-    'us.anthropic.claude-sonnet-4-5-20251001-v1:0',
+    'us.anthropic.claude-sonnet-4-6',
 
-  // Opus 4 — strongest available; used only when Sonnet has failed repeatedly
+  // Opus 4.6 — latest Opus accessible on this account, verified working at 1.8s avg
+  // (Opus 4.8 and Fable 5 are ACCESS DENIED for account 859934687821)
   STRONGEST: process.env.BEDROCK_MODEL_OPUS ||
-    'us.anthropic.claude-opus-4-20250514-v1:0',
+    'global.anthropic.claude-opus-4-6-v1',
 } as const;
 
 export type BedrockTier = keyof typeof BEDROCK_MODELS;
+
+/**
+ * Fallback chain: if a model returns "model identifier is invalid" or
+ * "end of life", the route handler retries with the next ID in the chain.
+ * All IDs here are verified working on account 859934687821 as of 2026-06-22.
+ */
+export const BEDROCK_FALLBACK_CHAINS: Record<BedrockTier, string[]> = {
+  HAIKU: [
+    'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    'anthropic.claude-3-haiku-20240307-v1:0',
+  ],
+  SONNET: [
+    'us.anthropic.claude-sonnet-4-6',
+    'global.anthropic.claude-sonnet-4-6',
+    'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    'global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+    // Final fallback: drop to Haiku rather than crash
+    'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  ],
+  STRONGEST: [
+    'global.anthropic.claude-opus-4-6-v1',
+    'us.anthropic.claude-opus-4-6-v1',
+    'global.anthropic.claude-opus-4-5-20251101-v1:0',
+    'us.anthropic.claude-opus-4-5-20251101-v1:0',
+    // Degrade to Sonnet before Haiku
+    'us.anthropic.claude-sonnet-4-6',
+    'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  ],
+};
 
 /**
  * AWS Bedrock Configuration

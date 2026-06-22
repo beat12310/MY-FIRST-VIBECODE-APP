@@ -604,17 +604,17 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       let projectData = null;
       let lastRawError = '';
-      // Track if the requested tier was unavailable — used to fall back to HAIKU
-      let activeTier: import('@/lib/constants').BedrockTier = generateTier;
 
       for (let attempt = 0; attempt < buildStrategies.length; attempt++) {
         try {
           const strategyPrompt = buildStrategies[attempt]();
-          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, activeTier);
+          // buildWithAI now uses BEDROCK_FALLBACK_CHAINS internally — if the primary
+          // model for generateTier is unavailable it automatically tries the next one
+          // in the chain (e.g. Sonnet 4.6 → Sonnet 4.5 → Haiku) without any manual retry.
+          const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, generateTier);
           const parsed = parseProjectFormat(aiResponse);
 
           if (parsed && parsed.files.length > 0 && hasRequiredFiles(parsed)) {
-            // Patch: if package.json is missing, the managed scaffold adds it anyway — accept the output
             projectData = parsed;
             break;
           }
@@ -626,30 +626,6 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         } catch (err) {
           lastRawError = err instanceof Error ? err.message : `Strategy ${attempt + 1} threw`;
           console.error('[generate] Strategy', attempt + 1, 'threw:', lastRawError);
-
-          // If the requested model tier is unavailable, fall back to HAIKU and immediately
-          // retry THIS strategy before moving on. "invalid model identifier" means the
-          // model ID doesn't exist in this account/region — Haiku 4.5 is the most
-          // widely available cross-region model.
-          if (activeTier !== 'HAIKU' && (lastRawError.toLowerCase().includes('model identifier is invalid') || lastRawError.includes('provided model identifier'))) {
-            console.warn(`[generate] ${activeTier} model unavailable — retrying strategy ${attempt + 1} with HAIKU`);
-            activeTier = 'HAIKU';
-            try {
-              const retryResponse = await buildWithAI(buildStrategies[attempt](), BUILD_SYSTEM_PROMPT, 'HAIKU');
-              const retryParsed = parseProjectFormat(retryResponse);
-              if (retryParsed && retryParsed.files.length > 0 && hasRequiredFiles(retryParsed)) {
-                projectData = retryParsed;
-                break;
-              }
-              lastRawError = retryParsed
-                ? `Strategy ${attempt + 1} (HAIKU retry): Missing root page file`
-                : `Strategy ${attempt + 1} (HAIKU retry): No [START_PROJECT] block`;
-              console.error(`[generate] ${lastRawError}`);
-            } catch (retryErr) {
-              lastRawError = retryErr instanceof Error ? retryErr.message : `HAIKU retry threw`;
-              console.error('[generate] HAIKU retry threw:', lastRawError);
-            }
-          }
         }
 
         if (attempt < buildStrategies.length - 1) {

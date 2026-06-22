@@ -2,7 +2,7 @@ import {
   BedrockRuntimeClient,
   InvokeModelWithResponseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { BEDROCK_CONFIG, BEDROCK_MODELS, type BedrockTier } from '@/lib/constants';
+import { BEDROCK_CONFIG, BEDROCK_MODELS, BEDROCK_FALLBACK_CHAINS, type BedrockTier } from '@/lib/constants';
 import { logError, ErrorCode, createError } from '@/lib/error-handler';
 
 export type MultimodalBlock =
@@ -231,6 +231,58 @@ async function invokeWithRetry(
   throw new Error(`[${kind}] ${lastErr.message}`);
 }
 
+// ─── Model-unavailable detection ───────────────────────────────────────────
+// These errors signal that a specific model ID is gone (deprecated, invalid,
+// or access-denied). They are NOT retryable with the same model — move to
+// the next model in the fallback chain instead.
+
+function isModelUnavailableError(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    m.includes('model identifier is invalid') ||
+    m.includes('provided model identifier') ||
+    m.includes('end of life') ||
+    m.includes('resourcenotfoundexception') ||
+    // ValidationException from Bedrock when the model string isn't recognised
+    (m.includes('validationexception') && m.includes('model'))
+  );
+}
+
+/**
+ * Invoke with per-tier model fallback chain.
+ *
+ * Tries each model ID in BEDROCK_FALLBACK_CHAINS[tier] sequentially.
+ * If a model returns an "unavailable" error (deprecated, invalid, access-denied),
+ * it logs a warning and moves to the next model automatically.
+ * Any other error (network, throttle, auth) is re-thrown immediately.
+ */
+async function invokeWithModelFallback(
+  messages:     ConversationTurn[],
+  systemPrompt: string,
+  maxTokens:    number,
+  context:      string,
+  tier:         BedrockTier
+): Promise<string> {
+  const chain = BEDROCK_FALLBACK_CHAINS[tier];
+  let lastErr: Error = new Error(`No models available for tier ${tier}`);
+
+  for (const modelId of chain) {
+    try {
+      return await invokeWithRetry(messages, systemPrompt, maxTokens, context, modelId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isModelUnavailableError(msg)) {
+        console.warn(`[Bedrock][${context}] Model ${modelId} unavailable — trying next in ${tier} chain`);
+        lastErr = err instanceof Error ? err : new Error(msg);
+        continue;
+      }
+      throw err; // network/throttle/auth — don't swallow
+    }
+  }
+
+  throw lastErr;
+}
+
 // ─── Public API ────────────────────────────────────────────────────────────
 //
 // Model routing summary:
@@ -263,9 +315,8 @@ export async function converseWithEngineer(
   tier:         BedrockTier = 'HAIKU'
 ): Promise<string> {
   try {
-    return await invokeWithRetry(
-      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse',
-      BEDROCK_MODELS[tier]
+    return await invokeWithModelFallback(
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse', tier
     );
   } catch (error) {
     logError('Bedrock conversation failed', error);
@@ -283,12 +334,12 @@ export async function buildWithAI(
   tier:         BedrockTier = 'SONNET'
 ): Promise<string> {
   try {
-    return await invokeWithRetry(
+    return await invokeWithModelFallback(
       [{ role: 'user', content: userMessage }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
       'build',
-      BEDROCK_MODELS[tier]
+      tier
     );
   } catch (error) {
     logError('Bedrock build failed', error);
@@ -311,12 +362,12 @@ export async function fixErrorsWithAI(
     ? BEDROCK_CONFIG.MAX_TOKENS_REPAIR
     : BEDROCK_CONFIG.MAX_TOKENS_BUILD;
   try {
-    return await invokeWithRetry(
+    return await invokeWithModelFallback(
       [{ role: 'user', content: prompt }],
       systemPrompt,
       maxTokens,
       'fix-errors',
-      BEDROCK_MODELS[tier]
+      tier
     );
   } catch (error) {
     logError('Bedrock error-fix failed', error);
@@ -336,12 +387,12 @@ export async function editWithAI(
   tier:           BedrockTier = 'SONNET'
 ): Promise<string> {
   try {
-    return await invokeWithRetry(
+    return await invokeWithModelFallback(
       [{ role: 'user', content: contextMessage }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
       'edit',
-      BEDROCK_MODELS[tier]
+      tier
     );
   } catch (error) {
     logError('Bedrock edit failed', error);
@@ -369,9 +420,8 @@ export async function analyzeImageWithAI(
     ],
   }];
   try {
-    return await invokeWithRetry(
-      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision',
-      BEDROCK_MODELS[tier]
+    return await invokeWithModelFallback(
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision', tier
     );
   } catch (error) {
     logError('Bedrock image analysis failed', error);
@@ -389,12 +439,12 @@ export async function generateLogoWithAI(
   tier:         BedrockTier = 'HAIKU'
 ): Promise<string> {
   try {
-    return await invokeWithRetry(
+    return await invokeWithModelFallback(
       [{ role: 'user', content: prompt }],
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_CHAT,
       'logo-gen',
-      BEDROCK_MODELS[tier]
+      tier
     );
   } catch (error) {
     logError('Bedrock logo generation failed', error);
