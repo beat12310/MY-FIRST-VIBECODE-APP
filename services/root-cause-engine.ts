@@ -84,13 +84,26 @@ const PLACEHOLDER_VALUES = new Set([
   '',
 ]);
 
-const CREDENTIALS_VARS = [
-  'RAPIDAPI_KEY', 'OPENAI_API_KEY', 'STRIPE_SECRET_KEY', 'STRIPE_PUBLISHABLE_KEY',
-  'PAYSTACK_SECRET_KEY', 'PAYSTACK_PUBLIC_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN',
-  'RESEND_API_KEY', 'SENDGRID_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_MAPS_API_KEY',
-  'SUPABASE_SERVICE_ROLE_KEY', 'NEXT_PUBLIC_SUPABASE_URL', 'DATABASE_URL',
-  'NEXTAUTH_SECRET', 'AUTH_SECRET', 'JWT_SECRET', 'SESSION_SECRET',
-];
+// Known credential key names — used ONLY as a type-classification list to
+// tell "this is a real secret" from "this is a config string".
+// We do NOT check all of these for every project. We only check the subset
+// that the project's source code actually references.
+const KNOWN_CREDENTIAL_KEYS = new Set([
+  'RAPIDAPI_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
+  'STRIPE_SECRET_KEY', 'STRIPE_PUBLISHABLE_KEY', 'STRIPE_WEBHOOK_SECRET',
+  'PAYSTACK_SECRET_KEY', 'PAYSTACK_PUBLIC_KEY',
+  'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER',
+  'RESEND_API_KEY', 'SENDGRID_API_KEY', 'MAILGUN_API_KEY',
+  'GOOGLE_API_KEY', 'GOOGLE_MAPS_API_KEY', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET',
+  'SUPABASE_SERVICE_ROLE_KEY', 'NEXT_PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  'DATABASE_URL', 'MONGODB_URI',
+  'NEXTAUTH_SECRET', 'AUTH_SECRET', 'JWT_SECRET', 'SESSION_SECRET', 'MANAGED_JWT_SECRET',
+  'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+  'CLOUDINARY_URL', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET',
+  'GITHUB_TOKEN', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET',
+  'DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET',
+  'FACEBOOK_APP_ID', 'FACEBOOK_APP_SECRET',
+]);
 
 const AUTH_PATTERNS = [
   /NEXTAUTH_SECRET/i, /AUTH_SECRET/i, /\[next-auth\]/i, /next-auth.*error/i,
@@ -133,22 +146,110 @@ async function readEnvFile(projectPath: string): Promise<Record<string, string>>
   return result;
 }
 
-function findMissingCredentials(envVars: Record<string, string>): {
-  missing: string[];
-  placeholder: string[];
-} {
+// ── Source-code env-var scanner ────────────────────────────────────────────
+// Reads the project's actual source files and extracts every process.env.KEY
+// reference. Only keys that appear in the source AND are in KNOWN_CREDENTIAL_KEYS
+// get checked for presence in .env.local.
+//
+// This prevents the health check from flagging STRIPE_SECRET_KEY, OPENAI_API_KEY,
+// PAYSTACK_KEY, etc. as "missing" when the app never references them.
+
+const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs']);
+const ENV_REF_RE = /process\.env\.([A-Z_][A-Z0-9_]+)/g;
+
+// Directories that are DWOMOH platform boilerplate — injected into every generated
+// app but not reflective of the app's own credential requirements.
+// Keys found only in these directories should not trigger "missing credential" warnings.
+const MANAGED_DIRS = new Set(['lib/managed', 'lib/managed/']);
+
+async function scanProjectForEnvRefs(projectPath: string): Promise<Set<string>> {
+  const found = new Set<string>();
+  const dirsToScan = ['app', 'lib', 'services', 'components', 'pages', 'src'];
+
+  async function walk(dir: string, relativeDir: string): Promise<void> {
+    let entries: import('fs').Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    await Promise.all(entries.map(async entry => {
+      const fullPath = join(dir, entry.name);
+      const relPath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+
+      if (entry.isDirectory()) {
+        const skip = entry.name === 'node_modules' || entry.name === '.next' || entry.name === '.git';
+        // Skip lib/managed — platform boilerplate; its env refs are managed by DWOMOH, not the app
+        const isManaged = MANAGED_DIRS.has(relPath) || MANAGED_DIRS.has(`${relPath}/`);
+        if (!skip && !isManaged) {
+          await walk(fullPath, relPath);
+        }
+      } else if (entry.isFile()) {
+        const ext = entry.name.slice(entry.name.lastIndexOf('.'));
+        if (!SOURCE_EXTENSIONS.has(ext)) return;
+        try {
+          const src = await readFile(fullPath, 'utf-8');
+          let m: RegExpExecArray | null;
+          ENV_REF_RE.lastIndex = 0;
+          while ((m = ENV_REF_RE.exec(src)) !== null) {
+            found.add(m[1]);
+          }
+        } catch { /* skip unreadable file */ }
+      }
+    }));
+  }
+
+  for (const d of dirsToScan) {
+    await walk(join(projectPath, d), d);
+  }
+  return found;
+}
+
+async function findMissingCredentials(
+  envVars: Record<string, string>,
+  projectPath: string,
+): Promise<{ missing: string[]; placeholder: string[] }> {
   const missing: string[] = [];
   const placeholder: string[] = [];
 
-  for (const key of CREDENTIALS_VARS) {
+  // Find every process.env.KEY the project actually references
+  const usedKeys = await scanProjectForEnvRefs(projectPath);
+
+  // Only evaluate keys that are (a) referenced in source AND (b) are known credentials
+  const keysToCheck = [...usedKeys].filter(k => KNOWN_CREDENTIAL_KEYS.has(k));
+
+  for (const key of keysToCheck) {
     const val = envVars[key];
-    if (val === undefined) {
+    if (val === undefined || val === '') {
       missing.push(key);
-    } else if (PLACEHOLDER_VALUES.has(val) || val.length < 5) {
+    } else if (PLACEHOLDER_VALUES.has(val) || isPlaceholderValue(val)) {
       placeholder.push(key);
     }
   }
   return { missing, placeholder };
+}
+
+function isPlaceholderValue(val: string): boolean {
+  if (val.length < 4) return true;
+  const v = val.toLowerCase();
+  return (
+    v.startsWith('your_') ||
+    v.startsWith('your-') ||
+    v.startsWith('paste_') ||
+    v.startsWith('replace_') ||
+    v.startsWith('insert_') ||
+    v.startsWith('add_your_') ||
+    v.startsWith('enter_') ||
+    v.includes('_here') ||
+    v.includes('-here') ||
+    v.includes('_placeholder') ||
+    v.includes('example.com') ||
+    v.includes('test_key') ||
+    v === 'null' ||
+    v === 'undefined' ||
+    v === 'false' ||
+    /^[x]+$/i.test(v)    // xxx, XXXX, etc.
+  );
 }
 
 // ── Log analysis ──────────────────────────────────────────────────────────────
@@ -420,7 +521,8 @@ export async function investigateRootCause(opts: InvestigateOptions): Promise<Ro
 
   // ── 1. Read env vars ───────────────────────────────────────────────────────
   const envVars = await readEnvFile(projectPath);
-  const { missing, placeholder } = findMissingCredentials(envVars);
+  // Source-aware: only flags credentials the project actually uses via process.env.KEY
+  const { missing, placeholder } = await findMissingCredentials(envVars, projectPath);
 
   if (missing.length > 0) {
     findings.push({

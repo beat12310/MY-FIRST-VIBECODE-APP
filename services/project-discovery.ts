@@ -9,6 +9,64 @@ const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.css', '.json', '.md
 const MAX_READ = 40 * 1024; // 40KB per file for edit context
 const MAX_CHAT_READ = 3 * 1024; // 3KB per file for chat context (shorter)
 
+/**
+ * Returns true when a value from .env.local.example (or .env.local) is clearly
+ * a template placeholder rather than a real credential.
+ *
+ * This prevents the discovery engine from marking keys as "missing" when the
+ * project never actually needs them — e.g. AWS keys for an app that only uses
+ * RAPIDAPI_KEY, or a default JWT secret for an app that generates its own.
+ */
+function isDiscoveryPlaceholder(val: string): boolean {
+  if (!val || val.length < 4) return true;
+  const v = val.toLowerCase();
+  return (
+    // Explicit "your_" / "your-" template prefix
+    v.startsWith('your_') ||
+    v.startsWith('your-') ||
+    v.startsWith('my_') ||
+    v.startsWith('my-') ||
+    // "paste_" / "replace_" / "insert_" prefixes from generated examples
+    v.startsWith('paste_') ||
+    v.startsWith('replace_') ||
+    v.startsWith('insert_') ||
+    v.startsWith('enter_') ||
+    v.startsWith('add_') ||
+    // Suffix hints
+    v.endsWith('_here') ||
+    v.endsWith('-here') ||
+    v.endsWith('_key') ||
+    v.endsWith('_secret') ||
+    v.endsWith('_placeholder') ||
+    // Well-known placeholder patterns
+    v === 'placeholder' ||
+    v === 'xxx' ||
+    v === 'null' ||
+    v === 'undefined' ||
+    v === 'false' ||
+    v === 'true' ||
+    v === 'changeme' ||
+    v === 'change_me' ||
+    v === 'replace_me' ||
+    /^x+$/i.test(v) ||
+    v.includes('_replace_') ||
+    v.includes('-replace-') ||
+    // Email template addresses (not real credentials)
+    (v.includes('@') && (
+      v.includes('example.com') ||
+      v.includes('your-') ||
+      v.includes('yourapp') ||
+      v.includes('yourdomain')
+    )) ||
+    // AWS example ARNs / account IDs
+    v.includes('123456789012') ||
+    // Generic "test" / "demo" values
+    v === 'test' ||
+    v === 'demo' ||
+    v === 'sample'
+  );
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface DiscoveredFile {
@@ -217,7 +275,10 @@ export async function discoverProject(projectPath: string): Promise<DiscoveryRes
       if (eqIdx > 0) {
         const key = line.slice(0, eqIdx).trim().replace(/^#\s*/, '');
         const val = localVars[key];
-        if (!val || val.startsWith('your_') || val === '') {
+        // Only flag as missing if:
+        // 1. The key has no value in .env.local, OR
+        // 2. The value in .env.local is a recognizable placeholder
+        if (!val || isDiscoveryPlaceholder(val)) {
           missingCredentials.push({ key, description: lastComment || key });
         }
         lastComment = '';
