@@ -796,10 +796,17 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
     // ── fix-errors: classify → missing packages first, then AI code fix ────────
     if (action === 'fix-errors') {
-      const { errors, filePaths } = body;
+      const { errors, filePaths, tier: fixTier } = body;
       if (!projectPath || !errors?.length) {
         return NextResponse.json({ success: false, error: 'Missing projectPath or errors' }, { status: 400 });
       }
+
+      // Haiku handles trivial TS fixes; Sonnet is the default for non-trivial errors;
+      // callers may pass tier='STRONGEST' to escalate on repeated failures.
+      const fixErrorsTier: import('@/lib/constants').BedrockTier =
+        fixTier === 'STRONGEST' ? 'STRONGEST'
+        : fixTier === 'HAIKU' ? 'HAIKU'
+        : 'SONNET'; // default — TypeScript + code fixes need Sonnet's reasoning
 
       const errorText = Array.isArray(errors) ? errors.join('\n') : String(errors);
 
@@ -850,7 +857,7 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       const affected = resolvedPaths.length > 0 ? resolvedPaths : ['app/page.tsx', 'app/layout.tsx'];
       const sourceFiles = await readProjectFiles(projectPath, affected);
       const fixPrompt = generateErrorFixPrompt(errors, sourceFiles);
-      const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT);
+      const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT, fixErrorsTier);
 
       let fixedFiles = parseEditFormat(aiResponse);
       if (fixedFiles.length === 0) {
@@ -1739,6 +1746,66 @@ Return ONLY the corrected file in this exact format:
             const content = await readFile(join(projectPath, ref), 'utf-8');
             extraContextFiles.push(`=== ${ref} (referenced in error) ===\n${content.slice(0, 2000)}`);
           } catch {}
+        }
+
+        // ── Provider registry context ──────────────────────────────────────
+        // When fixing API routes that call external providers, inject the correct
+        // provider details so Strongest/Sonnet can fix the integration, not just
+        // the syntax. This is what enables "football app provider error → Sonnet/
+        // Strongest rewrites the route with the right LiveScore 6 endpoint + headers."
+        const allErrorText = errorContext + '\n' + serverLogs + '\n' + browserErrors;
+        const isProviderError = /provider.misconfigured|rapidapi|external.*api|fetch.failed|upstream|rate.?limit/i.test(allErrorText);
+        const hasApiRouteTargets = targetFiles.some(f => f.includes('/api/'));
+        if (isProviderError || hasApiRouteTargets) {
+          try {
+            // Infer what the route is doing from its name + error text keywords
+            const routeSegments = targetFiles.map(f => f.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') ?? '');
+            const domainKeywords = (allErrorText.match(
+              /\b(football|soccer|cricket|basketball|sport|score|match|fixture|weather|currency|exchange|crypto|stock|news|music|video|travel|hotel|flight|restaurant|map|location|country|finance)\b/gi
+            ) ?? []).map(w => w.toLowerCase());
+            const inferredNeed = [...new Set([...routeSegments, ...domainKeywords])].filter(Boolean).join(' ');
+
+            if (inferredNeed.trim()) {
+              const { selectProvider } = await import('@/services/provider-engine');
+              const plan = await selectProvider({ need: inferredNeed });
+              if (plan.primary) {
+                const p = plan.primary;
+                const rapidEntry = p.rapidApiEntry;
+                let providerBlock = `Provider: ${p.name} [${p.tier}]\nDescription: ${p.description}`;
+                if (p.tier === 'rapidapi' && rapidEntry) {
+                  providerBlock += `\nRapidAPI Host: ${rapidEntry.host}`;
+                  // testEndpoint is the verified working endpoint for this provider
+                  if (rapidEntry.testEndpoint) {
+                    const method = rapidEntry.testMethod ?? 'GET';
+                    providerBlock += `\nSample endpoint: ${method} ${rapidEntry.testEndpoint}`;
+                    if (rapidEntry.testParams && Object.keys(rapidEntry.testParams).length) {
+                      providerBlock += `\nSample params: ${JSON.stringify(rapidEntry.testParams)}`;
+                    }
+                  }
+                  providerBlock += `\nRequired auth headers:\n  X-RapidAPI-Key: process.env.RAPIDAPI_KEY\n  X-RapidAPI-Host: "${rapidEntry.host}"`;
+                } else if (p.tier === 'public' && p.publicEntry) {
+                  const pe = p.publicEntry;
+                  providerBlock += `\nBase URL: ${pe.buildUrl(pe.testParams ?? {})}`;
+                  providerBlock += `\nNo auth key required`;
+                } else if (p.tier === 'aws') {
+                  providerBlock += `\nAWS service: ${p.awsService}\nKey env var: AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY`;
+                }
+                if (p.keyEnvVar) providerBlock += `\nKey env var: ${p.keyEnvVar}`;
+                if (plan.alternatives.length) {
+                  providerBlock += `\nAlternatives available: ${plan.alternatives.slice(0, 3).map(a => `${a.name} [${a.tier}]`).join(', ')}`;
+                }
+                extraContextFiles.push(`=== DWOMOH Provider Registry — recommended provider for this fix ===\n${providerBlock}`);
+              } else {
+                extraContextFiles.push(
+                  `=== DWOMOH Provider Registry ===\n` +
+                  `No subscribed RapidAPI provider found for inferred need: "${inferredNeed}". ` +
+                  `Rationale: ${plan.rationale}. ` +
+                  `Searched tiers: ${plan.tierSummary.map(t => `${t.tier}(${t.found} found)`).join(', ')}. ` +
+                  `Fallback options: use a free public API or check RAPIDAPI_KEY subscription.`
+                );
+              }
+            }
+          } catch { /* provider engine unavailable — non-critical, continue without provider context */ }
         }
       }
 

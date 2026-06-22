@@ -2203,19 +2203,23 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       // Each kind has ordered strategies tried in sequence.
       // When a strategy fails to improve the check count, the next is tried.
       const ERROR_STRATEGIES: Record<string, ReadonlyArray<string>> = {
-        'missing-package':    ['auto-install'],
-        'auth-misconfigured': ['add-secret', 'targeted'],
-        'missing-env':        ['add-placeholder'],
-        'wrong-http-method':  ['targeted', 'broader', 'rewrite'],
-        'server-crash':       ['cache-clear', 'targeted', 'broader', 'rewrite'],
-        'not-found':          ['targeted', 'broader'],
-        'timeout':            ['targeted', 'broader', 'rewrite'],
-        'database-error':     ['targeted', 'broader', 'rewrite'],
-        'typescript-error':   ['targeted', 'broader'],
-        'route-failure':      ['targeted', 'broader', 'rewrite'],
-        'runtime-crash':      ['cache-clear', 'targeted', 'broader', 'rewrite'],
-        'preview-blank':      ['targeted', 'broader', 'cache-clear'],
-        'unknown':            ['cache-clear', 'targeted', 'broader'],
+        'missing-package':       ['auto-install'],
+        'auth-misconfigured':    ['add-secret', 'targeted'],
+        'missing-env':           ['add-placeholder'],
+        'wrong-http-method':     ['targeted', 'broader', 'rewrite'],
+        'server-crash':          ['cache-clear', 'targeted', 'broader', 'rewrite'],
+        'not-found':             ['targeted', 'broader'],
+        'timeout':               ['targeted', 'broader', 'rewrite'],
+        'database-error':        ['targeted', 'broader', 'rewrite'],
+        'typescript-error':      ['targeted', 'broader'],
+        'route-failure':         ['targeted', 'broader', 'rewrite'],
+        'runtime-crash':         ['cache-clear', 'targeted', 'broader', 'rewrite'],
+        'preview-blank':         ['targeted', 'broader', 'cache-clear'],
+        // provider-misconfigured: wrong endpoint, bad auth headers, mismatched response schema.
+        // targeted → Sonnet minimal patch; broader → Strongest with provider registry context;
+        // rewrite → Strongest rewrites the full route with correct provider integration.
+        'provider-misconfigured': ['targeted', 'broader', 'rewrite'],
+        'unknown':               ['cache-clear', 'targeted', 'broader'],
       };
 
       // Per-kind strategy cursor: how many strategies we've consumed for each kind
@@ -2294,6 +2298,12 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             if (loopInvestigation.success && loopInvestigation.report) {
               const lr = loopInvestigation.report;
               appendLog(`🔍 Root cause: ${lr.primaryLayer} layer (${lr.confidence} confidence)`);
+
+              // ── True missing credentials → stop and ask the user ──────────
+              // Only stop if credentials are actually missing (our scan confirmed it).
+              // Provider integration errors (wrong endpoint / bad response parsing) are
+              // code issues that the Sonnet/Strongest repair engine CAN fix, so we let
+              // the loop continue rather than surfacing a false "credentials needed" gate.
               if (loopInvestigation.missingCredentials?.length > 0) {
                 narrate(
                   `🔑 Root cause identified: **missing credentials** — ${loopInvestigation.missingCredentials.join(', ')}.\n\n` +
@@ -2302,6 +2312,29 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 );
                 break; // Stop the loop — credentials are a configuration issue, not a code bug
               }
+
+              // ── Provider integration error → escalate to broader/rewrite ──
+              // The verify engine now classifies external-API failures as
+              // 'provider-misconfigured'. If that's the primary stagnation cause,
+              // force-advance the strategy cursor past 'targeted' so the next
+              // iteration immediately uses the provider-aware Strongest pass.
+              const providerFails = verifyData.checks.filter(
+                c => !c.passed && c.rootCause?.kind === 'provider-misconfigured'
+              );
+              if (providerFails.length > 0) {
+                appendLog(`🔌 Provider integration error detected on ${providerFails.length} route(s) — escalating to broader repair with provider context…`);
+                // Nudge each failing kind to skip 'targeted' if it was already tried
+                for (const check of providerFails) {
+                  const kind = check.rootCause?.kind ?? 'unknown';
+                  const currentIdx = kindStrategyCursor.get(kind) ?? 0;
+                  if (currentIdx === 0) {
+                    // Skip straight to 'broader' (Strongest + provider registry context)
+                    kindStrategyCursor.set(kind, 1);
+                    appendLog(`   ↑ ${kind}: skipping to 'broader' strategy (Strongest model + provider registry)`);
+                  }
+                }
+              }
+
               if (lr.primaryLayer === 'database' && !verifyData.checks.some(c => c.rootCause?.kind === 'database-error')) {
                 appendLog('🗄️ Database layer issue detected — adjusting fix strategy');
               }

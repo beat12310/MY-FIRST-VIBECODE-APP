@@ -7,7 +7,7 @@
 // ─── Root cause types ─────────────────────────────────────────────────────────
 
 export interface CheckRootCause {
-  kind: 'missing-package' | 'auth-misconfigured' | 'missing-env' | 'typescript-error' | 'runtime-crash' | 'route-failure' | 'wrong-http-method' | 'timeout' | 'database-error' | 'preview-blank' | 'unknown';
+  kind: 'missing-package' | 'auth-misconfigured' | 'missing-env' | 'typescript-error' | 'runtime-crash' | 'route-failure' | 'wrong-http-method' | 'timeout' | 'database-error' | 'preview-blank' | 'provider-misconfigured' | 'unknown';
   detail: string;           // plain-English description
   packages?: string[];      // for missing-package: npm package names to install
   envVars?: string[];       // for missing-env: env var names to add
@@ -89,6 +89,36 @@ const PREVIEW_BLANK_PATTERNS = [
   /Text content does not match/i,
   /Minified React error/i,
   /Cannot read propert(?:y|ies) of (?:undefined|null)/i,
+];
+
+// Patterns that indicate a route is failing because of a bad external API integration,
+// not a code bug that a generic TS fix can solve. Matching these triggers the
+// 'provider-misconfigured' kind, which escalates to a provider-aware repair pass.
+const PROVIDER_ERROR_PATTERNS = [
+  // RapidAPI-specific
+  /x-rapidapi/i,
+  /rapidapi\.com/i,
+  /You are not subscribed to this API/i,
+  /Invalid API key/i,
+  // Upstream HTTP errors from a fetch() inside a route handler
+  /upstream\s+(?:api|service|server)/i,
+  /external\s+(?:api|service)/i,
+  // fetch() failure patterns
+  /fetch\s+failed/i,
+  /ECONNREFUSED.*(?:api|external)/i,
+  // JSON parse failures that indicate the API returned something unexpected
+  /Unexpected token.*JSON/i,
+  /SyntaxError.*JSON\.parse/i,
+  // Rate limiting or quota from a provider
+  /rate.?limit(?:ed)?/i,
+  /too many requests/i,
+  /quota.?exceed/i,
+  // Response shape mismatches — the API changed its schema or the wrong endpoint is called
+  /Cannot read propert(?:y|ies) of undefined.*(?:data|result|items|response|body|json)/i,
+  /is not a function.*(?:map|filter|forEach)/i,
+  // Provider name pattern — "SomeProvider API error"
+  /provider.*error/i,
+  /api.*(?:key|token|credential).*(?:invalid|expired|missing)/i,
 ];
 
 function isLocalAlias(p: string): boolean {
@@ -186,6 +216,25 @@ function parseRootCause(body: string, statusCode: number): CheckRootCause {
       errorText: text.slice(0, 200),
       fixHint: 'Ensure the route.ts exports the correct HTTP method function (export async function GET / POST / PUT / DELETE)',
     };
+  }
+
+  // 7b. External API / provider integration error — detect before generic 500 handler
+  // so provider-aware escalation kicks in instead of a blind code fix.
+  if (statusCode >= 400 || statusCode === 0) {
+    for (const re of PROVIDER_ERROR_PATTERNS) {
+      if (re.test(text)) {
+        const snippet = text.match(re)?.[0]?.slice(0, 100) ?? 'provider call failed';
+        return {
+          kind: 'provider-misconfigured',
+          detail: `External API integration error: ${snippet}`,
+          errorText: text.slice(0, 400),
+          fixHint:
+            'This route is calling an external API incorrectly. Check the provider endpoint URL, ' +
+            'authentication headers (X-RapidAPI-Key, X-RapidAPI-Host, Authorization), and the ' +
+            'response parsing code. Use the DWOMOH Provider Engine to find the correct provider.',
+        };
+      }
+    }
   }
 
   // 8. Runtime server crash (500)
