@@ -555,11 +555,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
       // Accept if the response has at minimum a main page file (package.json can be inferred / scaffold-patched).
       const hasRequiredFiles = (data: { files: Array<{ path: string }> }) => {
-        const paths = data.files.map(f => f.path);
-        return paths.some(p =>
-          p === 'app/page.tsx' || p === 'app/page.ts' || p === 'app/page.jsx' ||
-          p.includes('pages/index.') || p.includes('app/page.')
-        );
+        const REQUIRED = new Set([
+          'app/page.tsx', 'app/page.ts', 'app/page.jsx', 'app/page.js',
+          'src/app/page.tsx', 'src/app/page.ts', 'src/app/page.jsx', 'src/app/page.js',
+          'pages/index.tsx', 'pages/index.ts', 'pages/index.jsx', 'pages/index.js',
+        ]);
+        return data.files.some(f => REQUIRED.has(f.path));
       };
 
       // Extract a short app description for fallback strategies
@@ -727,9 +728,23 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         }
       }
 
+      // True only when NO root-page file has real content.
+      // Must match the same path variants as hasRequiredFiles() to avoid false positives
+      // (e.g. AI generates src/app/page.tsx or app/page.jsx → real project, not scaffold).
+      const ROOT_PAGE_PATHS = new Set([
+        'app/page.tsx', 'app/page.ts', 'app/page.jsx', 'app/page.js',
+        'src/app/page.tsx', 'src/app/page.ts', 'src/app/page.jsx', 'src/app/page.js',
+        'pages/index.tsx', 'pages/index.ts', 'pages/index.jsx', 'pages/index.js',
+      ]);
+      const SCAFFOLD_TEXT = ['Generating…', 'Building your app', 'the agent is generating'];
       const isScaffoldResponse = !projectData.files.some(
-        (f: { path: string; content: string }) => f.path === 'app/page.tsx' && !f.content.includes('Generating…')
+        (f: { path: string; content: string }) =>
+          ROOT_PAGE_PATHS.has(f.path) &&
+          !SCAFFOLD_TEXT.some(t => f.content.includes(t))
       );
+      // Diagnostic: log which root page file was found (or none)
+      const foundPageFile = projectData.files.find((f: { path: string }) => ROOT_PAGE_PATHS.has(f.path));
+      console.log(`[generate] scaffoldFallback=${isScaffoldResponse} rootPage=${foundPageFile?.path ?? 'NONE'} tier=${generateTier} files=${projectData.files.length}`);
       return NextResponse.json({
         success: true,
         projectData,
@@ -1412,6 +1427,18 @@ Complete, working, production-quality code. No placeholders.`;
         }
       }
       return NextResponse.json({ success: true, filesWritten, written, errors });
+    }
+
+    // ── read-file: read a single file from a project for diagnostics ────────────
+    if (action === 'read-file') {
+      const { filePath: readPath } = body;
+      if (!projectPath || !readPath) return NextResponse.json({ success: false, error: 'Missing projectPath or filePath' }, { status: 400 });
+      try {
+        const content = await readFile(join(projectPath, readPath), 'utf-8');
+        return NextResponse.json({ success: true, content, size: content.length });
+      } catch {
+        return NextResponse.json({ success: false, error: 'File not found' });
+      }
     }
 
     // ── file-create: create a new file in a project ─────────────────────────

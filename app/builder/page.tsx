@@ -2126,7 +2126,12 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       };
 
       // ── 5. Start server — 3 strategies, NEVER throws ──────────────────────
-      let serverData = await api({ action: 'start-server', projectPath: path });
+      // Always force=true on the initial start: if a previous build of the same
+      // project left a server running, that server holds a stale .next cache
+      // (possibly the scaffold page). Reusing it causes false scaffold detections
+      // in the verification loop because the new files aren't recompiled yet.
+      await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
+      let serverData = await api({ action: 'start-server', projectPath: path, force: true });
 
       if (!serverData.port) {
         const errorMsg = serverData.error || 'Server failed to start';
@@ -2295,6 +2300,9 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       let consecutiveRollbacks = 0;
       let triedCacheClear = false;
       let browserContextCache = ''; // browser console/network errors, collected lazily
+      // Set to true whenever we restart the dev server so the first-compile watchdog
+      // also fires after FIX X or other mid-loop restarts (not just on iter 1).
+      let serverJustRestarted = true; // treat the initial start as a restart
 
       for (let iter = 1; iter <= MAX_ITERATIONS; iter++) {
         appendLog(`🤖 Engineering loop — iteration ${iter}/${MAX_ITERATIONS}`);
@@ -2309,20 +2317,23 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         const totalChecks = verifyData.checks.length;
         appendLog(`📊 ${passedNow}/${totalChecks} checks passing`);
 
-        // ── 30-second scaffold watchdog ────────────────────────────────────
-        // If iteration 1 gets only timeouts, Next.js is still doing its first compile
-        // (which takes 25–40s). Wait 30s and re-verify BEFORE running any AI fix —
-        // prevents wasting a repair strategy on a transient compile delay.
-        if (iter === 1 && verifyData.checks.length > 0 &&
+        // ── First-compile watchdog ─────────────────────────────────────────
+        // Next.js first compile takes 25–40s. If all checks timeout AND the server
+        // was recently started (initial launch or a mid-loop FIX X restart), wait
+        // 30s and re-verify BEFORE running any AI fix strategy.
+        if (serverJustRestarted && verifyData.checks.length > 0 &&
             verifyData.checks.every(c => !c.passed && c.rootCause?.kind === 'timeout')) {
-          appendLog('⏳ All checks timed out on first iteration — waiting 30s for Next.js first compile…');
-          narrate(`⏳ Next.js is doing its first compile — waiting up to 30s before verification…`);
+          serverJustRestarted = false; // consumed — don't double-wait
+          appendLog('⏳ All checks timed out after server start — waiting 30s for Next.js first compile…');
+          narrate(`⏳ Next.js is compiling your app — waiting up to 30s before verification…`);
           await new Promise(r => setTimeout(r, 30_000));
-          appendLog('🔄 Re-verifying after first-compile wait…');
+          appendLog('🔄 Re-verifying after compile wait…');
           try {
             verifyData = await api({ action: 'verify-app', port, projectPath: path });
             setLastVerification(verifyData);
           } catch { break; }
+        } else if (serverJustRestarted) {
+          serverJustRestarted = false; // clear even if no timeout (server already compiled)
         }
 
         if (verifyData.verified) {
@@ -2474,6 +2485,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             break;
           }
           setPreviewKey(k => k + 1);
+          serverJustRestarted = true;
           narrate(`✅ Packages installed. Re-verifying…`);
           browserContextCache = '';
           continue;
@@ -2491,6 +2503,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
               if (restB.port) { port = restB.port; setPreviewUrl(`http://localhost:${port}`); }
               await api({ action: 'wait-for-server', port, timeout: 60000 });
               setPreviewKey(k => k + 1);
+              serverJustRestarted = true;
               browserContextCache = '';
               continue;
             }
@@ -2510,6 +2523,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           if (restC.port) { port = restC.port; setPreviewUrl(`http://localhost:${port}`); }
           await api({ action: 'wait-for-server', port, timeout: 60000 });
           setPreviewKey(k => k + 1);
+          serverJustRestarted = true;
           browserContextCache = '';
           continue;
         }
@@ -2566,7 +2580,15 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 files: regenData.projectData.files,
               });
               if (applyResult.success && applyResult.filesWritten > 0) {
-                appendLog(`✅ ${applyResult.filesWritten} files written — clearing cache and restarting server…`);
+                appendLog(`✅ ${applyResult.filesWritten} files written — verifying page file on disk…`);
+                // Diagnostic: confirm the root page file doesn't still have scaffold content
+                const pageCheck = await api({ action: 'read-file', projectPath: path, filePath: 'app/page.tsx' }).catch(() => null);
+                if (pageCheck?.content && (pageCheck.content.includes('Generating…') || pageCheck.content.includes('Building your app'))) {
+                  appendLog('❌ DIAGNOSTIC: app/page.tsx still contains scaffold text after apply — generation produced placeholder content');
+                  narrate('❌ The AI generated placeholder content again. This is a generation quality issue — trying with a stronger model.');
+                } else {
+                  appendLog(`✅ Page file confirmed real content (${pageCheck?.size ?? '?'} bytes) — clearing cache and restarting server…`);
+                }
                 narrate(`✅ App re-generated (${regenFileCount} files)! Restarting server with real code…`);
                 await api({ action: 'clear-cache', projectPath: path });
                 setBuildProgress(p => ({ ...p!, step: 'starting', message: '⚙️ Restarting with new app…', logs: p?.logs ?? [] }));
@@ -2577,6 +2599,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                   setScaffoldDetected(false); // server is now running real code — clear overlay
                   setPreviewLoading(true);    // show loading overlay while new app does first compile
                   setPreviewKey(k => k + 1); // force iframe to reload with new content
+                  serverJustRestarted = true; // watchdog: wait for first compile on next verify
                 }
                 browserContextCache = '';
                 setBuildProgress(p => ({ ...p!, step: 'verifying', message: '🔍 Verification running…', logs: p?.logs ?? [] }));
@@ -2629,6 +2652,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 break;
               }
               setPreviewKey(k => k + 1);
+              serverJustRestarted = true;
               browserContextCache = '';
             }
             continue;
@@ -2747,6 +2771,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             break;
           }
           setPreviewKey(k => k + 1);
+          serverJustRestarted = true;
           browserContextCache = '';
         } else {
           break;

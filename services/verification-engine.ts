@@ -97,9 +97,10 @@ const PREVIEW_BLANK_PATTERNS = [
 const SCAFFOLD_PLACEHOLDER_PATTERNS = [
   /Building your app.*the agent is generating/i,
   /the agent is generating the full codebase/i,
-  /animate-pulse.*Generating/i,
+  // Patterns 3 & 4 require the exact unicode ellipsis "…" (U+2026) so they don't
+  // false-positive on legitimate loading spinners that say e.g. "Generating report..."
+  /animate-pulse.*Generating…/i,
   /Generating….*animate-pulse/i,
-  // Matches the exact text in the scaffold page.tsx
   /the agent is generating the full codebase now/i,
 ];
 
