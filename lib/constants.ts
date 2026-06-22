@@ -19,7 +19,7 @@ export const APP_VERSION = '1.0.0';
  * Override any tier via env vars:
  *   BEDROCK_MODEL_HAIKU   → overrides HAIKU default
  *   BEDROCK_MODEL_SONNET  → overrides SONNET default
- *   BEDROCK_MODEL_OPUS    → overrides STRONGEST default
+ *   BEDROCK_MODEL_OPUS / BEDROCK_MODEL_STRONGEST → overrides STRONGEST default (both accepted)
  *   BEDROCK_MODEL_ID      → legacy; only falls back for HAIKU if BEDROCK_MODEL_HAIKU unset
  *
  * NOT available on this account (access denied or end-of-life):
@@ -42,7 +42,9 @@ export const BEDROCK_MODELS = {
 
   // Opus 4.6 — latest Opus accessible on this account, verified working at 1.8s avg
   // (Opus 4.8 and Fable 5 are ACCESS DENIED for account 859934687821)
-  STRONGEST: process.env.BEDROCK_MODEL_OPUS ||
+  // Accepts both BEDROCK_MODEL_STRONGEST and BEDROCK_MODEL_OPUS so either name works.
+  STRONGEST: process.env.BEDROCK_MODEL_STRONGEST ||
+    process.env.BEDROCK_MODEL_OPUS ||
     'global.anthropic.claude-opus-4-6-v1',
 } as const;
 
