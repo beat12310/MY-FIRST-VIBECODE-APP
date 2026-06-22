@@ -1880,7 +1880,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         appendLog(`🌐 API providers: ${apiPlanData.resolved.map((r: { category: string; providerName: string }) => `${r.category}→${r.providerName}`).join(', ')}`);
         narrate(`🌐 **API providers connected:** ${apiPlanData.resolved.map((r: { category: string; providerName: string }) => r.providerName).join(', ')} — live data enabled.`);
       } else if (apiPlanData.missing && apiPlanData.missing.length > 0) {
-        const hasFreeAlts = apiPlanData.missing.some((c: string) => ['weather', 'finance', 'news'].includes(c));
+        const hasFreeAlts = apiPlanData.missing.some((c: string) => ['weather', 'finance', 'news', 'sports'].includes(c));
         if (hasFreeAlts) {
           appendLog(`🌐 RapidAPI not configured — using free public APIs for: ${apiPlanData.missing.join(', ')}`);
           narrate(
@@ -2245,7 +2245,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         'auth-misconfigured':    ['add-secret', 'targeted'],
         'missing-env':           ['add-placeholder'],
         'wrong-http-method':     ['targeted', 'broader', 'rewrite'],
-        'server-crash':          ['cache-clear', 'targeted', 'broader', 'rewrite'],
+
         'not-found':             ['targeted', 'broader'],
         'timeout':               ['targeted', 'broader', 'rewrite'],
         'database-error':        ['targeted', 'broader', 'rewrite'],

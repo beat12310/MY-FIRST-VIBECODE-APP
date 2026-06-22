@@ -748,29 +748,55 @@ export async function GET(request: NextRequest) {
   },
 
   news: {
-    description: 'GNews (https://gnews.io) public endpoint — no key for basic use, real headlines.',
+    description: 'GNews/HN Algolia — GNews with key (preferred) or Hacker News Algolia (free, no key, real headlines).',
     routeFile: 'app/api/integrations/news/route.ts',
-    example: 'GET https://gnews.io/api/v4/top-headlines?lang=en&max=10',
+    example: 'GET /api/integrations/news?q=technology',
     route: `import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const q = searchParams.get('q') || searchParams.get('query') || 'world';
-  const key = process.env.GNEWS_API_KEY || process.env.RAPIDAPI_KEY || '';
-
-  // Fallback to free NewsData.io if no key
-  const url = key
-    ? \`https://gnews.io/api/v4/search?q=\${encodeURIComponent(q)}&lang=en&max=10&apikey=\${key}\`
-    : \`https://api.currentsapi.services/v1/latest-news?language=en\`;
+  const q = searchParams.get('q') || searchParams.get('query') || 'technology';
+  const gNewsKey = process.env.GNEWS_API_KEY || '';
 
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return NextResponse.json({ error: 'News fetch failed' }, { status: 502 });
-    const data = await res.json();
-    const articles = data.articles || data.news || [];
-    return NextResponse.json({ articles: articles.slice(0, 10), total: articles.length, provider: 'gnews' });
+    if (gNewsKey) {
+      // GNews with API key — full category + language support
+      const res = await fetch(
+        \`https://gnews.io/api/v4/search?q=\${encodeURIComponent(q)}&lang=en&max=10&apikey=\${gNewsKey}\`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const articles = (data.articles ?? []).map((a: Record<string,unknown>) => ({
+          title: a.title,
+          description: a.description,
+          url: a.url,
+          source: (a.source as Record<string,string>)?.name ?? 'GNews',
+          publishedAt: a.publishedAt,
+          imageUrl: a.image ?? null,
+        }));
+        return NextResponse.json({ articles, total: articles.length, query: q, provider: 'gnews' });
+      }
+    }
+
+    // Free fallback: Hacker News via Algolia — no key required, real-time top stories
+    const hnRes = await fetch(
+      \`https://hn.algolia.com/api/v1/search?tags=front_page&query=\${encodeURIComponent(q)}&hitsPerPage=10\`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!hnRes.ok) return NextResponse.json({ error: 'News fetch failed' }, { status: 502 });
+    const hnData = await hnRes.json();
+    const articles = (hnData.hits ?? []).map((h: Record<string,unknown>) => ({
+      title: h.title,
+      description: null,
+      url: h.url ?? \`https://news.ycombinator.com/item?id=\${h.objectID}\`,
+      source: 'Hacker News',
+      publishedAt: h.created_at,
+      imageUrl: null,
+    }));
+    return NextResponse.json({ articles, total: articles.length, query: q, provider: 'hacker-news' });
   } catch (err) {
     return NextResponse.json({ error: err instanceof Error ? err.message : 'News unavailable' }, { status: 503 });
   }
@@ -810,6 +836,102 @@ export async function GET(request: NextRequest) {
     });
   } catch (err) {
     return NextResponse.json({ error: err instanceof Error ? err.message : 'Finance service unavailable' }, { status: 503 });
+  }
+}`,
+  },
+
+  sports: {
+    description: 'ESPN public API — no API key required, real live scores and fixtures for all major sports.',
+    routeFile: 'app/api/integrations/sports/route.ts',
+    example: 'GET /api/integrations/sports?sport=soccer&league=eng.1',
+    route: `import { NextRequest, NextResponse } from 'next/server';
+
+export const runtime = 'nodejs';
+
+// ESPN public API — no key required, real live sports data
+const ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports';
+
+// League slugs: soccer (English leagues), American sports, etc.
+const LEAGUE_MAP: Record<string, string> = {
+  // Soccer
+  soccer: 'soccer/eng.1',          // Premier League (default)
+  'soccer/eng.1': 'soccer/eng.1',
+  'soccer/esp.1': 'soccer/esp.1',  // La Liga
+  'soccer/ger.1': 'soccer/ger.1',  // Bundesliga
+  'soccer/ita.1': 'soccer/ita.1',  // Serie A
+  'soccer/usa.1': 'soccer/usa.1',  // MLS
+  football: 'football/nfl',
+  nfl: 'football/nfl',
+  basketball: 'basketball/nba',
+  nba: 'basketball/nba',
+  baseball: 'baseball/mlb',
+  mlb: 'baseball/mlb',
+  hockey: 'hockey/nhl',
+  nhl: 'hockey/nhl',
+};
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const sportParam = (searchParams.get('sport') || 'soccer').toLowerCase();
+  const leagueParam = searchParams.get('league') || '';
+
+  // Resolve league path: explicit league param overrides sport param
+  const leagueKey = leagueParam ? (LEAGUE_MAP[leagueParam] ?? \`soccer/\${leagueParam}\`) : (LEAGUE_MAP[sportParam] ?? 'soccer/eng.1');
+
+  try {
+    const res = await fetch(
+      \`\${ESPN_BASE}/\${leagueKey}/scoreboard\`,
+      {
+        signal: AbortSignal.timeout(8000),
+        headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+      }
+    );
+    if (!res.ok) return NextResponse.json({ error: \`Sports data unavailable (HTTP \${res.status})\` }, { status: 502 });
+    const data = await res.json();
+
+    const events = (data.events ?? []).map((e: Record<string, unknown>) => {
+      const comp = (e.competitions as Record<string, unknown>[])?.[0] ?? {};
+      const competitors = (comp.competitors as Record<string, unknown>[]) ?? [];
+      const home = competitors.find((c) => c.homeAway === 'home');
+      const away = competitors.find((c) => c.homeAway === 'away');
+      const status = (comp.status as Record<string, unknown>) ?? {};
+      const statusType = (status.type as Record<string, unknown>) ?? {};
+      return {
+        id: e.id,
+        name: e.name,
+        shortName: e.shortName,
+        home: (home?.team as Record<string,string>)?.displayName ?? '',
+        homeScore: home?.score ?? null,
+        homeLogoUrl: (home?.team as Record<string,string>)?.logo ?? null,
+        away: (away?.team as Record<string,string>)?.displayName ?? '',
+        awayScore: away?.score ?? null,
+        awayLogoUrl: (away?.team as Record<string,string>)?.logo ?? null,
+        status: statusType.description ?? 'Scheduled',
+        statusState: statusType.state ?? 'pre',   // 'pre' | 'in' | 'post'
+        isLive: statusType.state === 'in',
+        date: e.date,
+        venue: (comp.venue as Record<string,string>)?.fullName ?? null,
+        provider: 'espn-public',
+      };
+    });
+
+    const leagueName = (data.leagues as Record<string,string>[])?.[0]?.name ?? leagueKey;
+    const seasonYear = (data.season as Record<string,unknown>)?.year ?? null;
+
+    return NextResponse.json({
+      sport: sportParam,
+      league: leagueName,
+      season: seasonYear,
+      events,
+      total: events.length,
+      liveCount: events.filter((e: Record<string, unknown>) => e.isLive).length,
+      provider: 'espn-public',
+    });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Sports service unavailable' },
+      { status: 503 }
+    );
   }
 }`,
   },

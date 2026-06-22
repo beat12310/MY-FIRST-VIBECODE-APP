@@ -290,29 +290,47 @@ async function probeDatabaseHealth(projectPath: string, envVars: Record<string, 
   connected: boolean;
   error?: string;
 }> {
-  // Check for SQLite file existence
-  const dbPaths = ['data/database.db', 'database.db', 'data/db.sqlite', 'db.sqlite', 'prisma/dev.db'];
-  for (const p of dbPaths) {
+  // 1. Check for managed SQLite database (better-sqlite3 via lib/managed/db.ts)
+  // Try both the project.db path and legacy data/ paths
+  const sqliteFiles = ['project.db', 'data/database.db', 'database.db', 'data/db.sqlite', 'db.sqlite', 'prisma/dev.db'];
+  for (const p of sqliteFiles) {
     try {
-      await access(join(projectPath, p));
-      return { connected: true };
+      const fullPath = join(projectPath, p);
+      await access(fullPath);
+      // File exists — do a basic readability check (just stat it)
+      const { stat } = await import('fs/promises');
+      const info = await stat(fullPath);
+      if (info.size > 0) return { connected: true }; // Non-empty SQLite file = OK
+      // Zero-byte SQLite file = never initialized
+      return { connected: false, error: `SQLite file ${p} exists but is empty — initTable() may not have been called` };
     } catch { /* continue */ }
   }
 
-  // Check if DATABASE_URL is configured
-  const dbUrl = envVars['DATABASE_URL'];
-  if (!dbUrl) {
-    // Check if there's any DB-related code
-    try {
-      const files = await readdir(join(projectPath, 'lib')).catch(() => [] as string[]);
-      const hasDb = files.some(f => /db|database|prisma|supabase/i.test(f));
-      if (hasDb) {
-        return { connected: false, error: 'DATABASE_URL is not configured' };
-      }
-    } catch { /* no lib dir */ }
+  // 2. Check for Prisma schema — even without a db file, the schema tells us db is expected
+  try {
+    await access(join(projectPath, 'prisma/schema.prisma'));
+    const dbUrl = envVars['DATABASE_URL'];
+    if (!dbUrl) return { connected: false, error: 'Prisma schema found but DATABASE_URL is not set' };
+    return { connected: true }; // DATABASE_URL configured — trust it
+  } catch { /* no Prisma schema */ }
+
+  // 3. Check if any DB-related source files exist
+  const libManagedDb = join(projectPath, 'lib/managed/db.ts');
+  try {
+    await access(libManagedDb);
+    // lib/managed/db.ts exists — project uses managed SQLite. The db file is created
+    // on first query (better-sqlite3 auto-creates), so absence is not an error here.
+    return { connected: true };
+  } catch { /* no managed db */ }
+
+  // 4. Check for DATABASE_URL — indicates expected external DB
+  if (envVars['DATABASE_URL']) {
+    // Can't probe a remote DB from here — assume reachable
+    return { connected: true };
   }
 
-  return { connected: true }; // No DB usage detected — not a DB issue
+  // 5. No database usage detected
+  return { connected: true };
 }
 
 // ── Auth probe ────────────────────────────────────────────────────────────────

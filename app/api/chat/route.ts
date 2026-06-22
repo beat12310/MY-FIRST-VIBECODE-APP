@@ -1171,14 +1171,15 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       const result = await verifyRunningApp(port as number, apiRoutes);
 
-      // TypeScript safety gate: if TypeScript errors exist, never mark as verified.
+      // TypeScript safety gate: only run tsc when HTTP checks all pass.
+      // Running tsc on every loop iteration (15 × ~30s) would add 7+ minutes of overhead.
+      // We only need the TS gate at the final step — when the app appears verified.
       let tsErrorsExist = false;
-      if (projectPath) {
+      if (projectPath && result.verified) {
         try {
           const tsCheck = await validateProject(projectPath);
           tsErrorsExist = (tsCheck.errors?.length ?? 0) > 0;
-          if (tsErrorsExist && result.verified) {
-            // Override: cannot be verified with TypeScript errors present
+          if (tsErrorsExist) {
             result.verified = false;
             result.summary = `TypeScript errors exist (${tsCheck.errors?.length} error(s)) — cannot mark as verified until resolved.`;
             result.failures = [...(result.failures ?? []), `TypeScript: ${tsCheck.errors?.slice(0, 2).join('; ')}`];

@@ -577,10 +577,20 @@ export interface HealthGateResult {
  * - Required credentials are missing or placeholder
  * - Database connections fail
  * - Authentication is broken
+ * - The main page is still showing the scaffold/generation placeholder
  * - Critical functionality is unavailable
  */
 export function healthGate(result: VerificationResult, missingCredentials?: string[]): HealthGateResult {
   const blockers: string[] = [];
+
+  // Block if the main page is still showing the AI generation placeholder.
+  // This check must be first — a 200 scaffold page must never be "verified".
+  const scaffoldCheck = result.checks.find(
+    c => c.name.includes('Main page') && c.rootCause?.kind === 'scaffold-placeholder'
+  );
+  if (scaffoldCheck) {
+    blockers.push('App is still showing the AI generation placeholder — real application has not rendered yet');
+  }
 
   // Block on any HTTP failure
   for (const check of result.checks) {
