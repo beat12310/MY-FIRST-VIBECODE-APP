@@ -1132,7 +1132,19 @@ function BuilderInner() {
         if (isDebugRequest) advanceDebug('verifying', 6);
 
         const runPort = buildProgress?.port || currentProject.port;
-        type EditVerifyCheck = { name: string; passed: boolean; recordCount?: number; error?: string; rootCause?: { kind: string; detail: string; packages?: string[]; envVars?: string[]; fixFile?: string; fixHint?: string }; fixFile?: string; fixHint?: string };
+        type EditVerifyCheck = {
+          name: string; passed: boolean; recordCount?: number; error?: string; url?: string;
+          statusCode?: number; responsePreview?: string;
+          rootCause?: { kind: string; detail: string; packages?: string[]; envVars?: string[]; fixFile?: string; fixHint?: string };
+          fixFile?: string; fixHint?: string;
+          // Rich failure context from enhanced verification engine
+          requestBody?: string; responseBody?: string; validationError?: string; stackTrace?: string;
+          repairDiagnosis?: {
+            failureCategory: string; confidence: string;
+            recommendedAction: string; canAutoRepair: boolean;
+            autoRepairContext: string; expectedFieldName?: string;
+          };
+        };
         let verifyData: { verified: boolean; summary: string; checks?: Array<EditVerifyCheck>; failures?: string[] } | null = null;
         if (runPort) {
           try {
@@ -1141,26 +1153,70 @@ function BuilderInner() {
           } catch { /* best-effort */ }
         }
 
-        // ── If routes are still failing, run one agent-fix round ──────────
+        // ── If routes are still failing, run a targeted auto-repair ──────────
         if (runPort && verifyData && !verifyData.verified && isDebugRequest) {
+          // Build rich error context that includes request/response/validation details
           const failedRoutes = (verifyData.checks ?? []).filter(c => !c.passed && (
             c.rootCause?.kind === 'runtime-crash' ||
             c.rootCause?.kind === 'wrong-http-method' ||
             c.rootCause?.kind === 'timeout' ||
-            c.rootCause?.kind === 'route-failure'
+            c.rootCause?.kind === 'route-failure' ||
+            c.rootCause?.kind === 'file-upload-required' ||
+            c.rootCause?.kind === 'ocr-extraction-failure' ||
+            // Also auto-fix when repairDiagnosis says we can
+            (!c.repairDiagnosis?.canAutoRepair && !!c.fixFile)
           ));
+
           if (failedRoutes.length > 0) {
-            addStatus(`Auto-fixing ${failedRoutes.length} failing route(s)…`, 'applying');
-            const targetFiles = [...new Set(failedRoutes.flatMap(c => [c.fixFile, c.rootCause?.fixFile].filter(Boolean) as string[]))];
-            const errorContext = failedRoutes.map(c =>
-              `${c.name}: ${c.rootCause?.detail || c.error}\n  ${c.fixHint || c.rootCause?.fixHint || ''}`
-            ).join('\n');
+            addStatus(`Diagnosing ${failedRoutes.length} failing route(s)…`, 'checking');
+
+            const targetFiles = [...new Set(failedRoutes.flatMap(c =>
+              [c.fixFile, c.rootCause?.fixFile].filter(Boolean) as string[]
+            ))];
+
+            // Build rich error context for agent-fix — includes full request, response, and validation error
+            const errorContext = failedRoutes.map(c => {
+              const lines: string[] = [];
+              lines.push(`ROUTE: ${c.name} (${c.url ?? ''})`);
+              lines.push(`HTTP STATUS: ${c.statusCode ?? 'unknown'}`);
+              if (c.rootCause?.kind) lines.push(`ROOT CAUSE KIND: ${c.rootCause.kind}`);
+              if (c.rootCause?.detail) lines.push(`ROOT CAUSE: ${c.rootCause.detail}`);
+              if (c.requestBody) lines.push(`REQUEST SENT: ${c.requestBody}`);
+              if (c.validationError) lines.push(`EXACT VALIDATION ERROR: ${c.validationError}`);
+              if (c.responseBody) lines.push(`FULL RESPONSE BODY: ${c.responseBody.slice(0, 600)}`);
+              if (c.stackTrace) lines.push(`STACK TRACE:\n${c.stackTrace}`);
+              if (c.repairDiagnosis) {
+                lines.push(`FAILURE CATEGORY: ${c.repairDiagnosis.failureCategory}`);
+                lines.push(`DIAGNOSIS CONFIDENCE: ${c.repairDiagnosis.confidence}`);
+                lines.push(`RECOMMENDED ACTION: ${c.repairDiagnosis.recommendedAction}`);
+                if (c.repairDiagnosis.autoRepairContext) {
+                  lines.push(`REPAIR CONTEXT: ${c.repairDiagnosis.autoRepairContext}`);
+                }
+              }
+              if (c.fixHint || c.rootCause?.fixHint) {
+                lines.push(`FIX HINT: ${c.fixHint || c.rootCause?.fixHint}`);
+              }
+              return lines.join('\n');
+            }).join('\n\n---\n\n');
+
             const logData2 = await api({ action: 'get-server-logs', projectPath: currentProject.projectPath }).catch(() => ({ logs: '' }));
-            const serverLogs2 = (logData2.logs as string || '').split('\n').filter((l: string) => /error|failed/i.test(l)).slice(-10).join('\n');
+            const serverLogs2 = (logData2.logs as string || '').split('\n')
+              .filter((l: string) => /error|failed|exception|throw/i.test(l)).slice(-15).join('\n');
+
             if (targetFiles.length > 0) {
               await api({ action: 'snapshot-files', projectPath: currentProject.projectPath, files: targetFiles });
             }
-            const agentFixResult = await api({ action: 'agent-fix', projectPath: currentProject.projectPath, errorContext, targetFiles, serverLogs: serverLogs2 }).catch(() => null);
+
+            addStatus(`Auto-repairing ${failedRoutes.length} failing route(s) with full diagnostic context…`, 'applying');
+            const agentFixResult = await api({
+              action: 'agent-fix',
+              projectPath: currentProject.projectPath,
+              errorContext,
+              targetFiles,
+              serverLogs: serverLogs2,
+              tier: 'SONNET', // Use Sonnet for route diagnosis (smarter than Haiku for HTTP issues)
+            }).catch(() => null);
+
             if (agentFixResult?.fixedCount > 0) {
               addStatus(`Fixed ${agentFixResult.fixedCount} file(s) — re-verifying…`, 'checking');
               await new Promise(r => setTimeout(r, 2500));
@@ -1171,7 +1227,6 @@ function BuilderInner() {
                   setLastVerification(verifyAfterFix as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
                   await api({ action: 'clear-snapshot', projectPath: currentProject.projectPath });
                 } else {
-                  // Rollback — fix made things worse
                   await api({ action: 'restore-files', projectPath: currentProject.projectPath });
                 }
               } catch { /* non-critical */ }

@@ -10,15 +10,52 @@ import { join } from 'path';
 // ─── Root cause types ─────────────────────────────────────────────────────────
 
 export interface CheckRootCause {
-  kind: 'missing-package' | 'auth-misconfigured' | 'missing-env' | 'typescript-error' | 'runtime-crash' | 'route-failure' | 'wrong-http-method' | 'timeout' | 'database-error' | 'preview-blank' | 'provider-misconfigured' | 'scaffold-placeholder' | 'unknown';
-  detail: string;           // plain-English description
-  packages?: string[];      // for missing-package: npm package names to install
-  envVars?: string[];       // for missing-env: env var names to add
-  errorText?: string;       // raw excerpt from the response body (for logs only)
-  /** Suggested fix: the specific source file to edit */
+  kind:
+    | 'missing-package'
+    | 'auth-misconfigured'
+    | 'missing-env'
+    | 'typescript-error'
+    | 'runtime-crash'
+    | 'route-failure'
+    | 'wrong-http-method'
+    | 'timeout'
+    | 'database-error'
+    | 'preview-blank'
+    | 'provider-misconfigured'
+    | 'scaffold-placeholder'
+    | 'file-upload-required'   // route expects multipart/form-data, verifier sent JSON
+    | 'ocr-extraction-failure' // OCR ran but returned empty or placeholder result
+    | 'unknown';
+  detail: string;
+  packages?: string[];
+  envVars?: string[];
+  errorText?: string;
   fixFile?: string;
-  /** Suggested fix: concrete action for the agent */
   fixHint?: string;
+}
+
+/**
+ * Structured diagnosis used by the repair engine to auto-classify and fix 4xx
+ * failures without escalating to the user.
+ */
+export interface RouteRepairDiagnosis {
+  failureCategory:
+    | 'missing-image-upload'   // route needs multipart file; verifier sent JSON
+    | 'invalid-ocr-input'      // file type wrong or unreadable by OCR
+    | 'missing-field'          // specific field absent from request body
+    | 'route-validation-failure' // route-level validation rejected the request
+    | 'ocr-extraction-failure' // OCR ran but extracted nothing meaningful
+    | 'wrong-content-type'     // sent application/json to a form-data route
+    | 'other';
+  confidence: 'high' | 'medium' | 'low';
+  /** What the repair engine should do next */
+  recommendedAction: string;
+  /** True when the verifier can self-repair by retrying with correct input */
+  canAutoRepair: boolean;
+  /** Inject into agent-fix prompt when canAutoRepair is false */
+  autoRepairContext: string;
+  /** The actual field name the route expects (e.g. "bill" for parse-bill) */
+  expectedFieldName?: string;
 }
 
 export interface VerificationCheck {
@@ -31,10 +68,19 @@ export interface VerificationCheck {
   responsePreview?: string;
   error?: string;
   rootCause?: CheckRootCause;
-  /** Source file most likely responsible for this failure */
   fixFile?: string;
-  /** Concise fix description for the agent prompt */
   fixHint?: string;
+  // ── Rich failure context (always populated on failure) ─────────────────────
+  /** Exact body sent to the route during verification */
+  requestBody?: string;
+  /** Full response body from the route (up to 2 KB) */
+  responseBody?: string;
+  /** Parsed error message from JSON response (e.g. json.error, json.message) */
+  validationError?: string;
+  /** Stack trace extracted from response body if available */
+  stackTrace?: string;
+  /** Structured repair diagnosis — tells the repair loop exactly what to do */
+  repairDiagnosis?: RouteRepairDiagnosis;
 }
 
 export interface VerificationResult {
@@ -94,6 +140,20 @@ const PREVIEW_BLANK_PATTERNS = [
   /Cannot read propert(?:y|ies) of (?:undefined|null)/i,
 ];
 
+// Patterns that classify 400 responses as "missing file upload" rather than broken route.
+// When a verifier sends JSON to a multipart route, the route always 400s with these messages.
+// The route itself is correct; the verifier needs to retry with FormData.
+const FILE_UPLOAD_ERROR_PATTERNS = [
+  /invalid form data/i,
+  /no file uploaded/i,
+  /please upload an? (?:image|file)/i,
+  /file.*required/i,
+  /missing.*file/i,
+  /multipart.*required/i,
+  /expected.*multipart/i,
+  /content.?type.*multipart/i,
+];
+
 // Patterns that identify the DWOMOH scaffold placeholder page — the "Building your app"
 // loading screen that is served when AI generation was incomplete or failed. A 200 on
 // this page must NOT count as a passing verification check.
@@ -144,6 +204,164 @@ function isLocalAlias(p: string): boolean {
 function moduleToPackage(modulePath: string): string {
   if (modulePath.startsWith('@')) return modulePath.split('/').slice(0, 2).join('/');
   return modulePath.split('/')[0];
+}
+
+// ─── Route input-type detection ───────────────────────────────────────────────
+
+type RouteInputType = 'form-data' | 'json' | 'unknown';
+
+interface RouteProfile {
+  inputType: RouteInputType;
+  /** FormData field name the route reads (e.g. "bill") */
+  formDataField: string;
+  /** Whether route reads req.formData() */
+  usesFormData: boolean;
+}
+
+async function detectRouteProfile(absoluteFilePath: string): Promise<RouteProfile> {
+  try {
+    const src = await readFile(absoluteFilePath, 'utf-8');
+    const usesFormData = /req\.formData\(\)|request\.formData\(\)/.test(src);
+    if (usesFormData) {
+      // Find which field name the route reads: formData.get('bill') → 'bill'
+      const fieldMatch = src.match(/formData\.get\(['"](\w+)['"]\)/);
+      const formDataField = fieldMatch?.[1] ?? 'file';
+      return { inputType: 'form-data', formDataField, usesFormData: true };
+    }
+    return { inputType: 'json', formDataField: 'file', usesFormData: false };
+  } catch {
+    return { inputType: 'unknown', formDataField: 'file', usesFormData: false };
+  }
+}
+
+/**
+ * Build a minimal test FormData for file-upload routes.
+ * Uses a 1×1 pixel valid PNG so the route's image/* validation passes.
+ */
+function buildTestFormData(fieldName: string): FormData {
+  // 67-byte 1×1 white pixel PNG (smallest valid PNG)
+  const PNG_1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64',
+  );
+  const blob = new Blob([PNG_1x1], { type: 'image/png' });
+  const fd = new FormData();
+  fd.append(fieldName, blob, 'test-bill.png');
+  return fd;
+}
+
+// ─── Validation error extractor ───────────────────────────────────────────────
+
+/**
+ * Pull the exact validation error out of a JSON response body.
+ * Returns the raw error string and any stack trace found.
+ */
+function extractValidationDetails(bodyText: string): { validationError?: string; stackTrace?: string } {
+  try {
+    const json = JSON.parse(bodyText);
+    const validationError =
+      (typeof json.error === 'string' && json.error) ||
+      (typeof json.message === 'string' && json.message) ||
+      (typeof json.detail === 'string' && json.detail) ||
+      (typeof json.msg === 'string' && json.msg) ||
+      undefined;
+    return { validationError: validationError?.slice(0, 500) };
+  } catch { /* not JSON */ }
+
+  // Try to pull error from Next.js HTML dev error page
+  const htmlText = bodyText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  const errMatch = /(?:Error|TypeError|ReferenceError|SyntaxError):\s+([^\n]{5,200})/i.exec(htmlText);
+  const stackMatch = /at\s+\w[\w.]*\s+\([^\)]+:\d+:\d+\)/g;
+  const stackLines = [...htmlText.matchAll(stackMatch)].slice(0, 5).map(m => m[0]);
+  return {
+    validationError: errMatch?.[1],
+    stackTrace: stackLines.length > 0 ? stackLines.join('\n') : undefined,
+  };
+}
+
+/**
+ * Classify the root cause of a 400 response into a structured RepairDiagnosis
+ * so the repair engine knows exactly what to do without AI involvement.
+ */
+function buildRepairDiagnosis(
+  statusCode: number,
+  responseBody: string,
+  rootCauseKind: CheckRootCause['kind'],
+  routeProfile: RouteProfile,
+  retrySucceeded?: boolean,
+): RouteRepairDiagnosis {
+  const text = responseBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+
+  // File-upload route that verifier probed with wrong content-type
+  if (rootCauseKind === 'file-upload-required' || routeProfile.usesFormData) {
+    if (retrySucceeded) {
+      return {
+        failureCategory: 'missing-image-upload',
+        confidence: 'high',
+        recommendedAction: 'Route works correctly — it requires multipart/form-data. Verified by sending a synthetic test image.',
+        canAutoRepair: true,
+        autoRepairContext: 'Route verified: accepts image uploads via POST multipart/form-data. No code change needed.',
+        expectedFieldName: routeProfile.formDataField,
+      };
+    }
+    if (/no file|no image|bill.*missing/i.test(text)) {
+      return {
+        failureCategory: 'missing-image-upload',
+        confidence: 'high',
+        recommendedAction: `Route expects FormData field "${routeProfile.formDataField}" with an image file. The test file was rejected.`,
+        canAutoRepair: false,
+        autoRepairContext:
+          `Route requires multipart/form-data POST with field "${routeProfile.formDataField}" containing an image file.\n` +
+          `The route validates file.type.startsWith("image/"). Ensure the file field is named "${routeProfile.formDataField}".`,
+        expectedFieldName: routeProfile.formDataField,
+      };
+    }
+    return {
+      failureCategory: 'wrong-content-type',
+      confidence: 'high',
+      recommendedAction: 'Route expects multipart/form-data but received application/json. Retry with FormData.',
+      canAutoRepair: true,
+      autoRepairContext:
+        `Route requires multipart/form-data. Client fetch must NOT set Content-Type manually — ` +
+        `let the browser/FormData set it with the boundary. Example: fetch(url, { method: 'POST', body: formData })`,
+      expectedFieldName: routeProfile.formDataField,
+    };
+  }
+
+  // Missing specific field
+  const missingFieldMatch = /(?:missing|required).*?['"]?(\w+)['"]?\s*(?:field|param|parameter)/i.exec(text) ||
+    /['"]?(\w+)['"]?\s*(?:is\s+)?(?:required|missing)/i.exec(text);
+  if (missingFieldMatch && statusCode === 400) {
+    return {
+      failureCategory: 'missing-field',
+      confidence: 'medium',
+      recommendedAction: `Missing required field: "${missingFieldMatch[1]}". Add it to the request body.`,
+      canAutoRepair: false,
+      autoRepairContext: `Route validation failed: missing required field "${missingFieldMatch[1]}". Ensure the request includes this field.`,
+    };
+  }
+
+  // OCR extraction failure
+  if (/ocr|tesseract|recognize|text.*extract|extract.*text/i.test(text)) {
+    return {
+      failureCategory: 'ocr-extraction-failure',
+      confidence: 'medium',
+      recommendedAction: 'OCR processing failed. Check tesseract.js worker initialization and image input format.',
+      canAutoRepair: false,
+      autoRepairContext:
+        'OCR extraction failed. Check: (1) tesseract.js is installed, (2) createWorker("eng") is called, ' +
+        '(3) the image buffer is passed correctly to worker.recognize(), (4) worker.terminate() is called after.',
+    };
+  }
+
+  // Generic route validation failure
+  return {
+    failureCategory: 'route-validation-failure',
+    confidence: 'low',
+    recommendedAction: `Route returned HTTP ${statusCode}. Inspect response body for exact cause.`,
+    canAutoRepair: false,
+    autoRepairContext: `Route validation failed with HTTP ${statusCode}. Response: ${responseBody.slice(0, 300)}`,
+  };
 }
 
 /**
@@ -274,6 +492,21 @@ function parseRootCause(body: string, statusCode: number): CheckRootCause {
     };
   }
 
+  // 10a. File upload required — route expects multipart/form-data
+  // Must be checked early (before generic 4xx) so the repair loop can retry with a test file
+  if (statusCode === 400) {
+    for (const re of FILE_UPLOAD_ERROR_PATTERNS) {
+      if (re.test(text)) {
+        return {
+          kind: 'file-upload-required',
+          detail: 'Route requires a file upload (multipart/form-data). Verifier sent application/json — will retry with test image.',
+          errorText: text.slice(0, 200),
+          fixHint: 'The route is correct. Verification will retry with a synthetic multipart upload to confirm the handler works end-to-end.',
+        };
+      }
+    }
+  }
+
   // 10. Other 4xx
   if (statusCode >= 400) {
     return {
@@ -342,35 +575,55 @@ async function checkEndpoint(
   url: string,
   name: string,
   method: HttpMethod = 'GET',
+  routeFilePath?: string,
 ): Promise<VerificationCheck> {
   const urlPath = new URL(url).pathname;
   const suggestedFixFile = urlToFixFile(urlPath);
 
+  // Detect whether the route uses FormData before sending the first request
+  const routeProfile = routeFilePath
+    ? await detectRouteProfile(routeFilePath)
+    : { inputType: 'unknown' as RouteInputType, formDataField: 'file', usesFormData: false };
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
 
-  // Methods that send a body
   const hasBody = (method === 'POST' || method === 'PUT' || method === 'PATCH');
 
-  try {
-    const fetchOpts: RequestInit = {
+  // Build the initial request body. Form-data routes get a test multipart body
+  // on the FIRST attempt so we don't trigger a 400 we'd just have to retry anyway.
+  let initialRequestDescription: string;
+  let fetchOpts: RequestInit;
+  if (hasBody && routeProfile.usesFormData) {
+    const fd = buildTestFormData(routeProfile.formDataField);
+    initialRequestDescription = `multipart/form-data { ${routeProfile.formDataField}: test-bill.png (1×1 PNG) }`;
+    fetchOpts = {
+      method,
+      signal: controller.signal,
+      headers: { Accept: 'application/json, text/html' },
+      body: fd,
+    };
+  } else {
+    initialRequestDescription = hasBody ? 'application/json: {}' : '(no body)';
+    fetchOpts = {
       method,
       signal: controller.signal,
       headers: { Accept: 'application/json, text/html', 'Content-Type': 'application/json' },
       ...(hasBody ? { body: JSON.stringify({}) } : {}),
     };
+  }
 
+  try {
     const res = await fetch(url, fetchOpts);
     clearTimeout(timer);
 
     const ct = res.headers.get('content-type') || '';
     const bodyText = await res.text().catch(() => '');
 
+    // Always extract validation details from the response
+    const { validationError, stackTrace } = extractValidationDetails(bodyText);
+
     // ── 405: wrong HTTP method ───────────────────────────────────────────────
-    // When GET returns 405, probe POST to learn what the route actually accepts,
-    // then report a targeted failure. We never mark 405 as "passed" — the agent-fix
-    // loop must inspect both the route file and any calling client code to decide
-    // whether to add a GET export or change the fetch() call to POST.
     if (res.status === 405 && method === 'GET') {
       const postCtrl = new AbortController();
       const postTimer = setTimeout(() => postCtrl.abort(), 5000);
@@ -386,27 +639,36 @@ async function checkEndpoint(
         postAccepted = postRes.ok || postRes.status < 405;
       } catch { clearTimeout(postTimer); }
 
-      const routeFile = suggestedFixFile;
       const rootCause: CheckRootCause = {
         kind: 'wrong-http-method',
         detail: postAccepted
-          ? `Route only accepts POST (GET → 405). Either add \`export async function GET\` to ${routeFile ?? 'the route file'}, or update the client fetch() to use POST.`
+          ? `Route only accepts POST (GET → 405). Either add \`export async function GET\` to ${suggestedFixFile ?? 'the route file'}, or update the client fetch() to use POST.`
           : `Route returned 405 for both GET and POST — the route file may be missing all HTTP method exports.`,
         errorText: bodyText.slice(0, 200),
-        fixFile: routeFile,
+        fixFile: suggestedFixFile,
         fixHint: postAccepted
-          ? `Read ${routeFile ?? 'route.ts'} and the component that calls this URL. If this is a data-fetch route (called by useEffect/SWR), add "export async function GET". If it is a mutation route, ensure all callers use fetch(url, { method: 'POST' }).`
-          : `Add the missing HTTP method export to ${routeFile ?? 'route.ts'}: "export async function GET()" for read routes or "export async function POST()" for mutation routes.`,
+          ? `Read ${suggestedFixFile ?? 'route.ts'} and the component that calls this URL. If this is a data-fetch route, add "export async function GET". If it is a mutation route, ensure callers use fetch(url, { method: 'POST' }).`
+          : `Add the missing HTTP method export to ${suggestedFixFile ?? 'route.ts'}`,
       };
       return {
-        name,
-        url,
+        name, url,
         passed: false,
         statusCode: 405,
         rootCause,
         error: rootCause.detail,
-        fixFile: routeFile,
+        fixFile: suggestedFixFile,
         fixHint: rootCause.fixHint,
+        requestBody: initialRequestDescription,
+        responseBody: bodyText.slice(0, 2000),
+        validationError,
+        stackTrace,
+        repairDiagnosis: {
+          failureCategory: 'route-validation-failure',
+          confidence: 'high',
+          recommendedAction: rootCause.detail,
+          canAutoRepair: false,
+          autoRepairContext: rootCause.fixHint ?? '',
+        },
       };
     }
 
@@ -414,15 +676,84 @@ async function checkEndpoint(
     if (!res.ok) {
       const rootCause = parseRootCause(bodyText, res.status);
       if (!rootCause.fixFile) rootCause.fixFile = suggestedFixFile;
+
+      // ── File-upload required: retry with multipart if we haven't already ──
+      // This handles the case where route-profile detection missed the formData usage
+      // (e.g., the file wasn't readable before the first request).
+      if (rootCause.kind === 'file-upload-required' && !routeProfile.usesFormData) {
+        const retryCtrl = new AbortController();
+        const retryTimer = setTimeout(() => retryCtrl.abort(), 12000);
+        let retryPassed = false;
+        let retryBodyText = '';
+        const fieldName = routeProfile.formDataField;
+
+        try {
+          const fd = buildTestFormData(fieldName);
+          const retryRes = await fetch(url, {
+            method: 'POST',
+            signal: retryCtrl.signal,
+            headers: { Accept: 'application/json, text/html' },
+            body: fd,
+          });
+          clearTimeout(retryTimer);
+          retryBodyText = await retryRes.text().catch(() => '');
+          retryPassed = retryRes.ok;
+
+          if (retryPassed) {
+            // Route works — it just needs a real file. Mark as soft pass.
+            const { validationError: ve2 } = extractValidationDetails(retryBodyText);
+            const retryProfile = { ...routeProfile, usesFormData: true };
+            const diagnosis = buildRepairDiagnosis(res.status, bodyText, rootCause.kind, retryProfile, true);
+            return {
+              name, url,
+              passed: true,
+              statusCode: retryRes.status,
+              dataFound: true,
+              responsePreview: `✅ Route verified with synthetic image upload — accepts multipart/form-data { ${fieldName}: PNG }`,
+              requestBody: `multipart/form-data { ${fieldName}: test-bill.png (1×1 PNG) } [retry after initial JSON 400]`,
+              responseBody: retryBodyText.slice(0, 2000),
+              validationError: ve2,
+              repairDiagnosis: diagnosis,
+            };
+          } else {
+            // Retry also failed — report the retry failure with full context
+            const retryRootCause = parseRootCause(retryBodyText, retryRes.status);
+            const { validationError: ve2, stackTrace: st2 } = extractValidationDetails(retryBodyText);
+            const retryProfile = { ...routeProfile, usesFormData: true };
+            const diagnosis = buildRepairDiagnosis(retryRes.status, retryBodyText, retryRootCause.kind, retryProfile, false);
+            return {
+              name, url,
+              passed: false,
+              statusCode: retryRes.status,
+              rootCause: { ...retryRootCause, fixFile: suggestedFixFile },
+              error: `[After multipart retry] ${retryRootCause.detail}`,
+              fixFile: suggestedFixFile,
+              fixHint: retryRootCause.fixHint,
+              requestBody: `multipart/form-data { ${fieldName}: test-bill.png (1×1 PNG) }`,
+              responseBody: retryBodyText.slice(0, 2000),
+              validationError: ve2,
+              stackTrace: st2,
+              repairDiagnosis: diagnosis,
+            };
+          }
+        } catch { clearTimeout(retryTimer); /* fall through to standard error handling */ }
+      }
+
+      // Standard failure path — report with full context
+      const diagnosis = buildRepairDiagnosis(res.status, bodyText, rootCause.kind, routeProfile);
       return {
-        name,
-        url,
+        name, url,
         passed: false,
         statusCode: res.status,
         rootCause,
         error: rootCause.detail,
         fixFile: suggestedFixFile,
         fixHint: rootCause.fixHint,
+        requestBody: initialRequestDescription,
+        responseBody: bodyText.slice(0, 2000),
+        validationError,
+        stackTrace,
+        repairDiagnosis: diagnosis,
       };
     }
 
@@ -447,21 +778,24 @@ async function checkEndpoint(
         if (isApiError) {
           const errorDetail = (json.error || json.message || 'API returned error').slice(0, 200);
           const rootCause = parseRootCause(JSON.stringify(json), 200);
-          // Check if this looks like a credentials issue
           if (/key|credential|rapidapi|provider|configured/i.test(errorDetail)) {
             rootCause.kind = 'route-failure';
             rootCause.detail = `API error: ${errorDetail}`;
             rootCause.fixHint = 'The route is reachable but the external API call failed. Check credentials and provider configuration.';
           }
+          const diagnosis = buildRepairDiagnosis(res.status, JSON.stringify(json), rootCause.kind, routeProfile);
           return {
-            name,
-            url,
+            name, url,
             passed: false,
             statusCode: res.status,
             rootCause,
             error: `API error (HTTP 200): ${errorDetail}`,
             fixFile: suggestedFixFile,
             fixHint: rootCause.fixHint,
+            requestBody: initialRequestDescription,
+            responseBody: bodyText.slice(0, 2000),
+            validationError: errorDetail,
+            repairDiagnosis: diagnosis,
           };
         }
 
@@ -530,6 +864,9 @@ async function checkEndpoint(
       dataFound,
       recordCount,
       responsePreview,
+      // Capture response body on success too (truncated) so debug logs are rich
+      responseBody: bodyText.slice(0, 500),
+      requestBody: initialRequestDescription,
     };
 
   } catch (err) {
@@ -544,13 +881,20 @@ async function checkEndpoint(
         : undefined,
     };
     return {
-      name,
-      url,
+      name, url,
       passed: false,
       rootCause,
       error: isAbort ? 'Timed out after 10s — handler hung' : err instanceof Error ? err.message : 'Request failed',
       fixFile: suggestedFixFile,
       fixHint: rootCause.fixHint,
+      requestBody: initialRequestDescription,
+      repairDiagnosis: {
+        failureCategory: 'other',
+        confidence: 'low',
+        recommendedAction: isAbort ? 'Handler is hanging — add timeout/try-catch' : 'Server not responding',
+        canAutoRepair: false,
+        autoRepairContext: rootCause.detail,
+      },
     };
   }
 }
@@ -579,11 +923,14 @@ export async function verifyRunningApp(
     // Detect the actual HTTP method from the route file so we probe correctly
     // instead of blindly using GET and triggering avoidable 405 errors.
     let method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' = 'GET';
+    let routeFilePath: string | undefined;
     if (projectPath) {
-      const routeFile = join(projectPath, 'app', urlPath, 'route.ts');
-      method = await detectRouteMethod(routeFile);
+      routeFilePath = join(projectPath, 'app', urlPath, 'route.ts');
+      method = await detectRouteMethod(routeFilePath);
     }
-    checks.push(await checkEndpoint(`${base}${urlPath}`, `API: ${method} ${urlPath}`, method));
+    // Pass routeFilePath so checkEndpoint can detect FormData routes and send
+    // the right body on the first request (avoiding an unnecessary 400 → retry cycle).
+    checks.push(await checkEndpoint(`${base}${urlPath}`, `API: ${method} ${urlPath}`, method, routeFilePath));
   }
 
   const failures = checks
