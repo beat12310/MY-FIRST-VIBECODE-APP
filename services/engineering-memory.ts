@@ -33,6 +33,12 @@ export interface RepairPattern {
   successfulTier: 'HAIKU' | 'SONNET' | 'STRONGEST';
   /** Number of times this pattern successfully fixed a bug */
   successCount: number;
+  /**
+   * If set, the deterministic-repair engine can fix this WITHOUT calling an AI model.
+   * Value must match a transformId in services/deterministic-repair.ts.
+   * 'none' (or undefined) = AI repair required.
+   */
+  directTransform?: string;
 }
 
 export interface MemoryMatch {
@@ -144,6 +150,80 @@ const BUILTIN_PATTERNS: RepairPattern[] = [
     successCount: 0,
   },
 
+  // ── Auth / Database patterns (deterministic — no AI needed) ─────────────
+  // IMPORTANT: lib/managed/db.ts exports: db (object with .get/.all/.run), initTable, generateId
+  //            lib/managed/auth.ts exports: getAuthUser, registerUser, loginUser, AuthUser (type)
+  //            NEVER use: getDb, getCurrentUser, verifyToken, createAuthUser — these do not exist
+  {
+    id: 'auth-missing-await',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "does not exist on type.*Promise.*Token|Property.*sub.*Promise|Property.*userId.*Promise|Property 'sub' does not exist on type 'Promise|Property 'email' does not exist on type 'Promise",
+    rootCause: 'getAuthUser() called without await — returns Promise instead of user object',
+    fixApproach:
+      'Every call to getAuthUser() is async and MUST be awaited. ' +
+      'Change: const auth = getAuthUser(request) → const auth = await getAuthUser(request). ' +
+      'The user object has .sub (not .userId, not .id) for the user ID. ' +
+      'After the fix, verify: if (!auth) return 401 guard remains in place.',
+    targetFiles: [],  // determined dynamically by scanning app/api/**
+    tsErrorsToAvoid: ['TS2339'],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+    directTransform: 'auth-missing-await',
+  },
+  {
+    id: 'db-get-raw-instance',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "Property 'get' does not exist on type 'Database'|Property 'all' does not exist on type 'Database'|Property 'run' does not exist on type 'Database'",
+    rootCause: 'lib/managed/db.ts exports raw Database instance — .get() does not exist on Database directly',
+    fixApproach:
+      'better-sqlite3 Database class exposes .prepare() but NOT .get() or .all() directly. ' +
+      'lib/managed/db.ts must export a { all, get, run } wrapper object. ' +
+      'Each method delegates to: getDb().prepare(sql).get/all/run(...params). ' +
+      'NEVER export default db where db is a raw new Database() instance. ' +
+      'The wrapper makes db.get<T>(sql, ...params): T | undefined available everywhere.',
+    targetFiles: ['lib/managed/db.ts'],
+    tsErrorsToAvoid: ['TS2339'],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+    directTransform: 'db-get-raw-instance',
+  },
+  {
+    id: 'missing-use-client-hooks',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "useState.*not.*function|useEffect.*not.*function|You're importing a component that needs.*useState|hooks.*client component",
+    rootCause: 'React hook used in Server Component — "use client" directive missing',
+    fixApproach:
+      'Add "use client"; as the FIRST line of the file — before any imports. ' +
+      'This is required for any component using: useState, useEffect, useRef, useCallback, useContext, useMemo. ' +
+      'Do NOT add "use client" to API route files (app/api/*) — those are always server-side.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+    directTransform: 'missing-use-client',
+  },
+
+  // ── Route structure patterns ─────────────────────────────────────────────
+  {
+    id: 'duplicate-route-conflict',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'two parallel pages that resolve to the same path|cannot have two parallel pages|parallel pages.*same path',
+    rootCause:
+      'Two Next.js page files resolve to the same URL. ' +
+      'Route groups like (auth) are transparent — app/(auth)/X/page.tsx and app/X/page.tsx both resolve to /X. ' +
+      'This is a build-level error that produces ZERO TypeScript errors but fails next build entirely.',
+    fixApproach:
+      'Delete the duplicate page. ' +
+      'Keep the route-group version (e.g. app/(auth)/X/page.tsx) if the route group has a layout.tsx. ' +
+      'Keep the bare version (app/X/page.tsx) if the route group has no layout. ' +
+      'Never create a page at app/X/page.tsx when app/(group)/X/page.tsx already exists.',
+    targetFiles: [],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+    directTransform: 'duplicate-route-conflict',
+  },
+
   // ── Timeout patterns ──────────────────────────────────────────────────────
   {
     id: 'platform-proxy-timeout-too-long',
@@ -219,6 +299,54 @@ const BUILTIN_PATTERNS: RepairPattern[] = [
     tsErrorsToAvoid: [],
     successfulTier: 'HAIKU',
     successCount: 0,
+  },
+
+  // ── Hallucinated import names ────────────────────────────────────────────
+  {
+    id: 'hallucinated-db-export',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "Module.*has no exported member.*getDb|getDb.*is not exported|Module.*lib/managed/db.*getDb|'getDb' is not exported",
+    rootCause: "Hallucinated import 'getDb' — lib/managed/db.ts exports 'db' (not 'getDb')",
+    fixApproach:
+      "lib/managed/db.ts does NOT export getDb. It exports: db (the wrapper object), initTable, generateId. " +
+      "Change: import { getDb } from '@/lib/managed/db' → import { db } from '@/lib/managed/db'. " +
+      "Usage: db.get<T>(sql, ...params), db.all<T>(sql, ...params), db.run(sql, ...params).",
+    targetFiles: [],
+    tsErrorsToAvoid: ['TS2305'],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+  },
+  {
+    id: 'hallucinated-auth-export',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "Module.*has no exported member.*getCurrentUser|getCurrentUser.*is not exported|'getCurrentUser' is not exported|Module.*lib/managed/auth.*getCurrentUser",
+    rootCause: "Hallucinated import 'getCurrentUser' — lib/managed/auth.ts exports 'getAuthUser'",
+    fixApproach:
+      "lib/managed/auth.ts does NOT export getCurrentUser or verifyToken. It exports: getAuthUser (async). " +
+      "Change: import { getCurrentUser } from '@/lib/managed/auth' → import { getAuthUser } from '@/lib/managed/auth'. " +
+      "Usage: const auth = await getAuthUser(request); if (!auth) return 401; auth.sub is the user ID.",
+    targetFiles: [],
+    tsErrorsToAvoid: ['TS2305'],
+    successfulTier: 'HAIKU',
+    successCount: 0,
+  },
+
+  // ── Next.js 15 async params ──────────────────────────────────────────────
+  {
+    id: 'nextjs15-sync-params',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "does not satisfy the constraint.*RouteHandlerConfig|Types of property 'GET' are incompatible.*params.*Promise|params.*Promise<.*>.*not assignable.*params.*{",
+    rootCause: 'Next.js 15: route handler params are now Promise<{id}> — sync destructuring fails type check',
+    fixApproach:
+      'In Next.js 15, dynamic route handler context params are ASYNC. ' +
+      'Change: { params }: { params: { id: string } } → { params }: { params: Promise<{ id: string }> } ' +
+      'Then destructure with await at the top of the handler: const { id } = await params; ' +
+      'Apply this to ALL exported handler functions (GET, POST, PUT, DELETE, PATCH) in the same file. ' +
+      'This applies to ALL files under app/api/**/[id]/route.ts or any dynamic segment route.',
+    targetFiles: [],
+    tsErrorsToAvoid: ['TS2344'],
+    successfulTier: 'HAIKU',
+    successCount: 1,
   },
 ];
 

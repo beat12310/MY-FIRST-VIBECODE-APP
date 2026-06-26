@@ -5,6 +5,7 @@ import Link from 'next/link';
 
 const NAV_LINKS = [
   { label: 'Features', href: '#features' },
+  { label: 'How It Works', href: '#how-it-works' },
   { label: 'Pricing', href: '#pricing' },
   { label: 'FAQ', href: '#faq' },
 ];
@@ -323,6 +324,132 @@ function FeaturesSection() {
   );
 }
 
+const PIPELINE_STEPS = [
+  {
+    number: '01',
+    title: 'Describe',
+    desc: 'You type one sentence. The AI classifies your intent, identifies the right tech stack, and plans every screen, route, and API.',
+    icon: '💬',
+    color: '#6366f1',
+  },
+  {
+    number: '02',
+    title: 'Generate',
+    desc: 'Claude generates hundreds of files — components, API routes, database schema, authentication, Tailwind styles — in parallel.',
+    icon: '⚡',
+    color: '#8b5cf6',
+  },
+  {
+    number: '03',
+    title: 'Install & Compile',
+    desc: 'Packages are detected and installed automatically. TypeScript compilation runs and all type errors are logged for repair.',
+    icon: '📦',
+    color: '#a855f7',
+  },
+  {
+    number: '04',
+    title: 'Self-Heal',
+    desc: 'A 5-round repair loop reads every error, matches it against an engineering memory of known patterns, and applies fixes tier-by-tier: deterministic → Haiku → Sonnet → Opus.',
+    icon: '🔧',
+    color: '#c084fc',
+  },
+  {
+    number: '05',
+    title: 'Verify',
+    desc: 'Playwright opens a real browser, navigates every page, fills forms, and tests login/logout. Broken routes trigger another repair round before the green light is given.',
+    icon: '🎭',
+    color: '#e879f9',
+  },
+  {
+    number: '06',
+    title: 'Live Preview',
+    desc: 'Your app is running. A live iframe streams the preview. Every edit you request goes through the same pipeline — read, plan, apply, hot-reload.',
+    icon: '🚀',
+    color: '#f0abfc',
+  },
+];
+
+function AIArchitectureSection() {
+  return (
+    <section id="how-it-works" style={{ padding: '100px 24px', background: 'rgba(6,6,16,0.8)' }}>
+      <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+        <div style={{ textAlign: 'center', marginBottom: 72 }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, background: 'rgba(139,92,246,0.1)', border: '1px solid rgba(139,92,246,0.25)', borderRadius: 100, padding: '5px 14px', marginBottom: 20 }}>
+            <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#8b5cf6', display: 'inline-block' }} />
+            <span style={{ color: '#a78bfa', fontSize: 12, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase' }}>AI Architecture</span>
+          </div>
+          <h2 style={{ fontSize: 'clamp(32px,5vw,52px)', fontWeight: 800, letterSpacing: '-0.03em', color: '#f8fafc', marginBottom: 16 }}>
+            The self-healing pipeline
+          </h2>
+          <p style={{ color: '#94a3b8', fontSize: 17, maxWidth: 560, margin: '0 auto', lineHeight: 1.65 }}>
+            Six autonomous stages turn your description into a verified, live web app — with no manual intervention required.
+          </p>
+        </div>
+
+        <div style={{ position: 'relative' }}>
+          {/* Connector line */}
+          <div style={{ position: 'absolute', top: 28, left: 0, right: 0, height: 1, background: 'linear-gradient(90deg, transparent, rgba(139,92,246,0.15) 15%, rgba(139,92,246,0.35) 50%, rgba(139,92,246,0.15) 85%, transparent)', pointerEvents: 'none' }} />
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(280px,1fr))', gap: 24 }}>
+            {PIPELINE_STEPS.map((step, i) => (
+              <div key={i} style={{
+                background: 'rgba(10,10,22,0.9)',
+                border: '1px solid rgba(139,92,246,0.12)',
+                borderRadius: 16,
+                padding: '28px 24px',
+                position: 'relative',
+                transition: 'border-color 0.2s, transform 0.2s',
+              }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.borderColor = `${step.color}55`;
+                  e.currentTarget.style.transform = 'translateY(-3px)';
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.borderColor = 'rgba(139,92,246,0.12)';
+                  e.currentTarget.style.transform = 'translateY(0)';
+                }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                  <div style={{
+                    width: 40, height: 40, borderRadius: 10,
+                    background: `${step.color}18`,
+                    border: `1px solid ${step.color}40`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 18, flexShrink: 0,
+                  }}>
+                    {step.icon}
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: step.color, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 2 }}>
+                      STEP {step.number}
+                    </div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: '#f1f5f9' }}>{step.title}</div>
+                  </div>
+                </div>
+                <p style={{ color: '#94a3b8', fontSize: 14, lineHeight: 1.7, margin: 0 }}>{step.desc}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Bottom stat bar */}
+        <div style={{ marginTop: 64, display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(180px,1fr))', gap: 1, background: 'rgba(139,92,246,0.1)', borderRadius: 16, overflow: 'hidden', border: '1px solid rgba(139,92,246,0.2)' }}>
+          {[
+            { stat: '5 rounds', label: 'Self-heal depth' },
+            { stat: '3 models', label: 'Haiku → Sonnet → Opus escalation' },
+            { stat: '100% auto', label: 'No manual fixes needed' },
+            { stat: 'Real browser', label: 'Playwright verification' },
+          ].map(({ stat, label }) => (
+            <div key={label} style={{ padding: '24px 28px', background: 'rgba(6,6,16,0.8)', textAlign: 'center' }}>
+              <div style={{ fontSize: 22, fontWeight: 800, color: '#a78bfa', marginBottom: 4 }}>{stat}</div>
+              <div style={{ fontSize: 12, color: '#64748b', letterSpacing: '0.03em' }}>{label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function PricingSection() {
   return (
     <section id="pricing" style={{ padding: '100px 24px' }}>
@@ -496,21 +623,98 @@ function CTASection() {
   );
 }
 
+const FOOTER_LINKS = {
+  Product: [
+    { label: 'Features', href: '#features' },
+    { label: 'How It Works', href: '#how-it-works' },
+    { label: 'Pricing', href: '#pricing' },
+    { label: 'Changelog', href: '#' },
+  ],
+  Company: [
+    { label: 'About', href: '#' },
+    { label: 'Blog', href: '#' },
+    { label: 'Careers', href: '#' },
+    { label: 'Contact', href: '#' },
+  ],
+  Legal: [
+    { label: 'Privacy Policy', href: '#' },
+    { label: 'Terms of Service', href: '#' },
+    { label: 'Cookie Policy', href: '#' },
+    { label: 'Data Processing', href: '#' },
+  ],
+  Support: [
+    { label: 'Documentation', href: '#' },
+    { label: 'Help Center', href: '#' },
+    { label: 'Status', href: '#' },
+    { label: 'Community', href: '#' },
+  ],
+};
+
 function Footer() {
   return (
-    <footer style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '40px 24px' }}>
-      <div style={{ maxWidth: 1100, margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <div style={{ width: 28, height: 28, background: 'linear-gradient(135deg,#8b5cf6,#6366f1)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>⚡</div>
-          <span style={{ fontSize: 14, fontWeight: 700, color: '#94a3b8' }}>DWOMOH Vibe Code</span>
-        </div>
-        <div style={{ display: 'flex', gap: 24 }}>
-          {['Privacy', 'Terms', 'Support'].map(l => (
-            <a key={l} href="#" style={{ color: '#64748b', fontSize: 13, textDecoration: 'none' }}>{l}</a>
+    <footer style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '64px 24px 32px' }}>
+      <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+        {/* Top row: brand + columns */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr repeat(4, auto)', gap: 48, marginBottom: 56, flexWrap: 'wrap' }}>
+          {/* Brand */}
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+              <div style={{ width: 32, height: 32, background: 'linear-gradient(135deg,#8b5cf6,#6366f1)', borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 15 }}>⚡</div>
+              <span style={{ fontSize: 15, fontWeight: 700, color: '#f8fafc' }}>DWOMOH Vibe Code</span>
+            </div>
+            <p style={{ color: '#64748b', fontSize: 13, lineHeight: 1.7, maxWidth: 220, margin: '0 0 20px' }}>
+              AI-powered app builder for Africa and the world. Describe it, build it, ship it.
+            </p>
+            <div style={{ display: 'flex', gap: 12 }}>
+              {[
+                { label: 'X', href: '#' },
+                { label: 'GH', href: '#' },
+                { label: 'LI', href: '#' },
+              ].map(s => (
+                <a key={s.label} href={s.href} style={{
+                  width: 32, height: 32, borderRadius: 8,
+                  background: 'rgba(255,255,255,0.05)',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: '#64748b', fontSize: 11, fontWeight: 700, textDecoration: 'none',
+                  transition: 'border-color 0.2s, color 0.2s',
+                }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(139,92,246,0.4)'; e.currentTarget.style.color = '#a78bfa'; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.color = '#64748b'; }}>
+                  {s.label}
+                </a>
+              ))}
+            </div>
+          </div>
+
+          {/* Link columns */}
+          {Object.entries(FOOTER_LINKS).map(([col, links]) => (
+            <div key={col}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 16 }}>{col}</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {links.map(l => (
+                  <a key={l.label} href={l.href} style={{ color: '#64748b', fontSize: 13, textDecoration: 'none', transition: 'color 0.15s' }}
+                    onMouseEnter={e => { e.currentTarget.style.color = '#94a3b8'; }}
+                    onMouseLeave={e => { e.currentTarget.style.color = '#64748b'; }}>
+                    {l.label}
+                  </a>
+                ))}
+              </div>
+            </div>
           ))}
         </div>
-        <div style={{ color: '#475569', fontSize: 13 }}>
-          &copy; 2026 DWOMOH Vibe Code. All rights reserved.
+
+        {/* Bottom row: copyright + payment note */}
+        <div style={{ borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 28, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+          <div style={{ color: '#334155', fontSize: 12 }}>
+            &copy; 2026 DWOMOH Vibe Code. Founded by Bright Dwomoh, Ghana. All rights reserved.
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 11, color: '#334155' }}>Payments via</span>
+            {['Stripe', 'Paystack', 'MTN MoMo', 'M-Pesa'].map(p => (
+              <span key={p} style={{ padding: '2px 8px', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 4, fontSize: 10, color: '#475569', fontWeight: 600 }}>{p}</span>
+            ))}
+          </div>
         </div>
       </div>
     </footer>
@@ -523,6 +727,7 @@ export default function LandingPage() {
       <NavBar />
       <HeroSection />
       <FeaturesSection />
+      <AIArchitectureSection />
       <PricingSection />
       <TestimonialsSection />
       <FAQSection />

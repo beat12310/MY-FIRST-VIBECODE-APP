@@ -726,19 +726,24 @@ export async function deleteFile(urlOrFilename: string): Promise<void> {
 const MANAGED_QR_TS = `// QR code generation — pure JavaScript, zero configuration required.
 // Returns data URLs (base64 PNG) or SVG strings ready to embed in HTML.
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type QRCodeLib = any;
+
+async function qr(): Promise<QRCodeLib> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (await import('qrcode' as any)).default;
+}
+
 export async function generateQRDataURL(data: string, size = 256): Promise<string> {
-  const QRCode = await import('qrcode');
-  return QRCode.default.toDataURL(data, { width: size, margin: 1 });
+  return (await qr()).toDataURL(data, { width: size, margin: 1 });
 }
 
 export async function generateQRBuffer(data: string, size = 512): Promise<Buffer> {
-  const QRCode = await import('qrcode');
-  return QRCode.default.toBuffer(data, { width: size, margin: 1 });
+  return (await qr()).toBuffer(data, { width: size, margin: 1 });
 }
 
 export async function generateQRSVG(data: string): Promise<string> {
-  const QRCode = await import('qrcode');
-  return QRCode.default.toString(data, { type: 'svg' });
+  return (await qr()).toString(data, { type: 'svg' });
 }
 
 // Convenience: generate a QR code and return it as a base64 src for <img>
@@ -840,6 +845,8 @@ async function injectManagedServices(baseDir: string, files: ProjectFile[], logs
       '.env', '.env.local', '.env*.local',
       '# SQLite database files',
       '/data/*.db', '/data/*.db-shm', '/data/*.db-wal', 'project.db', '*.db',
+      '# DWOMOH platform internal state — never commit',
+      '.dwomoh/',
       'npm-debug.log*', '.DS_Store', 'next-env.d.ts',
     ].join('\n'), 'utf-8');
   }
@@ -938,6 +945,99 @@ export interface GenerateProjectResult {
   logs: string[];
 }
 
+// ─── Route Completeness Audit ─────────────────────────────────────────────────
+// Runs after all AI-generated files are written to disk but BEFORE npm install.
+// Finds every <Link href>, router.push(), redirect() etc. that references a
+// route with no corresponding page.tsx, then writes a functional stub page so
+// Next.js never serves a 404 for a navigation link.
+
+function extractReferencedRoutes(content: string): string[] {
+  const routes = new Set<string>();
+  const patterns = [
+    /\bhref\s*=\s*["'`](\/[^"'`?#[\]{}$]*?)["'`]/g,
+    /\bhref\s*=\s*\{\s*["'`](\/[^"'`?#[\]{}$]*?)["'`]\s*\}/g,
+    /router\.push\s*\(\s*["'`](\/[^"'`?#[\]{}$]*?)["'`]/g,
+    /\bredirect\s*\(\s*["'`](\/[^"'`?#[\]{}$]*?)["'`]/g,
+    /\.replace\s*\(\s*["'`](\/[^"'`?#[\]{}$]*?)["'`]/g,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(content)) !== null) {
+      const route = match[1].replace(/\/$/, '') || '/';
+      if (!route || route.startsWith('/api/') || route.includes('[') || route.includes('${')) continue;
+      routes.add(route);
+    }
+  }
+  return Array.from(routes);
+}
+
+async function auditAndRepairRoutes(
+  baseDir: string,
+  files: ProjectFile[],
+  logs: string[]
+): Promise<void> {
+  // Build set of page routes the AI generated (strip route groups like (auth))
+  const existingPages = new Set<string>();
+  if (files.some(f => f.path === 'app/page.tsx' || f.path === 'app/page.jsx')) {
+    existingPages.add('/');
+  }
+  for (const file of files) {
+    const m = file.path.match(/^app\/(.*?)\/page\.[jt]sx?$/);
+    if (!m) continue;
+    const route = '/' + m[1].replace(/\([^)]+\)\//g, '').replace(/\([^)]+\)$/, '');
+    existingPages.add(route || '/');
+  }
+
+  // Scan all source files for referenced routes
+  const codeExts = new Set(['.ts', '.tsx', '.js', '.jsx']);
+  const referencedRoutes = new Set<string>();
+  for (const file of files) {
+    const ext = '.' + (file.path.split('.').pop() ?? '');
+    if (!codeExts.has(ext)) continue;
+    const content = typeof file.content === 'string' ? file.content : '';
+    for (const route of extractReferencedRoutes(content)) {
+      referencedRoutes.add(route);
+    }
+  }
+
+  // Find missing routes
+  const AUTH_SLUGS = new Set(['login', 'signin', 'signup', 'register', 'verify-email', 'forgot-password', 'reset-password', 'auth']);
+  const missing = Array.from(referencedRoutes).sort().filter(r => !existingPages.has(r));
+
+  if (missing.length === 0) {
+    logs.push('✅ Route audit: all referenced routes have pages');
+    return;
+  }
+
+  logs.push(`⚠️ Route audit: ${missing.length} missing page(s) — auto-generating stubs`);
+
+  const hasAuthGroup = files.some(f => f.path.includes('app/(auth)/'));
+  const authRedirect = existingPages.has('/auth') ? '/auth' : (existingPages.has('/login') ? '/login' : '/');
+
+  for (const route of missing) {
+    const segments = route.split('/').filter(Boolean);
+    const pageName = segments.map(s => s.charAt(0).toUpperCase() + s.slice(1).replace(/-([a-z])/g, (_, c) => c.toUpperCase())).join('');
+    const displayName = segments.map(s => s.charAt(0).toUpperCase() + s.slice(1).replace(/-/g, ' ')).join(' ');
+    const isAuth = segments.some(s => AUTH_SLUGS.has(s));
+
+    let stub: string;
+    if (isAuth) {
+      stub = `'use client';\nimport { useEffect } from 'react';\nimport { useRouter } from 'next/navigation';\n\nexport default function ${pageName || 'Auth'}Page() {\n  const router = useRouter();\n  useEffect(() => { router.replace('${authRedirect}'); }, [router]);\n  return null;\n}\n`;
+    } else {
+      stub = `'use client';\nimport { useRouter } from 'next/navigation';\n\nexport default function ${pageName || 'Stub'}Page() {\n  const router = useRouter();\n  return (\n    <main className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-8">\n      <div className="bg-white rounded-2xl shadow-sm p-10 max-w-md w-full text-center">\n        <h1 className="text-3xl font-bold text-gray-900 mb-3">${displayName}</h1>\n        <p className="text-gray-500 mb-8">Loading content…</p>\n        <div className="space-y-3 mb-8">{[0,1,2].map(i => <div key={i} className="h-4 bg-gray-100 rounded animate-pulse" />)}</div>\n        <button onClick={() => router.back()} className="px-5 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium">← Back</button>\n      </div>\n    </main>\n  );\n}\n`;
+    }
+
+    const filePath = isAuth && hasAuthGroup ? `app/(auth)${route}/page.tsx` : `app${route}/page.tsx`;
+    const fullPath = `${baseDir}/${filePath}`;
+    const dirPath = fullPath.substring(0, fullPath.lastIndexOf('/'));
+    await mkdir(dirPath, { recursive: true });
+    await writeFile(fullPath, stub, 'utf-8');
+    logs.push(`🔧 Stub created: ${filePath}`);
+  }
+
+  logs.push(`✅ Route audit complete: ${missing.length} stub(s) written — zero 404 nav links`);
+}
+
 /**
  * Create project directory structure and files
  */
@@ -975,6 +1075,14 @@ export async function generateProject(
       if (!file.path || file.content === undefined) {
         logs.push(`⚠️ Skipping invalid file: ${file.path}`);
         continue;
+      }
+
+      // Skip paths where the AI accidentally used template-literal syntax in directory names
+      // e.g. app/listings/${id}/page.tsx should be app/listings/[id]/page.tsx
+      if (file.path.includes('${') || file.path.includes('$(')) {
+        const corrected = file.path.replace(/\$\{([^}]+)\}/g, '[$1]').replace(/\$\(([^)]+)\)/g, '[$1]');
+        logs.push(`🔧 Fixed template-literal path: ${file.path} → ${corrected}`);
+        file.path = corrected;
       }
 
       const filePath = join(baseDir, file.path);
@@ -1028,6 +1136,10 @@ export async function generateProject(
     await patchPageFile(baseDir, files, logs);
     await patchTsconfig(baseDir, files, logs);
     await ensureNextConfig(baseDir, files, logs);
+
+    // Route Completeness Audit: detect and stub any nav links with no page.tsx
+    // Runs before npm install so Next.js never serves a 404 for a nav link
+    await auditAndRepairRoutes(baseDir, files, logs);
 
     logs.push(`✅ Project created with ${filesCreated} files in ${foldersCreated} folders`);
 
@@ -1205,7 +1317,10 @@ yarn-error.log*
 .vscode/
 .idea/
 *.swp
-*.swo`,
+*.swo
+
+# DWOMOH platform internal state
+.dwomoh/`,
     });
   }
 

@@ -182,7 +182,10 @@ export async function discoverProject(projectPath: string): Promise<DiscoveryRes
     'package.json',
     'app/page.tsx',
     'app/layout.tsx',
+    'middleware.ts',
+    'middleware.js',
     ...pages.slice(0, 8),
+    ...apiRoutes.slice(0, 8),   // API routes always read — fixes "404" repair missing route context
     ...components.slice(0, 10),
     ...libFiles.slice(0, 5),
   ];
@@ -430,13 +433,33 @@ export async function buildEditContext(params: {
     if (segment && req.includes(segment) && segment !== 'app') filesToInclude.add(page);
   }
 
+  // Match API route names — critical for 404 / broken route repairs
+  // e.g. "fix the /bookings 404" must include app/api/bookings/route.ts AND app/bookings/page.tsx
+  for (const route of discovery.apiRoutes) {
+    const segment = route.split('/').find((_, i, a) => a[i - 1] === 'api') ?? '';
+    if (segment && req.includes(segment.toLowerCase())) filesToInclude.add(route);
+  }
+
+  // Always include middleware — it controls auth redirects, which are a common 404/403 source
+  if (discovery.keyContents['middleware.ts'])  filesToInclude.add('middleware.ts');
+  if (discovery.keyContents['middleware.js'])  filesToInclude.add('middleware.js');
+
+  // For "404", "not found", "broken route", "routing" requests: include all API routes
+  if (/\b(404|not found|broken|routing|redirect|missing route|page not found)\b/i.test(req)) {
+    for (const route of discovery.apiRoutes.slice(0, 6)) filesToInclude.add(route);
+    for (const page of discovery.pages.slice(0, 6))  filesToInclude.add(page);
+    filesToInclude.add('middleware.ts');
+    filesToInclude.add('next.config.ts');
+    filesToInclude.add('next.config.js');
+  }
+
   // Files explicitly mentioned in auto-detected error messages take priority
   for (const f of extraFiles) {
     const normalized = f.startsWith('./') ? f.slice(2) : f;
     filesToInclude.add(normalized);
   }
 
-  // If still fewer than 3 files, add more
+  // If still fewer than 3 files, add more from keyContents
   if (filesToInclude.size < 3) {
     for (const path of Object.keys(discovery.keyContents)) {
       if (!filesToInclude.has(path) && path !== 'package.json') {

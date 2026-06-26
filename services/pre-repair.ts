@@ -176,7 +176,54 @@ async function checkDatabaseSetup(
   const hasDbError =
     /SQLITE_ERROR|SQLITE_CANTOPEN|database.*locked|no such table|better-sqlite3|TS7009|TS2351/i.test(allText);
 
-  if (!hasDbError) return issues;
+  // ── Auth-without-await pattern detection ──────────────────────────────────
+  // "Property 'X' does not exist on type 'Promise<TokenPayload | null>'"
+  // Root cause: getAuthUser(request) called without await
+  if (/does not exist on type.*Promise.*Token|Promise.*TokenPayload|Promise.*null.*sub|Property.*sub.*Promise/i.test(allText)) {
+    const routeFileRe2 = /app\/api\/([\w/-]+)\/route\.ts/g;
+    let m2;
+    while ((m2 = routeFileRe2.exec(allText)) !== null) {
+      const rel = `app/api/${m2[1]}/route.ts`;
+      try {
+        const src = await readFile(join(projectPath, rel), 'utf-8');
+        if (/getAuthUser\s*\([^)]+\)(?!\s*;)/.test(src) && !/await\s+getAuthUser/.test(src)) {
+          issues.push({
+            file: rel,
+            issue: `${rel}: getAuthUser() called without await — returns Promise instead of user object. Accessing .sub or .userId on a Promise causes "Property does not exist on type Promise" error.`,
+            directFix: `Replace every: const auth = getAuthUser(req) with: const auth = await getAuthUser(req)\nAlso replace .userId with .sub (the property is named .sub, not .userId)`,
+          });
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  // ── db.get() on raw Database instance ────────────────────────────────────
+  // "Property 'get' does not exist on type 'Database'"
+  // Root cause: AI generated raw better-sqlite3 Database and called .get() on it
+  if (/Property 'get' does not exist on type.*Database|Property 'all' does not exist on type.*Database/i.test(allText)) {
+    // Check lib/managed/db.ts — if it exports a raw Database instead of the { all, get, run } wrapper
+    try {
+      const dbTs = await readFile(join(projectPath, 'lib/managed/db.ts'), 'utf-8');
+      const hasGetWrapper = /export\s+const\s+db\s*=\s*\{[\s\S]*?get\s*[<(]/.test(dbTs);
+      const hasRawExport = /export\s+default\s+db|export\s+\{[^}]*\bdb\b[^}]*\}\s*from/.test(dbTs);
+      if (!hasGetWrapper || hasRawExport) {
+        issues.push({
+          file: 'lib/managed/db.ts',
+          issue: `lib/managed/db.ts exports a raw Database instance — .get() and .all() do not exist directly on Database. The file must export a { all, get, run } wrapper object.`,
+          directFix: `Replace lib/managed/db.ts with the correct wrapper:\nimport Database from 'better-sqlite3';\nimport { join } from 'path';\nlet _db: Database.Database | null = null;\nfunction getDb(): Database.Database {\n  if (_db) return _db;\n  _db = new Database(join(process.cwd(), 'project.db'));\n  _db.pragma('journal_mode = WAL');\n  _db.pragma('foreign_keys = ON');\n  return _db;\n}\nexport function initTable(sql: string): void { getDb().exec(sql); }\nexport const db = {\n  all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): T[] { return getDb().prepare(sql).all(...params) as T[]; },\n  get<T = Record<string, unknown>>(sql: string, ...params: unknown[]): T | undefined { return getDb().prepare(sql).get(...params) as T | undefined; },\n  run(sql: string, ...params: unknown[]): Database.RunResult { return getDb().prepare(sql).run(...params); },\n};`,
+        });
+      }
+    } catch {
+      // lib/managed/db.ts missing entirely — that's also a problem
+      issues.push({
+        file: 'lib/managed/db.ts',
+        issue: 'lib/managed/db.ts is missing — generated code imports { db, initTable } from this file but it does not exist',
+        directFix: `Create lib/managed/db.ts with the standard wrapper (see system prompt DATABASE section)`,
+      });
+    }
+  }
+
+  if (!hasDbError && !/Property 'get' does not exist on type.*Database/i.test(allText)) return issues;
 
   // TS7009 / TS2351 with better-sqlite3 — wrong constructor pattern
   if (/TS7009|TS2351/i.test(allText) && /better-sqlite3|Database/i.test(allText)) {

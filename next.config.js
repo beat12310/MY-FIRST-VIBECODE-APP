@@ -1,8 +1,25 @@
+const path = require('path');
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    // stripe is an optional billing dependency — don't bundle it; require it at runtime
     serverComponentsExternalPackages: ['stripe'],
+    outputFileTracingRoot: path.join(__dirname),
+  },
+  webpack: (config, { dev }) => {
+    if (!dev) {
+      config.devtool = false;
+    }
+    config.watchOptions = {
+      ...(config.watchOptions ?? {}),
+      ignored: [
+        '**/node_modules/**',
+        '**/generated-projects/**',
+        '**/.dwomoh/**',
+        '**/public/browser-screenshots/**',
+      ],
+    };
+    return config;
   },
 };
 

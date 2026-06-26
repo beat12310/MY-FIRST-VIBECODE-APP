@@ -2,7 +2,7 @@ export const runtime = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
 import { parseProjectFormat } from '@/lib/json-parser';
-import { converseWithEngineer, buildWithAI, fixErrorsWithAI, editWithAI, analyzeImageWithAI, generateLogoWithAI, ConversationTurn } from '@/services/bedrock';
+import { converseWithEngineer, buildWithAI, fixErrorsWithAI, editWithAI, analyzeImageWithAI, generateLogoWithAI, converseAgentically, ConversationTurn } from '@/services/bedrock';
 import { handleError } from '@/lib/error-handler';
 import { generateProject } from '@/services/project-generator';
 import { installDependencies, startDevServer, validateProject, clearBuildCache, readServerState, getServerLogs } from '@/services/project-runner';
@@ -137,6 +137,159 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         return NextResponse.json({ success: false, error: 'No user message provided' }, { status: 400 });
       }
       const response = await converseWithEngineer(turns, INTELLIGENT_SYSTEM_PROMPT);
+      return NextResponse.json({ success: true, response });
+    }
+
+    // ── think-agentic: conversation with live tool use (browse, test, search) ──
+    // When the AI decides to use a tool, it calls it live and feeds the result back.
+    // Supports: browse_web, test_live_app, search_internet.
+    if (action === 'think-agentic') {
+      const turns: ConversationTurn[] = Array.isArray(messages) ? messages : [];
+      if (turns.length === 0 || turns[turns.length - 1].role !== 'user') {
+        return NextResponse.json({ success: false, error: 'No user message provided' }, { status: 400 });
+      }
+      const agentPort    = body.port        as number | undefined;
+      const agentPath    = body.projectPath as string | undefined;
+      const agentProject = body.projectName as string | undefined;
+
+      // Discover the project's file structure server-side so the AI can see
+      // exactly which pages and routes exist — without the user providing anything.
+      let fileStructureBlock = '';
+      let discoveredPages: string[] = [];
+      let discoveredApiRoutes: string[] = [];
+      if (agentPath) {
+        try {
+          const { discoverProject } = await import('@/services/project-discovery');
+          const disc = await discoverProject(agentPath);
+          discoveredPages     = disc.pages ?? [];
+          discoveredApiRoutes = disc.apiRoutes ?? [];
+          const pageList = discoveredPages.length     > 0 ? discoveredPages.join(', ')                              : 'none discovered';
+          const apiList  = discoveredApiRoutes.length > 0 ? discoveredApiRoutes.join(', ')                         : 'none discovered';
+          const compList = (disc.components ?? []).slice(0, 12).join(', ') + ((disc.components ?? []).length > 12 ? ', …' : '');
+          fileStructureBlock = `
+Pages     : ${pageList}
+API routes: ${apiList}
+Components: ${compList || 'none discovered'}`;
+        } catch { /* non-critical */ }
+      }
+
+      // Active-project context block injected verbatim into the agent system prompt.
+      // The AI MUST use these values — never ask the user for port, path, or project name.
+      const activeProjectBlock = (agentPort || agentPath) ? `
+
+╔══════════════════════════════════════════════════════════════╗
+║  ACTIVE PROJECT  —  DO NOT ask the user for any of this     ║
+╚══════════════════════════════════════════════════════════════╝
+Project : ${agentProject ?? '(unnamed)'}
+Port    : ${agentPort ?? 'not running'}   ← pass this exact value as "port" to test_live_app
+Path    : ${agentPath  ?? 'unknown'}
+${fileStructureBlock}
+
+MANDATORY BEHAVIOUR — follow these in order:
+1. If the user mentions "404", "broken", "not working", "error", "preview shows", "page not found",
+   "blank", "won't load", or any indication the app is misbehaving:
+   → Call test_live_app(port=${agentPort}) IMMEDIATELY as your very first action.
+   → NEVER ask "what is the port?" — it is ${agentPort} (shown above).
+   → NEVER ask "can you share your files?" — the file structure is shown above.
+
+2. After test_live_app returns results:
+   → Read every ❌ line. Each one identifies a broken route or failed step.
+   → Name the exact file that needs to be created or fixed (use the Pages list above to cross-check).
+   → Explain the problem clearly before describing the fix.
+
+3. If a fix is applied, call test_live_app again to confirm the repair worked.
+   Never declare a page "fixed" without a passing re-test.
+
+4. If the user asks to test or verify the app for any reason, call test_live_app first.
+   Do not ask for confirmation — just run it.
+` : '';
+
+      const toolExecutor = async (toolName: string, toolInput: Record<string, unknown>): Promise<string> => {
+        if (toolName === 'browse_web') {
+          const url = toolInput.url as string;
+          if (!url?.startsWith('http')) return 'Invalid URL — must start with https://';
+          try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 12000);
+            const res = await fetch(url, {
+              headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DWOMOHVibe-Research/1.0)' },
+              signal: controller.signal,
+            });
+            clearTimeout(timer);
+            if (!res.ok) return `HTTP ${res.status} — page unavailable`;
+            const html = await res.text();
+            const text = html
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ').trim().slice(0, 5000);
+            const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+            return `Page: ${titleMatch?.[1] ?? url}\nURL: ${url}\n\n${text || 'No readable content extracted'}`;
+          } catch (err) {
+            return `Browse error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+
+        if (toolName === 'test_live_app') {
+          const port = (toolInput.port as number) ?? agentPort;
+          if (!port) return 'No port provided — the app must be running. Check buildProgress.port in the builder.';
+          const testType = (toolInput.test_type as string) ?? 'generic';
+          const baseUrl  = `http://localhost:${port}`;
+
+          // Step 1: HTTP-level route check — catches 404s in under 1 second
+          const httpLines: string[] = [];
+          try {
+            const { verifyRunningApp } = await import('@/services/verification-engine');
+            const routeCheck = await verifyRunningApp(port, discoveredApiRoutes, agentPath, discoveredPages);
+            for (const c of routeCheck.checks) {
+              httpLines.push(`${c.passed ? '✅' : '❌'} HTTP ${c.name}: ${c.statusCode ?? 'no status'} ${c.error ? `— ${c.error}` : ''}`);
+            }
+          } catch { /* non-critical — continue to Playwright */ }
+
+          // Step 2: Playwright browser test — clicks, forms, navigation
+          let playwrightSection = '';
+          try {
+            const { runBrowserJourney } = await import('@/services/browser-journey-runner');
+            const result = await runBrowserJourney(baseUrl, testType as 'generic' | 'marketplace' | 'booking' | 'social');
+            const passed = result.steps.filter(s => s.passed).length;
+            const total  = result.steps.length;
+            const lines  = result.steps.map(s => `${s.passed ? '✅' : '❌'} ${s.step}${s.error ? ` — ${s.error}` : ''}`);
+            playwrightSection = `\nPlaywright (${passed}/${total} steps passed — verdict: ${result.verdict}):\n${lines.join('\n')}${result.failureScreenshotPath ? `\nFailure screenshot: ${result.failureScreenshotPath}` : ''}`;
+          } catch (err) {
+            playwrightSection = `\nPlaywright: ${err instanceof Error ? err.message : String(err)}`;
+          }
+
+          const httpSection = httpLines.length > 0 ? `\nRoute HTTP checks:\n${httpLines.join('\n')}` : '';
+          return `Live test results for ${baseUrl}:${httpSection}${playwrightSection}`;
+        }
+
+        if (toolName === 'search_internet') {
+          const query = toolInput.query as string;
+          if (!query) return 'No search query provided';
+          try {
+            const { searchWeb, formatSearchResultsForPrompt } = await import('@/services/web-search');
+            const response = await searchWeb(query);
+            return response.results.length > 0 ? formatSearchResultsForPrompt(response) : 'No results found';
+          } catch (err) {
+            return `Search error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+
+        return `Unknown tool: ${toolName}`;
+      };
+
+      const agentSystemPrompt = `${INTELLIGENT_SYSTEM_PROMPT}${activeProjectBlock}
+
+═══════════════════════════════════════════════
+YOUR TOOLS — call them immediately; never describe them instead of using them
+═══════════════════════════════════════════════
+1. browse_web(url, purpose) — fetch and read any public webpage right now.
+2. test_live_app(port, test_type?) — open a real Playwright browser, click through every page, form, and route. Returns HTTP status for every route AND Playwright step-by-step results. Use port=${agentPort ?? 'from ACTIVE PROJECT block above'}.
+3. search_internet(query) — search Google/Bing for APIs, errors, documentation.
+
+RULE: A tool invocation is always better than an apology or a question. When in doubt, call the tool.`;
+
+      const response = await converseAgentically(turns, agentSystemPrompt, toolExecutor);
       return NextResponse.json({ success: true, response });
     }
 
@@ -388,8 +541,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ? `${userRequest}\n\n[ERRORS CURRENTLY VISIBLE IN THE PREVIEW PANEL — fix these without asking the user for more detail]:\n${autoErrorBlock}\n[END AUTO-DETECTED ERRORS]`
         : userRequest;
 
+      // ── Spec recovery — prepend project spec to the edit request ─────────────
+      // Ensures repair requests know WHAT they are repairing. Without this, a TS
+      // error fix can re-generate a page as a generic weather dashboard if the AI
+      // loses context of the original project.
+      let specPrefixForEdit = '';
+      try {
+        const { loadSpec, formatSpecAnchor } = await import('@/services/project-spec');
+        const editSpec = await loadSpec(projectPath);
+        if (editSpec) {
+          specPrefixForEdit = `${formatSpecAnchor(editSpec)}\n\n⚠️ You are editing THIS project (above). Fix errors without changing the project type or replacing existing pages.\n\n`;
+        }
+      } catch { /* non-fatal */ }
+
       // Build full edit context, including files mentioned in the auto-detected errors
-      const contextMessage = await buildEditContext({ discovery, userRequest: enrichedRequest, mem, extraFiles: autoErrorFiles });
+      const specEnrichedRequest = specPrefixForEdit ? `${specPrefixForEdit}${enrichedRequest}` : enrichedRequest;
+      const contextMessage = await buildEditContext({ discovery, userRequest: specEnrichedRequest, mem, extraFiles: autoErrorFiles });
 
       // ── Scope constraint injection into the system prompt ─────────────────────
       // When a specific issue layer is identified (api/frontend/backend/auth/database),
@@ -406,8 +573,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           scopeConstraint.blockedPrefixes?.length
             ? `DO NOT modify: ${scopeConstraint.blockedPrefixes.join(', ')}`
             : '',
-          'If the fix requires changing files outside the scope, explain why and ask first.',
+          'If the fix requires files outside the listed scope, include them anyway — do NOT explain or ask.',
           'NEVER touch unrelated files to fix a scoped issue.',
+          'CRITICAL: even with scope constraints, ALWAYS output [EDIT_START]...[EDIT_END] blocks — NEVER respond with explanation only.',
         ].filter(Boolean).join('\n');
         effectiveSystemPrompt = EDITOR_SYSTEM_PROMPT + scopeBlock;
       }
@@ -418,8 +586,46 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       // Parse the [EDIT_START]...[EDIT_END] format
       let editedFiles = parseEditFormat(aiResponse);
 
+      // ── Conversational-response guard ──────────────────────────────────────────
+      // If the AI returned text with no edit blocks, check whether the request was
+      // actually an edit command. If it was, retry ONCE with an explicit demand for
+      // [EDIT_START]...[EDIT_END] output. Only allow conversational pass-through
+      // for pure information questions.
       if (editedFiles.length === 0) {
-        return NextResponse.json({ success: true, filesChanged: [], response: aiResponse, conversational: true });
+        const EDIT_VERBS = /\b(remove|delete|hide|add|change|update|fix|rename|move|reorder|replace|modify|disable|enable|make|turn|set|show|adjust|include|exclude|implement|create|refactor|clean|clear|reset|toggle|switch|insert|append|prepend|strip|drop|convert)\b/i;
+        const isEditRequest = EDIT_VERBS.test(userRequest);
+
+        if (isEditRequest) {
+          // The AI explained instead of editing. Retry with an explicit demand.
+          const retryPrompt = contextMessage +
+            `\n\n═══════════════════════════════════════════════` +
+            `\nFORCE EDIT — CRITICAL` +
+            `\n═══════════════════════════════════════════════` +
+            `\nYour previous response was CONVERSATIONAL TEXT with no file changes.` +
+            `\nThis is NOT acceptable for an edit request.` +
+            `\nThe user asked: "${userRequest}"` +
+            `\nThis is an EDIT command — you MUST output [EDIT_START]...[EDIT_END] blocks RIGHT NOW.` +
+            `\nFind the file that renders the element mentioned. Output its FULL content with the change applied.` +
+            `\nDo NOT explain. Do NOT describe. Output ONLY the [EDIT_START]...[EDIT_END] block.`;
+
+          const retryResponse = await editWithAI(retryPrompt, effectiveSystemPrompt);
+          editedFiles = parseEditFormat(retryResponse);
+
+          if (editedFiles.length === 0) {
+            // Retry also returned no edits — allow conversational pass-through so
+            // the user at least sees what blocked the edit.
+            return NextResponse.json({
+              success: true,
+              filesChanged: [],
+              response: retryResponse || aiResponse,
+              conversational: true,
+              _retried: true,
+            });
+          }
+        } else {
+          // Pure information question — conversational response is correct.
+          return NextResponse.json({ success: true, filesChanged: [], response: aiResponse, conversational: true });
+        }
       }
 
       // ── Scope filter: drop any AI-generated changes that violate scope ─────────
@@ -511,6 +717,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         role: t.role,
         content: typeof t.content === 'string' ? t.content : '[image attached]',
       }));
+
+      // ── Step 0: Extract and lock the project specification ────────────────────
+      // This happens BEFORE building the prompt so the spec anchor can be prepended
+      // to ALL three strategy prompts (including the MVP fallback).
+      // Deterministic — no AI call, <5ms.
+      const { extractSpecFromConversation, formatSpecAnchor, saveSpec } = await import('@/services/project-spec');
+      const { getArchitectureHints } = await import('@/services/build-templates');
+      const lockedSpec = extractSpecFromConversation(stringTurns);
+      const specAnchor = formatSpecAnchor(lockedSpec);
+      const archHints = getArchitectureHints(lockedSpec.type);
+      console.log(`[generate] Spec locked — name: "${lockedSpec.name}", type: "${lockedSpec.type}"`);
+
       const buildUserMessage = stringTurns.length >= 1
         ? generateBuildPromptFromConversation(stringTurns)
         : (typeof prompt === 'string' ? `Generate a complete Next.js application for: ${prompt}` : '');
@@ -531,6 +749,17 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       // ── API Manager — detect + plan APIs before AI generation ──────────────────
       // Routes in plan.routes are injected directly into the generated project below
       // (they are not left to the AI to guess from text instructions alone).
+      //
+      // IMPORTANT: scan USER MESSAGES ONLY for API category detection.
+      // Scanning the full conversation (including AI responses) causes false positives:
+      // a Ghana tourism app discussion naturally triggers weather/finance/sports keywords
+      // from AI planning language ("check the weather", "exchange rates for tourists",
+      // "sports activities") even though the user never asked for those features.
+      const userOnlyText = stringTurns
+        .filter(t => t.role === 'user')
+        .map(t => t.content.replace('[READY_TO_BUILD]', '').trim())
+        .filter(c => c && c.length > 3 && !/^(create now|build now|start building|generate now|build it|make it|go build|proceed|execute|yes|ok|okay|sure|let's go|yep|yeah)$/i.test(c))
+        .join('\n');
       let apiPromptInstructions = '';
       let apiPlanRoutes: import('@/services/api-manager/generator').GeneratedRoute[] = [];
       let apiPlanMissingCategories: string[] = [];
@@ -538,7 +767,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       const projectId = buildUserMessage.slice(0, 40).replace(/\W+/g, '-').toLowerCase() + `-${Date.now()}`;
       try {
         const { apiManager } = await import('@/services/api-manager/index');
-        const plan = await apiManager.planForPrompt(buildUserMessage, projectId);
+        const plan = await apiManager.planForPrompt(userOnlyText || buildUserMessage, projectId);
         apiPromptInstructions = plan.promptInstructions;
         apiPlanRoutes = plan.routes;            // written into the project after AI generation
         apiPlanMissingCategories = plan.missing;
@@ -573,24 +802,36 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       const apiSuffix = apiPromptInstructions ? `\n${apiPromptInstructions}` : '';
 
       const buildStrategies: Array<() => string> = [
-        () => buildUserMessage + apiSuffix,
+        // Strategy 1: Full build prompt with spec anchor at top
+        () => `${specAnchor}
+${archHints}
 
-        () => `${buildUserMessage}${apiSuffix}
+${buildUserMessage}${apiSuffix}`,
+
+        // Strategy 2: Same + hard format reminder
+        () => `${specAnchor}
+${archHints}
+
+${buildUserMessage}${apiSuffix}
 
 ⚠️ REQUIRED OUTPUT FORMAT — DO NOT SKIP:
 Your response MUST begin with [START_PROJECT] on its own line and end with [END_PROJECT].
 Include AT MINIMUM: package.json and app/page.tsx.
 Do NOT reply conversationally. Output the project files IMMEDIATELY.`,
 
-        () => `Build a minimal but fully working MVP for: ${shortDesc}
+        // Strategy 3: MVP fallback — spec anchor REPLACES shortDesc so project intent survives
+        () => `${specAnchor}
+${archHints}
 ${apiSuffix}
+
+Build a minimal but fully working MVP for the project described in the SPECIFICATION above.
 Keep it simple — 5 to 8 files total. Required files:
 1. package.json
 2. next.config.ts
 3. app/layout.tsx
-4. app/page.tsx  ← main homepage with real UI and functionality
+4. app/page.tsx  ← main homepage matching the project spec above — NOT a weather/finance dashboard
 5. app/globals.css
-6. At least one API route under app/api/
+6. At least one API route matching the project type
 
 Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       ];
@@ -753,6 +994,9 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         scaffoldFallback: isScaffoldResponse,
         scaffoldReason: isScaffoldResponse ? (lastRawError || 'AI generation returned empty or unparseable output') : undefined,
         modelTier: generateTier,
+        // ── Locked spec — passed back to client so it can be forwarded to the
+        //    create action and saved to disk alongside the project files.
+        lockedSpec,
         // Surface API plan status to the builder for user messaging
         apiPlan: {
           resolved: apiPlanResolved,
@@ -832,6 +1076,18 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       // Record in global memory
       await recordBuild(result.projectName, originalPrompt, true);
+
+      // ── Save locked spec to disk for repair context recovery ─────────────────
+      // If the caller forwarded the lockedSpec from the generate response, save it
+      // so future repair/edit cycles can reload it without re-reading history.
+      if (body.lockedSpec) {
+        try {
+          const { saveSpec } = await import('@/services/project-spec');
+          await saveSpec(result.projectPath, body.lockedSpec);
+          console.log(`[create] Spec saved to ${result.projectPath}/.dwomoh/spec.json`);
+        } catch { /* non-fatal */ }
+      }
+
 
       return NextResponse.json({
         success: true,
@@ -1214,14 +1470,16 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
 
       let apiRoutes: string[] = [];
+      let pageRoutes: string[] = [];
       if (projectPath) {
         try {
           const disc = await discoverProject(projectPath);
           apiRoutes = disc.apiRoutes;
+          pageRoutes = disc.pages ?? [];
         } catch { /* non-critical — verify main page even without discovery */ }
       }
 
-      const result = await verifyRunningApp(port as number, apiRoutes, projectPath as string | undefined);
+      const result = await verifyRunningApp(port as number, apiRoutes, projectPath as string | undefined, pageRoutes);
 
       // TypeScript safety gate: only run tsc when HTTP checks all pass.
       // Running tsc on every loop iteration (15 × ~30s) would add 7+ minutes of overhead.
@@ -1880,6 +2138,73 @@ Return ONLY the corrected file in this exact format:
       });
     }
 
+    // ── deterministic-repair: apply known code transforms WITHOUT calling AI ───
+    // Phase 1 of the repair pipeline. For recognised error patterns (auth-await,
+    // db-wrapper, missing-use-client), applies a direct file transformation and
+    // re-runs TypeScript to confirm the fix. Only falls back to AI if this fails.
+    // ── auth-investigate: build auth dependency graph + ordered repair plan ──────
+    // Called BEFORE agent-fix when auth-related errors are detected.
+    // Returns a RepairPlan with steps ordered so root causes are fixed first.
+    if (action === 'auth-investigate') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const externalTsErrors: string[] = Array.isArray(body.tsErrors) ? body.tsErrors : [];
+
+      const { investigateAuthArchitecture } = await import('@/services/auth-investigator');
+      const report = await investigateAuthArchitecture(projectPath, externalTsErrors);
+
+      console.log(`[auth-investigate] provider=${report.provider} brokenFiles=${report.repairOrder.length} steps=${report.repairSteps.length}`);
+      if (report.repairOrder.length > 0) {
+        console.log(`[auth-investigate] Repair order: ${report.repairOrder.join(' → ')}`);
+      }
+
+      return NextResponse.json({
+        success: true,
+        provider: report.provider,
+        repairSteps: report.repairSteps,
+        healthChecks: report.healthChecks,
+        repairOrder: report.repairOrder,
+        summary: report.summary,
+        // Condensed file map for debug display
+        fileMap: report.authFiles.map(f => ({
+          rel: f.rel,
+          role: f.role,
+          errorCount: f.tsErrors.length,
+          missing: f.missing,
+          hasBrokenDeps: f.hasBrokenDeps,
+          deps: f.localDeps,
+        })),
+      });
+    }
+
+    if (action === 'deterministic-repair') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const errorText: string = body.errorText || body.errorContext || '';
+      const tsErrors: string[] = Array.isArray(body.tsErrors) ? body.tsErrors : [];
+      const forceTransform: string | undefined = body.forceTransform;
+
+      const { runDeterministicRepairs } = await import('@/services/deterministic-repair');
+      // forceTransform: if set, inject the transform ID into the error text so the
+      // deterministic engine always runs that specific transform regardless of pattern match
+      const effectiveErrorText = forceTransform
+        ? `${errorText}\n[FORCE_TRANSFORM:${forceTransform}]`
+        : errorText;
+      const result = await runDeterministicRepairs(projectPath, effectiveErrorText, tsErrors);
+
+      // Log to console for debugging even when debug mode is off
+      if (result.applied.length > 0) {
+        console.log('[deterministic-repair] Applied:', result.applied.map(f => `${f.transformId} → ${f.file}`).join(', '));
+      }
+
+      return NextResponse.json({
+        success: true,
+        ...result,
+        // User-friendly summary (shown in non-debug mode)
+        userSummary: result.applied.length > 0
+          ? `Identified and applied ${result.applied.length} targeted fix${result.applied.length > 1 ? 'es' : ''}.`
+          : 'No known patterns matched — proceeding to AI-assisted repair.',
+      });
+    }
+
     // ── install-packages: install multiple npm packages at once ───────────────
     if (action === 'install-packages') {
       if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
@@ -1929,6 +2254,223 @@ Return ONLY the corrected file in this exact format:
       return NextResponse.json({ success: true, saved: record.rootCause });
     }
 
+    // ── run-browser-journey: full browser-level user journey (Playwright) ───────────────────
+    // Opens a real headless browser, navigates pages, fills forms, uploads images, clicks buttons.
+    // Returns PASSED or FAILED VERIFICATION — never ambiguous.
+    // Failed steps include screenshots, console errors, and failed network requests.
+    if (action === 'run-browser-journey') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const port = body.port as number;
+      if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
+
+      const { runBrowserJourney, BrowserJourneyType } = await import('@/services/browser-journey-runner') as {
+        runBrowserJourney: (baseUrl: string, type: import('@/services/browser-journey-runner').BrowserJourneyType) => Promise<import('@/services/browser-journey-runner').BrowserJourneyResult>;
+        BrowserJourneyType: unknown;
+      };
+
+      // Detect project type from discovery
+      let projectType: import('@/services/browser-journey-runner').BrowserJourneyType = 'generic';
+      try {
+        const disc = await discoverProject(projectPath as string);
+        const { detectProjectType } = await import('@/services/journey-tester');
+        const name = (projectPath as string).split('/').pop() ?? '';
+        const detected = detectProjectType(name, disc.apiRoutes ?? [], disc.pages ?? []);
+        if (['marketplace', 'booking', 'social'].includes(detected)) {
+          projectType = detected as typeof projectType;
+        }
+      } catch { /* default to generic */ }
+
+      if (body.projectType && ['marketplace', 'booking', 'social', 'generic'].includes(body.projectType)) {
+        projectType = body.projectType as typeof projectType;
+      }
+
+      const baseUrl = `http://localhost:${port}`;
+      const result = await runBrowserJourney(baseUrl, projectType);
+      return NextResponse.json({ success: true, journey: result });
+    }
+
+    // ── run-journey: simulate a real user flow (register → login → create → list) ─────────
+    // Unlike verify-app (individual route pings), run-journey tests connected user flows.
+    // A marketplace with all routes returning 200 can still fail if the auth flow is broken.
+    // ── auto-repair-journey-failure: consume a repair package and fix without user intervention ─
+    // Takes a RepairPackage (built from browser journey failure), enriches it with flow trace,
+    // builds a targeted agent-fix prompt, and applies the repair. Returns fix result + whether
+    // the caller should re-run the journey to confirm.
+    if (action === 'auto-repair-journey-failure') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const pkg = body.repairPackage as import('@/services/repair-package').RepairPackage;
+      if (!pkg?.failedStep) return NextResponse.json({ success: false, error: 'Missing repairPackage' }, { status: 400 });
+
+      const { formatRepairPackageForPrompt } = await import('@/services/repair-package');
+      const { traceFailure } = await import('@/services/flow-tracer');
+
+      // Enrich package with flow trace from first failing network request
+      let enrichedPrompt = formatRepairPackageForPrompt(pkg);
+      const firstFailedReq = pkg.failedNetworkRequests[0];
+      if (firstFailedReq && projectPath) {
+        try {
+          const urlPath = new URL(firstFailedReq.url).pathname;
+          const trace = await traceFailure(urlPath, firstFailedReq.status, 'GET', projectPath as string);
+          if (trace.diagnosis) {
+            enrichedPrompt = `[FLOW TRACE]\n${trace.diagnosis}\nFix: ${trace.fixHint}\n\n${enrichedPrompt}`;
+            if (trace.fixFile && !pkg.affectedFiles.includes(trace.fixFile)) {
+              pkg.affectedFiles = [...pkg.affectedFiles, trace.fixFile];
+            }
+          }
+        } catch { /* non-critical */ }
+      }
+
+      // Enrich with live web search results for unusual or unknown errors
+      try {
+        const { searchWeb, buildErrorSearchQuery, formatSearchResultsForPrompt } = await import('@/services/web-search');
+        const errorContext = pkg.failureDetail ?? pkg.failedStep;
+        if (errorContext && pkg.consoleErrors?.length > 0) {
+          const query = buildErrorSearchQuery(
+            pkg.consoleErrors[0] || errorContext,
+            `Next.js ${pkg.projectType ?? 'app'}`,
+          );
+          const searchRes = await searchWeb(query, 4);
+          if (searchRes.results.length > 0) {
+            enrichedPrompt += formatSearchResultsForPrompt(searchRes);
+          }
+        }
+      } catch { /* non-critical — repair proceeds without search */ }
+
+      // Determine target files: use affectedFiles from package + any lib files referenced
+      const targetFiles = pkg.affectedFiles.length > 0
+        ? pkg.affectedFiles
+        : [`app/${pkg.projectType === 'marketplace' ? 'api/listings/route.ts' : 'api/auth/me/route.ts'}`];
+
+      // Run agent-fix with the repair package as error context
+      const sourceFiles: string[] = [];
+      for (const f of targetFiles) {
+        try {
+          const content = await readFile(join(projectPath as string, f), 'utf-8');
+          sourceFiles.push(`=== ${f} ===\n${content.slice(0, 3000)}`);
+        } catch { /* skip missing */ }
+      }
+
+      const editPrompt = `${enrichedPrompt}\n\nSOURCE FILES TO FIX:\n${sourceFiles.join('\n\n')}\n\n` +
+        `Return ONLY the files that need to change. Use the standard XML edit format:\n` +
+        `<file path="app/api/listings/route.ts">...fixed content...</file>`;
+
+      let fixResult: { fixedCount: number; changedFiles: string[] } = { fixedCount: 0, changedFiles: [] };
+      try {
+        const aiResult = await editWithAI(editPrompt, '', 'SONNET');
+        const parsed = parseEditFormat(aiResult);
+        if (parsed.length > 0) {
+          await applyEditsToProject(projectPath as string, parsed);
+          fixResult = { fixedCount: parsed.length, changedFiles: parsed.map(f => f.path) };
+        }
+      } catch { /* non-critical — fixResult stays at 0 */ }
+
+      // Record this repair attempt in the package
+      const attempt: import('@/services/repair-package').RepairAttempt = {
+        tier: 'SONNET',
+        filesChanged: fixResult.changedFiles,
+        resultVerdict: 'not-run', // caller updates this after re-running the journey
+        attemptedAt: new Date().toISOString(),
+      };
+      pkg.repairAttempts = [...(pkg.repairAttempts ?? []), attempt];
+
+      // Learn from this repair — store in engineering memory even before re-verification
+      if (fixResult.fixedCount > 0) {
+        const { learnFromRepair } = await import('@/services/repair-learner');
+        const callAI = async (p: string, tier: 'HAIKU' | 'SONNET'): Promise<string> =>
+          fixErrorsWithAI(p, '', tier);
+        learnFromRepair({
+          errorText: `Browser journey FAILED: ${pkg.failedStep} — ${pkg.failureDetail}\nFailed requests: ${pkg.failedNetworkRequests.map(r => `${r.status} ${r.url}`).join(', ')}`,
+          changedFiles: fixResult.changedFiles,
+          userMessage: `Auto-repair for ${pkg.journeyName} (step: ${pkg.failedStep})`,
+          successfulTier: 'SONNET',
+          projectPath: projectPath as string,
+          fixSummary: `Auto-repaired journey failure at "${pkg.failedStep}" — ${fixResult.changedFiles.join(', ')}`,
+        }, callAI).catch(() => { /* non-critical */ });
+      }
+
+      return NextResponse.json({
+        success: true,
+        ...fixResult,
+        shouldReverify: fixResult.fixedCount > 0,
+        repairPackage: pkg,
+      });
+    }
+
+    if (action === 'run-journey') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const port = body.port as number;
+      if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
+
+      const { testUserJourney } = await import('@/services/journey-tester');
+      const baseUrl = `http://localhost:${port}`;
+
+      // Discover project routes so we can build an appropriate journey
+      let apiRoutes: string[] = body.apiRoutes ?? [];
+      let pages: string[] = body.pages ?? [];
+      let projectName: string = body.projectName ?? '';
+
+      if ((!apiRoutes.length || !projectName) && projectPath) {
+        try {
+          const disc = await discoverProject(projectPath as string);
+          apiRoutes = apiRoutes.length ? apiRoutes : (disc.apiRoutes ?? []);
+          pages = pages.length ? pages : (disc.pages ?? []);
+          // DiscoveryResult has no projectName — derive from projectPath
+          if (!projectName) {
+            projectName = (projectPath as string).split('/').pop() ?? '';
+          }
+        } catch { /* non-critical */ }
+      }
+
+      const result = await testUserJourney({ baseUrl, projectName, apiRoutes, pages });
+      return NextResponse.json({ success: true, journey: result });
+    }
+
+    // ── trace-failure: trace a failed route through UI → Route → Auth → Database ─────────
+    // When verify-app flags a specific route as 401/404/500, trace-failure reads the source
+    // to identify exactly which layer in the chain is broken.
+    if (action === 'trace-failure') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const path: string = body.path ?? '';
+      const httpStatus: number = body.status ?? 500;
+      const method: string = body.method ?? 'GET';
+      if (!path) return NextResponse.json({ success: false, error: 'Missing path' }, { status: 400 });
+
+      const { traceFailure, formatFlowTrace } = await import('@/services/flow-tracer');
+      const trace = await traceFailure(path, httpStatus, method, projectPath as string);
+      const formatted = formatFlowTrace(trace);
+
+      return NextResponse.json({ success: true, trace, formatted });
+    }
+
+    // ── learn-from-repair: post-repair learning — improves the engine, not just the project ──
+    // Called after EVERY successful repair. Unlike save-repair-memory (manual pattern),
+    // this uses AI to extract a canonical pattern, classifies the engine capability,
+    // tracks confidence, promotes to auto-repair at confidence ≥ 3, and runs verification.
+    if (action === 'learn-from-repair') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+
+      const errorText: string    = body.errorText    || '';
+      const changedFiles: string[] = body.changedFiles || [];
+      const userMessage: string  = body.userMessage  || '';
+      const fixSummary: string   = body.fixSummary   || '';
+      const tier: 'HAIKU' | 'SONNET' | 'STRONGEST' =
+        (['HAIKU','SONNET','STRONGEST'].includes(body.tier)) ? body.tier : 'SONNET';
+
+      // Provide the learner with access to the AI (Haiku for pattern extraction)
+      const callAI = async (prompt: string, model: 'HAIKU' | 'SONNET'): Promise<string> => {
+        const bedrockTier = model === 'HAIKU' ? 'HAIKU' : 'SONNET';
+        return await fixErrorsWithAI(prompt, '', bedrockTier);
+      };
+
+      const { learnFromRepair } = await import('@/services/repair-learner');
+      const result = await learnFromRepair(
+        { errorText, changedFiles, userMessage, successfulTier: tier, projectPath, fixSummary },
+        callAI,
+      );
+
+      return NextResponse.json({ success: true, learning: result });
+    }
+
     // ── agent-fix: targeted multi-file AI repair for the autonomous loop ──────
     // Unlike 'fix-file' (single file) or 'edit' (full discovery + user intent),
     // agent-fix is purpose-built for the engineer loop:
@@ -1944,8 +2486,13 @@ Return ONLY the corrected file in this exact format:
       const serverLogs: string = body.serverLogs || '';
       const tsErrors: string = body.tsErrors || '';
       const browserErrors: string = body.browserErrors || '';
-      // strategy: 'targeted' = minimum change, 'broader' = more context, 'rewrite' = full file rewrite
-      const strategy: 'targeted' | 'broader' | 'rewrite' = body.strategy || 'targeted';
+      // strategy: 'surgical' = single-file minimal change with export map
+      //           'targeted' = minimum change across named files
+      //           'broader' = broader context, more files
+      //           'rewrite' = full file rewrite
+      const strategy: 'surgical' | 'targeted' | 'broader' | 'rewrite' = body.strategy || 'targeted';
+      // For surgical edits: pre-built export map from export-inspector
+      const exportMapBlock: string = body.exportMap || '';
       // tier: explicit model override — caller drives escalation (HAIKU → SONNET → STRONGEST)
       // Falls back to strategy-based selection when not provided.
       const explicitTier: import('@/lib/constants').BedrockTier | undefined =
@@ -1967,15 +2514,27 @@ Return ONLY the corrected file in this exact format:
 
       // 'broader' strategy: also include adjacent context files
       if (strategy === 'broader' || strategy === 'rewrite') {
-        // lib/managed/db.ts — always useful for DB errors
+        // lib/managed/db.ts — always useful for DB errors — show EXPORT MAP, not full source
         try {
+          const { extractExports } = await import('@/services/export-inspector');
           const dbTs = await readFile(join(projectPath, 'lib/managed/db.ts'), 'utf-8');
-          extraContextFiles.push(`=== lib/managed/db.ts (database API) ===\n${dbTs.slice(0, 2000)}`);
+          const dbExports = extractExports(dbTs);
+          extraContextFiles.push(
+            `=== lib/managed/db.ts ACTUAL EXPORTS (use ONLY these names) ===\n` +
+            `named: ${dbExports.named.join(', ')}\ntypes: ${dbExports.types.join(', ')}\n\n` +
+            `FULL SOURCE:\n${dbTs.slice(0, 2000)}`
+          );
         } catch {}
-        // lib/managed/auth.ts — always useful for auth errors
+        // lib/managed/auth.ts — show EXPORT MAP first
         try {
+          const { extractExports } = await import('@/services/export-inspector');
           const authTs = await readFile(join(projectPath, 'lib/managed/auth.ts'), 'utf-8');
-          extraContextFiles.push(`=== lib/managed/auth.ts (auth API) ===\n${authTs.slice(0, 2000)}`);
+          const authExports = extractExports(authTs);
+          extraContextFiles.push(
+            `=== lib/managed/auth.ts ACTUAL EXPORTS (use ONLY these names) ===\n` +
+            `named: ${authExports.named.join(', ')}\ntypes: ${authExports.types.join(', ')}\n\n` +
+            `FULL SOURCE:\n${authTs.slice(0, 2000)}`
+          );
         } catch {}
         // package.json — understand what packages are available
         try {
@@ -2069,6 +2628,19 @@ Return ONLY the corrected file in this exact format:
         }
       }
 
+      // ── Load spec for repair context recovery ─────────────────────────────────
+      // After any repair cycle, reload the original project spec so the AI knows
+      // WHAT it's repairing. This prevents repair from drifting toward a different
+      // project type (e.g. re-generating a weather dashboard when fixing a booking app).
+      let repairSpecBlock = '';
+      try {
+        const { loadSpec, formatSpecAnchor } = await import('@/services/project-spec');
+        const repairSpec = await loadSpec(projectPath);
+        if (repairSpec) {
+          repairSpecBlock = `${formatSpecAnchor(repairSpec)}\n\n⚠️ You are repairing THIS specific project (above). Fix the errors without changing the project type, pages, or features.\n\n`;
+        }
+      } catch { /* non-fatal — spec may not exist for older projects */ }
+
       // ── Build the fix prompt based on strategy ─────────────────────────────
       const relevantLogs = serverLogs
         ? serverLogs.split('\n').filter(l => /error|failed|cannot find|syntax|warning/i.test(l)).slice(-20).join('\n')
@@ -2076,8 +2648,32 @@ Return ONLY the corrected file in this exact format:
 
       let fixPrompt: string;
 
-      if (strategy === 'rewrite') {
-        fixPrompt = `FULL REWRITE TASK — Previous targeted fixes failed. Rewrite the broken files completely.
+      if (strategy === 'surgical') {
+        // Surgical: read the one file we're changing and inject real export maps
+        // for every import so the AI can't hallucinate names like getDb/getCurrentUser.
+        const singleFile = fileContexts[0] ?? '(file not found)';
+        fixPrompt = `${repairSpecBlock}SURGICAL EDIT — Make the MINIMUM change to satisfy the request below.
+
+USER REQUEST:
+${errorContext}
+
+CURRENT FILE TO MODIFY:
+${singleFile}
+
+ACTUAL EXPORTS FROM THIS FILE'S IMPORTS:
+${exportMapBlock || '(no import map — use only what is visible in the file above)'}
+
+SURGICAL RULES — FOLLOW EXACTLY:
+1. Return ONLY the file shown above. Do NOT output any other file.
+2. Change ONLY the section(s) needed for the user request. Preserve everything else verbatim.
+3. Do NOT add new imports unless the change strictly requires them.
+4. If you need a function/type from an import, it MUST appear in the ACTUAL EXPORTS list above. Never invent names.
+5. Do NOT rename any existing function, variable, component, or export.
+6. Do NOT reformat or restructure code you are not changing.
+7. Do NOT add comments describing what changed.
+Format: [EDIT_START] [FILE: ${targetFiles[0] ?? 'unknown'}] <complete modified file content> [EDIT_END]`;
+      } else if (strategy === 'rewrite') {
+        fixPrompt = `${repairSpecBlock}FULL REWRITE TASK — Previous targeted fixes failed. Rewrite the broken files completely.
 
 ERRORS TO FIX:
 ${errorContext || '(see logs below)'}
@@ -2105,12 +2701,12 @@ REWRITE RULES:
    - Return NextResponse.json({ success: true, data: [...] }) on success
 3. For database errors: ensure initTable() is called at the top of the handler
 4. For 405 errors: ensure the route exports exactly the methods the frontend calls
-5. For auth errors: use import { verifyToken } from '@/lib/managed/auth'
+5. For auth errors: use import { getAuthUser } from '@/lib/managed/auth' — NOT verifyToken, NOT getCurrentUser
 6. For timeout errors: add AbortController(5000) to any fetch() inside the handler
 7. Output ALL changed files — complete content, no truncation.
 8. Format: [EDIT_START] [FILE: path] <content> [EDIT_END]`;
       } else if (strategy === 'broader') {
-        fixPrompt = `AUTONOMOUS AGENT FIX — Broader context repair attempt.
+        fixPrompt = `${repairSpecBlock}AUTONOMOUS AGENT FIX — Broader context repair attempt.
 
 ERRORS DETECTED:
 ${errorContext || '(see logs below)'}
@@ -2141,8 +2737,26 @@ REPAIR RULES:
 8. For preview/hydration errors: add 'use client' where needed, check hook rules.
 9. Output [EDIT_START] [FILE: path] <content> [EDIT_END] for each changed file.`;
       } else {
-        // targeted (default)
-        fixPrompt = `AUTONOMOUS AGENT FIX — Minimum targeted changes.
+        // targeted (default): inject real export maps for any lib/managed imports
+        // to prevent hallucinated function names in the AI output
+        let managedExportBlock = '';
+        const hasApiTargets = targetFiles.some(f => f.includes('/api/'));
+        if (hasApiTargets) {
+          try {
+            const { extractExports } = await import('@/services/export-inspector');
+            const parts: string[] = [];
+            for (const libFile of ['lib/managed/db.ts', 'lib/managed/auth.ts']) {
+              try {
+                const src = await readFile(join(projectPath, libFile), 'utf-8');
+                const exp = extractExports(src);
+                parts.push(`${libFile} → named: ${exp.named.join(', ')}; types: ${exp.types.join(', ')}`);
+              } catch {}
+            }
+            if (parts.length) managedExportBlock = `\nACTUAL LIB EXPORTS (use ONLY these names — do not invent others):\n${parts.join('\n')}\n`;
+          } catch {}
+        }
+
+        fixPrompt = `${repairSpecBlock}AUTONOMOUS AGENT FIX — Minimum targeted changes.
 
 ERRORS DETECTED:
 ${errorContext || '(see logs below)'}
@@ -2152,7 +2766,7 @@ ${relevantLogs}
 
 TYPESCRIPT ERRORS:
 ${tsErrors || '(none)'}
-
+${managedExportBlock}
 FILES TO FIX:
 ${fileContexts.length > 0 ? fileContexts.join('\n\n') : '(no specific files identified — find the correct file from the error above)'}
 
@@ -2171,7 +2785,7 @@ RULES:
 
       // Tier selection: explicit caller override wins; otherwise escalate by strategy
       const repairTier: import('@/lib/constants').BedrockTier =
-        explicitTier ?? ((strategy === 'broader' || strategy === 'rewrite') ? 'STRONGEST' : 'SONNET');
+        explicitTier ?? ((strategy === 'broader' || strategy === 'rewrite') ? 'STRONGEST' : strategy === 'surgical' ? 'SONNET' : 'SONNET');
       console.log(`[agent-fix] strategy=${strategy} tier=${repairTier} targets=${targetFiles.join(',')}`);
       const aiResponse = await fixErrorsWithAI(fixPrompt, BUILD_SYSTEM_PROMPT, repairTier);
 
@@ -2196,6 +2810,63 @@ RULES:
         strategy,
         tier: repairTier,
       });
+    }
+
+    // ── list-project-files: return a flat list of source files in the project ──
+    if (action === 'list-project-files') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      try {
+        const { readdir } = await import('fs/promises');
+        const files: string[] = [];
+        const SKIP = new Set(['node_modules', '.next', '.git', 'dist', 'out', '.dwomoh']);
+
+        async function walk(dir: string, rel: string): Promise<void> {
+          let entries;
+          try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+          for (const e of entries) {
+            if (SKIP.has(e.name)) continue;
+            const childRel = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) {
+              await walk(join(dir, e.name), childRel);
+            } else if (/\.(tsx?|jsx?|json|css|md)$/.test(e.name)) {
+              files.push(childRel);
+            }
+          }
+        }
+
+        await walk(projectPath, '');
+        return NextResponse.json({ success: true, files });
+      } catch (err) {
+        return NextResponse.json({ success: false, error: String(err) });
+      }
+    }
+
+    // ── inspect-exports: read actual exports from a project file ─────────────
+    // Used before surgical edits so the AI prompt contains REAL export names.
+    // Prevents hallucinated imports like getDb (→ actual: db) or getCurrentUser (→ actual: getAuthUser).
+    if (action === 'inspect-exports') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const sourceFile: string = body.sourceFile || '';  // relative path of the file being edited
+      const targetSpecifiers: string[] = body.targetSpecifiers || []; // specific imports to inspect (optional)
+
+      try {
+        const { inspectImportedExports, formatExportMap } = await import('@/services/export-inspector');
+        const absPath = join(projectPath, sourceFile);
+        const maps = await inspectImportedExports(absPath, projectPath);
+
+        // Filter to requested specifiers if provided
+        const filtered = targetSpecifiers.length > 0
+          ? maps.filter(m => targetSpecifiers.some(s => m.specifier.includes(s)))
+          : maps;
+
+        return NextResponse.json({
+          success: true,
+          maps: filtered,
+          formatted: formatExportMap(filtered),
+        });
+      } catch (err) {
+        return NextResponse.json({ success: false, error: String(err) });
+      }
     }
 
     // ── run-command: execute a shell command in the project directory ──────────
@@ -2229,6 +2900,544 @@ RULES:
       }
     }
 
+    // ── collect-signals: Universal Signal Collector ───────────────────────────
+    if (action === 'collect-signals') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { collectAllSignals } = await import('@/services/signal-collector');
+      const collection = await collectAllSignals(projectPath, {
+        existingErrorText: body.errorText ?? '',
+        runBuildCheck: body.runBuildCheck ?? false,
+        skipRuntimeLog: false,
+      });
+      return NextResponse.json({ success: true, collection });
+    }
+
+    // ── build-project-map: Project Understanding Engine ───────────────────────
+    if (action === 'build-project-map') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { buildProjectMap, saveProjectMap } = await import('@/services/project-map');
+      const map = await buildProjectMap(projectPath);
+      await saveProjectMap(projectPath, map);
+      // Return a lightweight summary (not the full graph — too large for JSON response)
+      return NextResponse.json({
+        success: true,
+        summary: {
+          fileCount: map.files.length,
+          authProvider: map.authProvider,
+          authFiles: map.authFiles,
+          middlewareFile: map.middlewareFile,
+          envVarsMissing: map.envVarsMissing,
+          dbTables: map.dbTables,
+          routeCount: map.routes.length,
+          layerCounts: Object.fromEntries(
+            Object.entries(map.layers).map(([k, v]) => [k, (v as string[]).length])
+          ),
+        },
+      });
+    }
+
+    // ── build-repair-plan: Root Cause Engine → ordered RepairPlan ─────────────
+    if (action === 'build-repair-plan') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { collectAllSignals } = await import('@/services/signal-collector');
+      const { getProjectMap } = await import('@/services/project-map');
+      const { buildRepairPlan } = await import('@/services/repair-planner');
+
+      const collection = await collectAllSignals(projectPath, {
+        existingErrorText: body.errorText ?? '',
+        runBuildCheck: false,
+      });
+      const map = await getProjectMap(projectPath);
+      const plan = buildRepairPlan(collection, map);
+
+      return NextResponse.json({
+        success: true,
+        collection: { totalCount: collection.totalCount, summary: collection.summary },
+        plan: {
+          hasRootCause: plan.hasRootCause,
+          summary: plan.summary,
+          debugDetail: plan.debugDetail,
+          steps: plan.steps,
+          hypothesisCount: plan.hypotheses.length,
+        },
+      });
+    }
+
+    // ── execute-repair-step: run one step from the RepairPlan ─────────────────
+    if (action === 'execute-repair-step') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const step = body.step as import('@/services/repair-planner').RepairStep;
+      if (!step) return NextResponse.json({ success: false, error: 'Missing step' }, { status: 400 });
+
+      // Snapshot before repair
+      const { captureSnapshot: captureRepairSnapshot } = await import('@/services/project-snapshot');
+      await captureRepairSnapshot(projectPath, [step.targetFile]).catch(() => {});
+
+      switch (step.action) {
+        case 'delete-file': {
+          const { rm } = await import('fs/promises');
+          const { join: j } = await import('path');
+          const { readdir: rd } = await import('fs/promises');
+          try {
+            await rm(j(projectPath, step.targetFile));
+            const parentDir = j(projectPath, step.targetFile, '..');
+            const remaining = await rd(parentDir).catch(() => []);
+            if (remaining.length === 0) await rm(parentDir, { recursive: true }).catch(() => {});
+            const { invalidateProjectMap } = await import('@/services/project-map');
+            await invalidateProjectMap(projectPath);
+            return NextResponse.json({ success: true, action: 'delete-file', file: step.targetFile });
+          } catch (e) {
+            return NextResponse.json({ success: false, error: String(e) });
+          }
+        }
+
+        case 'install-package': {
+          if (!step.packageName) return NextResponse.json({ success: false, error: 'Missing packageName' });
+          const pkgPath = join(projectPath, 'package.json');
+          const { readFile: rf, writeFile: wf } = await import('fs/promises');
+          try {
+            const pkg = JSON.parse(await rf(pkgPath, 'utf-8'));
+            if (!pkg.dependencies) pkg.dependencies = {};
+            if (!pkg.dependencies[step.packageName] && !pkg.devDependencies?.[step.packageName]) {
+              pkg.dependencies[step.packageName] = 'latest';
+              await wf(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
+              await installDependencies(projectPath, ['--legacy-peer-deps']);
+            }
+            return NextResponse.json({ success: true, action: 'install-package', package: step.packageName });
+          } catch (e) {
+            return NextResponse.json({ success: false, error: String(e) });
+          }
+        }
+
+        case 'deterministic': {
+          const { runDeterministicRepairs } = await import('@/services/deterministic-repair');
+          const result = await runDeterministicRepairs(projectPath, step.instruction, []);
+          const { invalidateProjectMap } = await import('@/services/project-map');
+          if (result.applied.length > 0) await invalidateProjectMap(projectPath);
+          return NextResponse.json({
+            success: result.applied.length > 0,
+            action: 'deterministic',
+            applied: result.applied,
+            allFixed: result.allFixed,
+            tsOutput: result.tsOutput,
+          });
+        }
+
+        case 'targeted-ai':
+        case 'architecture-ai': {
+          // Return delegation instructions — the builder calls agent-fix directly,
+          // which already contains all the model-calling and file-apply logic.
+          const errorContext =
+            `REPAIR PLAN STEP ${step.stepNumber}: ${step.title}\n\n` +
+            `ROOT CAUSE IDENTIFIED BY ANALYSIS:\n${step.instruction}\n\n` +
+            `EXPECTED OUTCOME: ${step.expectedOutcome}\n\n` +
+            `Fix ONLY the target file. Do not modify unrelated files.`;
+
+          return NextResponse.json({
+            success: true,
+            action: step.action,
+            delegateToAgentFix: true,
+            agentFixParams: {
+              projectPath,
+              errorContext,
+              targetFiles: [step.targetFile],
+              contextFiles: step.contextFiles,
+              strategy: step.action === 'architecture-ai' ? 'broader' : 'targeted',
+              tier: 'SONNET',
+            },
+          });
+        }
+
+        default:
+          return NextResponse.json({ success: false, error: `Unhandled step action: ${step.action}` });
+      }
+    }
+
+    // ── verify-repair: Multi-Level Verification Suite ─────────────────────────
+    if (action === 'verify-repair') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { runVerificationSuite } = await import('@/services/verification-suite');
+      const maxLevel: 1 | 2 | 3 | 4 = body.maxLevel ?? 3;
+      const result = await runVerificationSuite(projectPath, {
+        maxLevel,
+        port: body.port ?? null,
+        skipL2: body.skipL2 ?? false,
+      });
+
+      // Extended verification: page 404 check + CSS health check
+      // These run in parallel after the TypeScript/build suite
+      let missingRoutes: string[] = [];
+      let cssIssues: string[] = [];
+
+      if (result.l1.passed) {
+        await Promise.allSettled([
+          // Page 404 check
+          import('@/services/route-scanner').then(async ({ scanMissingRoutes }) => {
+            const scan = await scanMissingRoutes(projectPath).catch(() => null);
+            if (scan?.missingRoutes?.length) missingRoutes = scan.missingRoutes;
+          }),
+          // CSS health check
+          import('@/services/css-health-check').then(async ({ checkCssHealth }) => {
+            const css = await checkCssHealth(projectPath).catch(() => null);
+            if (css && !css.healthy) cssIssues = css.issues.map((i: { title: string }) => i.title);
+          }),
+        ]);
+      }
+
+      const allPassed = result.allPassed && missingRoutes.length === 0 && cssIssues.length === 0;
+      const extendedSummary = [
+        result.summary,
+        missingRoutes.length > 0 ? `Missing pages: ${missingRoutes.join(', ')}` : '',
+        cssIssues.length > 0 ? `CSS issues: ${cssIssues.join('; ')}` : '',
+      ].filter(Boolean).join(' | ');
+
+      return NextResponse.json({
+        success: true,
+        result: { ...result, allPassed, summary: extendedSummary },
+        missingRoutes,
+        cssIssues,
+      });
+    }
+
+    // ── coordinate-repair: unified Phase 1-3 repair coordinator ──────────────
+    if (action === 'coordinate-repair') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { coordinateRepair } = await import('@/services/repair-coordinator');
+      const result = await coordinateRepair(projectPath, body.errorText ?? '', body.port ?? undefined);
+      return NextResponse.json({ success: true, result });
+    }
+
+    // ── plan-feature: Feature Understanding Layer ─────────────────────────────
+    if (action === 'plan-feature') {
+      const { request: featureRequest = '' } = body;
+      const { planFeature } = await import('@/services/feature-planner');
+      const { getProjectMap } = await import('@/services/project-map');
+
+      let map = null;
+      if (projectPath) {
+        map = await getProjectMap(projectPath).catch(() => null);
+      }
+
+      const plan = planFeature(featureRequest, map);
+      return NextResponse.json({
+        success: true,
+        category: plan.category,
+        hasSpec: plan.category !== 'unknown',
+        specificationBlock: plan.specificationBlock,
+        routeStructureNote: plan.routeStructureNote,
+        checklist: plan.checklist,
+        requiredPages: plan.requiredPages,
+        requiredApiRoutes: plan.requiredApiRoutes,
+        requiredDbTables: plan.requiredDbTables,
+      });
+    }
+
+    // ── scan-missing-routes: find UI links that have no page.tsx ─────────────
+    if (action === 'scan-missing-routes') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { scanMissingRoutes, checkRouteReachability } = await import('@/services/route-scanner');
+      const scanResult = await scanMissingRoutes(projectPath);
+
+      let reachability = null;
+      if (body.port && scanResult.referencedRoutes.length > 0) {
+        reachability = await checkRouteReachability(body.port, scanResult.referencedRoutes);
+      }
+
+      return NextResponse.json({ success: true, scanResult, reachability });
+    }
+
+    // ── scan-and-repair-routes: fast deterministic routing fix, no Playwright needed ──
+    // 1. scanMissingRoutes: compare nav links vs existing page files
+    // 2. repairStaticRoutes: create redirect stubs for auth routes, plain stubs for others
+    // 3. HTTP-check the newly created routes
+    // Returns: missingRoutes, created files, redirected routes, stubbed routes, httpChecks
+    if (action === 'scan-and-repair-routes') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const port = body.port as number | undefined;
+
+      const { scanMissingRoutes, repairStaticRoutes, checkRouteReachability } = await import('@/services/route-scanner');
+
+      const scanResult = await scanMissingRoutes(projectPath as string);
+      let repairResult = { created: [] as string[], redirected: [] as string[], stubbed: [] as string[] };
+
+      if (scanResult.missingRoutes.length > 0) {
+        repairResult = await repairStaticRoutes(
+          projectPath as string,
+          scanResult.missingRoutes,
+          scanResult.existingRoutes,
+        );
+      }
+
+      // HTTP-check all referenced routes after repair (only if port given)
+      let httpChecks: Array<{ route: string; statusCode: number; ok: boolean }> = [];
+      if (port && scanResult.referencedRoutes.length > 0) {
+        await new Promise(r => setTimeout(r, 2000)); // allow Next.js to hot-reload
+        httpChecks = await checkRouteReachability(port, scanResult.referencedRoutes);
+      }
+
+      const stillBroken = httpChecks.filter(c => !c.ok).map(c => c.route);
+
+      return NextResponse.json({
+        success: true,
+        scanned: scanResult.referencedRoutes.length,
+        missing: scanResult.missingRoutes,
+        existing: scanResult.existingRoutes,
+        created: repairResult.created,
+        redirected: repairResult.redirected,
+        stubbed: repairResult.stubbed,
+        httpChecks,
+        stillBroken,
+        allFixed: stillBroken.length === 0,
+      });
+    }
+
+    // ── crawl-and-repair-links: Playwright click-through link verification ────
+    // Opens every page, clicks every link and CTA button, detects 404s,
+    // derives missing dynamic routes, creates them with AI, then re-crawls to confirm.
+    // Returns a structured VerificationReport: Tested/Passed/Failed/Repaired/Status
+    if (action === 'crawl-and-repair-links') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const port = body.port as number;
+      if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
+
+      const { crawlLinks, buildVerificationReport } = await import('@/services/link-crawler');
+      const { scanMissingRoutes, repairStaticRoutes } = await import('@/services/route-scanner');
+
+      const baseUrl = `http://localhost:${port}`;
+      const repairedRoutes: string[] = [];
+
+      // ── Phase 0: deterministic static route repair (no AI, instant) ──────────
+      // Handles /login → /auth, /signup → /auth, etc. before Playwright even starts.
+      const preScan = await scanMissingRoutes(projectPath as string);
+      if (preScan.missingRoutes.length > 0) {
+        const staticRepair = await repairStaticRoutes(
+          projectPath as string,
+          preScan.missingRoutes,
+          preScan.existingRoutes,
+        );
+        if (staticRepair.created.length > 0) {
+          repairedRoutes.push(...staticRepair.created);
+          // Let Next.js hot-reload before crawling
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+
+      // ── Phase 1: Crawl ────────────────────────────────────────────────────────
+      const crawlReport = await crawlLinks(baseUrl, projectPath as string, {
+        maxPages: body.maxPages ?? 15,
+        maxLinksPerPage: body.maxLinksPerPage ?? 8,
+        timeoutMs: 75_000,
+      });
+
+      // ── Phase 2: Also check source-level dynamic route gaps ───────────────────
+      const scanResult = await scanMissingRoutes(projectPath as string);
+      const allMissingFiles = [
+        ...new Set([
+          ...crawlReport.missingRouteFiles,
+          ...scanResult.missingDynamicPageFiles,
+          ...scanResult.missingRoutes.map(r => `app${r}/page.tsx`),
+        ])
+      ];
+
+      // ── Phase 3: Auto-create missing pages with AI ────────────────────────────
+      if (allMissingFiles.length > 0) {
+        // Build context for AI: what the parent pages look like
+        const parentContextFiles: string[] = [];
+        for (const mf of allMissingFiles.slice(0, 4)) {
+          // For app/property/[id]/page.tsx, read app/page.tsx for context
+          const parentDir = mf.replace('/[id]/page.tsx', '').replace('/[slug]/page.tsx', '');
+          try {
+            const parentContent = await readFile(join(projectPath as string, parentDir + '/page.tsx'), 'utf-8');
+            parentContextFiles.push(`=== ${parentDir}/page.tsx ===\n${parentContent.slice(0, 2000)}`);
+          } catch { /* parent may not exist */ }
+          try {
+            // Also read the API route for this resource
+            const apiDir = parentDir.replace('app/', 'app/api/');
+            const apiContent = await readFile(join(projectPath as string, apiDir + '/route.ts'), 'utf-8');
+            parentContextFiles.push(`=== ${apiDir}/route.ts ===\n${apiContent.slice(0, 2000)}`);
+          } catch { /* skip */ }
+        }
+
+        // Search the web for Next.js dynamic route patterns if we have a key
+        let webSearchContext = '';
+        try {
+          const { searchWeb, formatSearchResultsForPrompt } = await import('@/services/web-search');
+          const searchRes = await searchWeb('Next.js 15 dynamic route page.tsx async params fetch data', 3);
+          webSearchContext = formatSearchResultsForPrompt(searchRes);
+        } catch { /* non-critical */ }
+
+        const repairPrompt =
+          `These dynamic route pages are missing and return 404 when users click internal links:\n\n` +
+          allMissingFiles.map(f => `• ${f}`).join('\n') + '\n\n' +
+          `For each missing file, create a complete Next.js page component that:\n` +
+          `1. Reads the dynamic param (id or slug) from params\n` +
+          `2. Fetches the resource from the corresponding API route (GET /api/...)\n` +
+          `3. Renders a full detail view with all relevant fields\n` +
+          `4. Shows a "not found" message if the resource doesn't exist\n` +
+          `5. Has a Back button/link to return to the listing page\n\n` +
+          `Parent page context:\n${parentContextFiles.join('\n\n')}\n\n` +
+          `IMPORTANT: Use async params: \`export default async function Page({ params }: { params: Promise<{ id: string }> })\`\n` +
+          `Await params: \`const { id } = await params\`\n` +
+          (webSearchContext ? webSearchContext + '\n\n' : '') +
+          `Use the standard file format:\n<file path="app/property/[id]/page.tsx">...content...</file>`;
+
+        try {
+          const aiResult = await editWithAI(repairPrompt, '', 'SONNET');
+          const parsed = parseEditFormat(aiResult);
+          if (parsed.length > 0) {
+            await applyEditsToProject(projectPath as string, parsed);
+            repairedRoutes.push(...parsed.map(f => f.path));
+          }
+        } catch { /* non-critical — report will show remaining errors */ }
+
+        // ── Phase 4: Re-crawl after repair ─────────────────────────────────────
+        if (repairedRoutes.length > 0) {
+          // Allow Next.js hot-reload to pick up new pages
+          await new Promise(r => setTimeout(r, 4000));
+
+          const crawlReport2 = await crawlLinks(baseUrl, projectPath as string, {
+            maxPages: 10,
+            maxLinksPerPage: 8,
+            timeoutMs: 45_000,
+          });
+
+          // Merge results: keep repaired in 'passed', update 'failed'
+          crawlReport.passed.push(...crawlReport2.passed.filter(r =>
+            repairedRoutes.some(rep => r.url.includes(rep.replace('app/', '').replace('/page.tsx', '')))
+          ));
+          crawlReport.failed = crawlReport2.failed; // post-repair truth
+          crawlReport.verdict = crawlReport2.verdict;
+          crawlReport.summary = crawlReport2.summary;
+        }
+      }
+
+      // ── Phase 5: Build structured verification report ─────────────────────────
+      const verificationReport = buildVerificationReport(crawlReport, repairedRoutes);
+
+      // Store successful dynamic route repairs in engineering memory
+      if (repairedRoutes.length > 0 && crawlReport.verdict === 'PASSED') {
+        const { learnFromRepair } = await import('@/services/repair-learner');
+        const callAI = async (p: string, tier: 'HAIKU' | 'SONNET'): Promise<string> =>
+          fixErrorsWithAI(p, '', tier);
+        learnFromRepair({
+          errorText: `Dynamic routes returned 404: ${allMissingFiles.join(', ')}`,
+          changedFiles: repairedRoutes,
+          userMessage: 'Link crawler detected missing dynamic route pages',
+          successfulTier: 'SONNET',
+          projectPath: projectPath as string,
+          fixSummary: `Created ${repairedRoutes.length} missing dynamic page(s): ${repairedRoutes.join(', ')}`,
+        }, callAI).catch(() => {});
+      }
+
+      return NextResponse.json({
+        success: true,
+        crawlReport,
+        verificationReport,
+        repairedRoutes,
+        allMissingFiles,
+      });
+    }
+
+    // ── create-missing-pages: write stubs + queue AI enhancement ─────────────
+    if (action === 'create-missing-pages') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const missingRoutes: string[] = body.missingRoutes ?? [];
+      const missingDetails: Array<{ route: string; sourceFile: string; context: string }> = body.missingDetails ?? [];
+      const routeGroups: string[] = body.routeGroups ?? [];
+
+      if (!missingRoutes.length) return NextResponse.json({ success: true, created: [] });
+
+      const { readFile, writeFile, mkdir } = await import('fs/promises');
+      const pathMod = await import('path');
+      const appDir = pathMod.join(projectPath, 'app');
+
+      // Read an existing page for style reference
+      let styleExample = '';
+      for (const candidate of ['page.tsx', '(auth)/login/page.tsx', 'login/page.tsx', '(auth)/signin/page.tsx']) {
+        try { styleExample = await readFile(pathMod.join(appDir, candidate), 'utf-8'); if (styleExample.length > 200) break; }
+        catch { /* try next */ }
+      }
+
+      const { bestPagePath, generatePageStub } = await import('@/services/route-scanner');
+      const created: string[] = [];
+      const fileInstructions: Array<{ route: string; pagePath: string }> = [];
+
+      for (const route of missingRoutes) {
+        const pagePath = bestPagePath(route, routeGroups, appDir);
+        const relPath = pagePath.replace(projectPath + pathMod.sep, '').replace(projectPath + '/', '');
+        fileInstructions.push({ route, pagePath: relPath });
+        try {
+          await mkdir(pathMod.dirname(pagePath), { recursive: true });
+          // Only write if file does not already exist
+          try { await readFile(pagePath, 'utf-8'); /* exists — skip */ }
+          catch {
+            await writeFile(pagePath, generatePageStub(route, styleExample), 'utf-8');
+            created.push(relPath);
+          }
+        } catch { /* skip on error */ }
+      }
+
+      // Build the agent enhancement prompt (caller will use this for agent-fix)
+      const missingList = missingRoutes.map((r, i) => {
+        const detail = missingDetails[i];
+        return `  • ${r}  →  file: ${fileInstructions[i]?.pagePath}  (referenced in ${detail?.sourceFile ?? 'unknown'}: \`${detail?.context ?? r}\`)`;
+      }).join('\n');
+
+      const routeGroupNote = routeGroups.length > 0
+        ? `Route groups present: ${routeGroups.map(g => `app/${g}/`).join(', ')}. Auth pages go in the (auth) group.`
+        : 'No route groups — pages are at top-level app/[route]/page.tsx.';
+
+      const agentPrompt =
+        `The UI has navigation links that return 404. Page stub files have been written — now replace each stub with a REAL functional page.\n\n` +
+        `Pages to create (stubs already written, now make them real):\n${missingList}\n\n` +
+        `${routeGroupNote}\n\n` +
+        `Style reference (existing page):\n\`\`\`tsx\n${styleExample.slice(0, 1000)}\n\`\`\`\n\n` +
+        `Rules:\n` +
+        `• Login/signin: form with email + password fields, submit button, link to signup and forgot-password\n` +
+        `• Signup/register: form with name + email + password + confirm-password, submit button, link to login\n` +
+        `• Forgot-password: form with email field, submit button, link back to login\n` +
+        `• Dashboard: welcome header, navigation cards/grid, recent activity section\n` +
+        `• Listings/browse: search bar, filter sidebar, grid of listing cards\n` +
+        `• Post-listing/create-listing: multi-field form matching the project domain\n` +
+        `• Profile/settings: user info form with save button\n` +
+        `• Any other page: real content matching the project's purpose — NOT placeholder text\n` +
+        `• Use the same Tailwind classes and component patterns as the style reference\n` +
+        `• Add 'use client' when using onClick, useState, useEffect, useRouter\n` +
+        `• Use next/link for internal navigation\n` +
+        `• Do NOT import components that don't exist yet\n` +
+        `• Every page must have a default export\n\n` +
+        `Rewrite ALL ${created.length} stub files now with full working content.`;
+
+      return NextResponse.json({ success: true, created, agentPrompt, fileInstructions, needsAgentEnhancement: true });
+    }
+
+    // ── inspect-preview: Preview Verification Engine ──────────────────────────
+    if (action === 'inspect-preview') {
+      const { port: previewPort } = body;
+      if (!projectPath || !previewPort) {
+        return NextResponse.json({ success: false, error: 'Missing projectPath or port' }, { status: 400 });
+      }
+      const { inspectPreview } = await import('@/services/preview-inspector');
+      const result = await inspectPreview(previewPort, projectPath);
+      return NextResponse.json({ success: true, result });
+    }
+
+    // ── check-css-health: CSS/Tailwind health check + auto-fix ────────────────
+    if (action === 'check-css-health') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { checkCssHealth, fixCssIssues } = await import('@/services/css-health-check');
+      const health = await checkCssHealth(projectPath);
+
+      if (!health.healthy && body.autoFix) {
+        const fixResult = await fixCssIssues(projectPath, health);
+        // Re-check after fix
+        const recheck = await checkCssHealth(projectPath);
+        return NextResponse.json({ success: true, health: recheck, fixResult, wasFixed: fixResult.fixed.length > 0 });
+      }
+
+      return NextResponse.json({ success: true, health });
+    }
+
     // ── investigate: root cause investigation BEFORE any fix ─────────────────
     if (action === 'investigate') {
       if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
@@ -2249,6 +3458,205 @@ RULES:
         recommendedActions: report.recommendedActions,
         findings: report.findings,
       });
+    }
+
+    // ── escalation-write: package all failure context and write to projectPath/.dwomoh/ ──
+    if (action === 'escalation-write') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { writeEscalationPackage } = await import('@/services/escalation-engine');
+      const result = await writeEscalationPackage(projectPath, {
+        projectName:      (body.projectName as string)    ?? 'Unknown project',
+        port:             (body.port as number | undefined),
+        userMessage:      (body.userMessage as string)    ?? '',
+        failingRoutes:    (body.failingRoutes as string[])    ?? [],
+        typescriptErrors: (body.typescriptErrors as string[]) ?? [],
+        consoleErrors:    (body.consoleErrors as string[])    ?? [],
+        networkErrors:    (body.networkErrors as string[])    ?? [],
+        buildErrors:      (body.buildErrors as string[])      ?? [],
+        playwrightResults:(body.playwrightResults as [])      ?? [],
+        failureScreenshot:(body.failureScreenshot as string | undefined),
+        allScreenshots:   (body.allScreenshots as string[])   ?? [],
+        repairHistory:    (body.repairHistory as [])          ?? [],
+      });
+      // Also try to open VS Code with the project — non-fatal if VS Code isn't in PATH
+      try {
+        const { exec } = await import('child_process');
+        exec(`code "${projectPath}"`);
+      } catch { /* VS Code may not be in PATH — user can open manually */ }
+      return NextResponse.json({ success: true, id: result.id, filePath: result.filePath });
+    }
+
+    // ── escalation-check: poll for a resolution written by VS Code + Claude Code ──
+    if (action === 'escalation-check') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { checkEscalationResolution } = await import('@/services/escalation-engine');
+      const resolution = await checkEscalationResolution(projectPath);
+      return NextResponse.json({ success: true, resolution });
+    }
+
+    // ── save-repair-pattern: store a repair learned from Claude Code escalation ──
+    if (action === 'save-repair-pattern') {
+      try {
+        const { saveRepairSuccess } = await import('@/services/engineering-memory');
+        await saveRepairSuccess({
+          errorPattern:    (body.errorPattern as string)    ?? '',
+          rootCause:       (body.rootCause as string)       ?? '',
+          fixApproach:     (body.fixApproach as string)     ?? '',
+          targetFiles:     (body.targetFiles as string[])   ?? [],
+          tsErrorsToAvoid: [],
+          successfulTier:  (body.successfulTier as 'HAIKU' | 'SONNET' | 'STRONGEST') ?? 'STRONGEST',
+        });
+      } catch { /* non-critical */ }
+      return NextResponse.json({ success: true });
+    }
+
+    // ── run-generation-verifier: 18-point post-generation completion gate ────────
+    // Runs all 5 verification phases (TypeScript, route map, API health, browser
+    // journey, deep interactive crawl) in a repair loop. Returns canComplete:true
+    // only when every check passes. Called automatically after every generation.
+    if (action === 'run-generation-verifier') {
+      if (!projectPath) return NextResponse.json({ error: 'Missing projectPath' }, { status: 400 });
+      const port = body.port as number;
+      if (!port) return NextResponse.json({ error: 'Missing port' }, { status: 400 });
+
+      const progressLines: string[] = [];
+      const onProgress = (msg: string) => { progressLines.push(msg); };
+
+      try {
+        const { runGenerationVerifier, saveVerifierResult } = await import('@/services/generation-verifier');
+        const result = await runGenerationVerifier(projectPath, port, onProgress);
+        await saveVerifierResult(result, projectPath);
+
+        return NextResponse.json({
+          success: true,
+          canComplete: result.canComplete,
+          rounds: result.rounds,
+          phases: result.phases,
+          totalChecks: result.totalChecks,
+          passedChecks: result.passedChecks,
+          failedChecks: result.failedChecks,
+          repairedTotal: result.repairedTotal,
+          repairLog: result.repairLog,
+          summary: result.summary,
+          failureReason: result.failureReason,
+          progressLog: progressLines,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return NextResponse.json({
+          success: false,
+          canComplete: false,
+          error: msg,
+          progressLog: progressLines,
+        }, { status: 500 });
+      }
+    }
+
+    // ── escalation-clear: remove escalation files after resolution is applied ──
+    if (action === 'escalation-clear') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { clearEscalation } = await import('@/services/escalation-engine');
+      await clearEscalation(projectPath);
+      return NextResponse.json({ success: true });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // FLUTTER BUILD PIPELINE — completely isolated from the web pipeline above
+    // These actions are only called from runFlutterBuildPipeline() in the UI.
+    // They never touch Next.js projects, npm, or the web generation chain.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── generate-flutter: AI generation → write Dart files → flutter pub get ──
+    if (action === 'generate-flutter') {
+      const turns: ConversationTurn[] = Array.isArray(messages) ? messages : [];
+      const stringTurns = turns.map(t => ({
+        role: t.role,
+        content: typeof t.content === 'string' ? t.content : '[image attached]',
+      }));
+
+      const { FLUTTER_BUILD_SYSTEM_PROMPT, buildFlutterPromptFromConversation } = await import('@/lib/flutter-prompt-engineer');
+      const { parseFlutterProjectFormat, generateFlutterProject, buildFlutterScaffold } = await import('@/services/flutter-generator');
+      const { runFlutterPubGet } = await import('@/services/flutter-builder');
+
+      const userMessage = buildFlutterPromptFromConversation(stringTurns);
+      if (!userMessage) {
+        return NextResponse.json({ success: false, error: 'No prompt provided for Flutter generation' }, { status: 400 });
+      }
+
+      const logs: string[] = [];
+      let projectData = null;
+      let isScaffold  = false;
+
+      // Generation with fallback to scaffold on parse failure
+      try {
+        const tier: import('@/services/bedrock').BedrockTier = (body.tier as import('@/services/bedrock').BedrockTier) ?? 'SONNET';
+        const aiText = await buildWithAI(userMessage, FLUTTER_BUILD_SYSTEM_PROMPT, tier);
+        projectData = parseFlutterProjectFormat(aiText);
+
+        if (!projectData) {
+          // AI output couldn't be parsed — use scaffold
+          logs.push('⚠️ Could not parse AI output — using scaffold fallback');
+          const name = stringTurns.filter(t => t.role === 'user').map(t => t.content).join(' ').slice(0, 40).replace(/\W+/g, '-').toLowerCase();
+          projectData = buildFlutterScaffold(name || 'my-app', 'Generated Flutter app');
+          isScaffold  = true;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return NextResponse.json({ success: false, error: `Flutter AI generation failed: ${msg}` }, { status: 500 });
+      }
+
+      // Write files to disk
+      const genResult = await generateFlutterProject(projectData, (msg) => logs.push(msg));
+      logs.push(`✅ Wrote ${genResult.filesWritten} file(s) to ${genResult.projectPath}`);
+
+      // flutter pub get
+      const pubGetResult = await runFlutterPubGet(genResult.projectPath);
+      logs.push(...pubGetResult.logs);
+
+      return NextResponse.json({
+        success: true,
+        projectPath:  genResult.projectPath,
+        projectName:  projectData.projectName,
+        description:  projectData.description,
+        filesWritten: genResult.filesWritten,
+        pubGetSuccess: pubGetResult.success,
+        pubGetErrors:  pubGetResult.errors,
+        isScaffold,
+        logs,
+      });
+    }
+
+    // ── flutter-analyze: run flutter analyze on a project ────────────────────
+    if (action === 'flutter-analyze') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { runFlutterAnalyze } = await import('@/services/flutter-builder');
+      const result = await runFlutterAnalyze(projectPath);
+      return NextResponse.json({ success: true, ...result });
+    }
+
+    // ── flutter-build-apk: start background APK build, return jobId ──────────
+    if (action === 'flutter-build-apk') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { startFlutterApkBuild } = await import('@/services/flutter-builder');
+      const jobId = await startFlutterApkBuild(projectPath);
+      return NextResponse.json({ success: true, jobId });
+    }
+
+    // ── flutter-build-status: poll APK build state ────────────────────────────
+    if (action === 'flutter-build-status') {
+      const { readFlutterBuildState } = await import('@/services/flutter-builder');
+      const state = await readFlutterBuildState();
+      if (!state) return NextResponse.json({ success: false, error: 'No active Flutter build' });
+      return NextResponse.json({ success: true, ...state });
+    }
+
+    // ── flutter-verify: quick verification of a Flutter project ──────────────
+    if (action === 'flutter-verify') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { verifyFlutterProject } = await import('@/services/flutter-verifier');
+      const runAnalyze = body.runAnalyze !== false;
+      const result = await verifyFlutterProject(projectPath, runAnalyze);
+      return NextResponse.json({ success: true, ...result });
     }
 
     return NextResponse.json({ success: false, error: `Unknown action: ${action}` }, { status: 400 });

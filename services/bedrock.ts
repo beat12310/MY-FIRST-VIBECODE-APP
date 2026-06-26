@@ -1,6 +1,7 @@
 import {
   BedrockRuntimeClient,
   InvokeModelWithResponseStreamCommand,
+  InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
 import { BEDROCK_CONFIG, BEDROCK_MODELS, BEDROCK_FALLBACK_CHAINS, type BedrockTier } from '@/lib/constants';
 import { logError, ErrorCode, createError } from '@/lib/error-handler';
@@ -450,4 +451,134 @@ export async function generateLogoWithAI(
     logError('Bedrock logo generation failed', error);
     throw error;
   }
+}
+
+// ─── Tool definitions for agentic conversations ────────────────────────────
+
+export interface AgentTool {
+  name: string;
+  description: string;
+  input_schema: {
+    type: 'object';
+    properties: Record<string, { type: string; description: string }>;
+    required: string[];
+  };
+}
+
+export type ToolExecutor = (toolName: string, toolInput: Record<string, unknown>) => Promise<string>;
+
+export const DWOMOH_AGENT_TOOLS: AgentTool[] = [
+  {
+    name: 'browse_web',
+    description: 'Fetch and analyze the content of any public webpage. Use this when the user wants you to visit a website, check a URL, research a competitor, or gather information from the internet.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'The full URL to fetch (must start with https://)' },
+        purpose: { type: 'string', description: 'What you are looking for on this page' },
+      },
+      required: ['url', 'purpose'],
+    },
+  },
+  {
+    name: 'test_live_app',
+    description: 'Run a live Playwright browser test on the generated app. Opens a real browser, navigates every page, fills forms, tests login/logout, and verifies routes. Use this when the user wants to verify their app works, test a feature, or check for broken pages.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        port: { type: 'number', description: 'The localhost port the generated app is running on' },
+        test_type: { type: 'string', description: 'Type of test: generic, marketplace, booking, social, or downloader' },
+        test_url: { type: 'string', description: 'Optional external URL to use as test input (e.g. a TikTok video URL to test in a downloader app)' },
+      },
+      required: ['port'],
+    },
+  },
+  {
+    name: 'search_internet',
+    description: 'Search Google or Bing for live information. Use this to find APIs, check error solutions, discover current pricing, or research technical topics.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'The search query' },
+      },
+      required: ['query'],
+    },
+  },
+];
+
+/**
+ * Multi-turn conversation with tool use (agentic mode).
+ * Allows the AI to call browse_web, test_live_app, and search_internet.
+ * Uses non-streaming InvokeModelCommand for the tool-use loop; returns final text.
+ */
+export async function converseAgentically(
+  messages:     ConversationTurn[],
+  systemPrompt: string,
+  toolExecutor: ToolExecutor,
+  maxToolRounds = 5
+): Promise<string> {
+  const client  = initializeClient();
+  // Sonnet is required for reliable tool use — Haiku frequently responds in prose
+  // instead of calling the tool, especially with complex multi-step system prompts.
+  const modelId = BEDROCK_MODELS.SONNET;
+
+  // Work on a mutable copy so we can append tool results for the next round
+  const agentMessages: Array<{ role: string; content: unknown }> = messages.map(m => ({
+    role: m.role,
+    content: typeof m.content === 'string'
+      ? [{ type: 'text', text: m.content }]
+      : m.content,
+  }));
+
+  for (let round = 0; round < maxToolRounds; round++) {
+    const body = JSON.stringify({
+      anthropic_version: BEDROCK_CONFIG.ANTHROPIC_VERSION,
+      max_tokens: BEDROCK_CONFIG.MAX_TOKENS_CHAT,
+      temperature: BEDROCK_CONFIG.TEMPERATURE,
+      system: systemPrompt,
+      tools: DWOMOH_AGENT_TOOLS,
+      messages: agentMessages,
+    });
+
+    const command = new InvokeModelCommand({
+      modelId,
+      contentType: 'application/json',
+      accept: 'application/json',
+      body,
+    });
+
+    const response = await client.send(command);
+    const decoded  = JSON.parse(new TextDecoder().decode(response.body));
+    const content: Array<{ type: string; id?: string; name?: string; input?: Record<string, unknown>; text?: string }> = decoded.content ?? [];
+
+    // If stop_reason is 'end_turn' or no tool_use blocks, extract text and return
+    const hasToolUse = content.some(b => b.type === 'tool_use');
+    if (!hasToolUse || decoded.stop_reason === 'end_turn') {
+      const textBlock = content.find(b => b.type === 'text');
+      return textBlock?.text ?? '';
+    }
+
+    // Append the assistant's tool-use turn
+    agentMessages.push({ role: 'assistant', content });
+
+    // Execute each tool and collect results
+    const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
+    for (const block of content) {
+      if (block.type === 'tool_use' && block.id && block.name) {
+        let result = '';
+        try {
+          result = await toolExecutor(block.name, block.input ?? {});
+        } catch (err) {
+          result = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: result });
+      }
+    }
+
+    // Append tool results as a user turn
+    agentMessages.push({ role: 'user', content: toolResults });
+  }
+
+  // Fallback if we hit max rounds without an end_turn
+  return 'I ran out of tool calls before completing the task. Please try again.';
 }

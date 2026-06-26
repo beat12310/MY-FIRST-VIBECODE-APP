@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "bash scripts/build-safe.sh",
     "start": "next start",
     "lint": "next lint"
   },

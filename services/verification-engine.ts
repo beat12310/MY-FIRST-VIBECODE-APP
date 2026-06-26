@@ -972,11 +972,29 @@ export async function verifyRunningApp(
   port: number,
   apiRoutes: string[],
   projectPath?: string,
+  pageRoutes?: string[],
 ): Promise<VerificationResult> {
   const base = `http://localhost:${port}`;
   const checks: VerificationCheck[] = [];
 
   checks.push(await checkEndpoint(`${base}/`, 'Main page (GET /)'));
+
+  // Check all PAGE routes (app/**/page.tsx → GET /path) so that broken pages
+  // like /browse or /listings are caught even if the API routes pass.
+  // Skip dynamic routes ([param]) as we cannot supply real IDs here.
+  if (pageRoutes && pageRoutes.length > 0) {
+    const pageUrlPaths = pageRoutes
+      .map(p => {
+        const rel = p.replace(/^app\//, '').replace(/\/page\.tsx?$/, '');
+        if (!rel || rel === 'page' || rel.includes('[') || rel.includes('(')) return null;
+        return '/' + rel;
+      })
+      .filter((u): u is string => u !== null);
+
+    for (const urlPath of pageUrlPaths) {
+      checks.push(await checkEndpoint(`${base}${urlPath}`, `Page: GET ${urlPath}`));
+    }
+  }
 
   const urlPaths = Array.from(
     new Set(

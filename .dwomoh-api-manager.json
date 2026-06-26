@@ -123,5 +123,705 @@
       }
     ],
     "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782128850197": {
+    "projectId": "the-following-conversation-led-to-this-b-1782128850197",
+    "projectPath": "",
+    "createdAt": "2026-06-22T11:47:30.251Z",
+    "updatedAt": "2026-06-22T11:47:30.253Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T11:47:30.253Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782132003278": {
+    "projectId": "the-following-conversation-led-to-this-b-1782132003278",
+    "projectPath": "",
+    "createdAt": "2026-06-22T12:40:03.472Z",
+    "updatedAt": "2026-06-22T12:40:03.474Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T12:40:03.474Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782135095484": {
+    "projectId": "the-following-conversation-led-to-this-b-1782135095484",
+    "projectPath": "",
+    "createdAt": "2026-06-22T13:31:39.115Z",
+    "updatedAt": "2026-06-22T13:31:39.117Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      },
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      },
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      },
+      {
+        "category": "music",
+        "providerId": "deezerdevs-deezer.p.rapidapi.com",
+        "providerName": "Deezer",
+        "rapidApiHost": "deezerdevs-deezer.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:31:39.117Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782135132670": {
+    "projectId": "the-following-conversation-led-to-this-b-1782135132670",
+    "projectPath": "",
+    "createdAt": "2026-06-22T13:32:12.712Z",
+    "updatedAt": "2026-06-22T13:32:12.713Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      },
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      },
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      },
+      {
+        "category": "music",
+        "providerId": "deezerdevs-deezer.p.rapidapi.com",
+        "providerName": "Deezer",
+        "rapidApiHost": "deezerdevs-deezer.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:12.713Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782135166958": {
+    "projectId": "the-following-conversation-led-to-this-b-1782135166958",
+    "projectPath": "",
+    "createdAt": "2026-06-22T13:32:47.032Z",
+    "updatedAt": "2026-06-22T13:32:47.033Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      },
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      },
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      },
+      {
+        "category": "music",
+        "providerId": "deezerdevs-deezer.p.rapidapi.com",
+        "providerName": "Deezer",
+        "rapidApiHost": "deezerdevs-deezer.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T13:32:47.033Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782139378950": {
+    "projectId": "the-following-conversation-led-to-this-b-1782139378950",
+    "projectPath": "",
+    "createdAt": "2026-06-22T14:42:58.974Z",
+    "updatedAt": "2026-06-22T14:42:58.976Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T14:42:58.975Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782139412861": {
+    "projectId": "the-following-conversation-led-to-this-b-1782139412861",
+    "projectPath": "",
+    "createdAt": "2026-06-22T14:43:32.865Z",
+    "updatedAt": "2026-06-22T14:43:32.871Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T14:43:32.868Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782139447246": {
+    "projectId": "the-following-conversation-led-to-this-b-1782139447246",
+    "projectPath": "",
+    "createdAt": "2026-06-22T14:44:07.253Z",
+    "updatedAt": "2026-06-22T14:44:07.255Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T14:44:07.254Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782139569104": {
+    "projectId": "the-following-conversation-led-to-this-b-1782139569104",
+    "projectPath": "",
+    "createdAt": "2026-06-22T14:46:09.110Z",
+    "updatedAt": "2026-06-22T14:46:09.113Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T14:46:09.113Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782139606379": {
+    "projectId": "the-following-conversation-led-to-this-b-1782139606379",
+    "projectPath": "",
+    "createdAt": "2026-06-22T14:46:46.381Z",
+    "updatedAt": "2026-06-22T14:46:46.384Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T14:46:46.383Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782141626565": {
+    "projectId": "the-following-conversation-led-to-this-b-1782141626565",
+    "projectPath": "",
+    "createdAt": "2026-06-22T15:20:26.618Z",
+    "updatedAt": "2026-06-22T15:20:26.624Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T15:20:26.623Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782142255534": {
+    "projectId": "the-following-conversation-led-to-this-b-1782142255534",
+    "projectPath": "",
+    "createdAt": "2026-06-22T15:30:55.605Z",
+    "updatedAt": "2026-06-22T15:30:55.613Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T15:30:55.611Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782142419856": {
+    "projectId": "the-following-conversation-led-to-this-b-1782142419856",
+    "projectPath": "",
+    "createdAt": "2026-06-22T15:33:39.884Z",
+    "updatedAt": "2026-06-22T15:33:39.908Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T15:33:39.905Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782142474587": {
+    "projectId": "the-following-conversation-led-to-this-b-1782142474587",
+    "projectPath": "",
+    "createdAt": "2026-06-22T15:34:34.592Z",
+    "updatedAt": "2026-06-22T15:34:34.594Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T15:34:34.593Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782143230316": {
+    "projectId": "the-following-conversation-led-to-this-b-1782143230316",
+    "projectPath": "",
+    "createdAt": "2026-06-22T15:47:10.352Z",
+    "updatedAt": "2026-06-22T15:47:10.358Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T15:47:10.357Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782147976083": {
+    "projectId": "the-following-conversation-led-to-this-b-1782147976083",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:06:16.129Z",
+    "updatedAt": "2026-06-22T17:06:16.130Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:06:16.130Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782150412459": {
+    "projectId": "the-following-conversation-led-to-this-b-1782150412459",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:46:52.568Z",
+    "updatedAt": "2026-06-22T17:46:52.576Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:46:52.574Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782150506994": {
+    "projectId": "the-following-conversation-led-to-this-b-1782150506994",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:48:27.004Z",
+    "updatedAt": "2026-06-22T17:48:27.008Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:48:27.008Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782150641150": {
+    "projectId": "the-following-conversation-led-to-this-b-1782150641150",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:50:41.187Z",
+    "updatedAt": "2026-06-22T17:50:41.193Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:50:41.192Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782150726465": {
+    "projectId": "the-following-conversation-led-to-this-b-1782150726465",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:52:06.515Z",
+    "updatedAt": "2026-06-22T17:52:06.517Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:52:06.516Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782150880922": {
+    "projectId": "the-following-conversation-led-to-this-b-1782150880922",
+    "projectPath": "",
+    "createdAt": "2026-06-22T17:54:41.162Z",
+    "updatedAt": "2026-06-22T17:54:41.197Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:54:41.168Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T17:54:41.168Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782154905238": {
+    "projectId": "the-following-conversation-led-to-this-b-1782154905238",
+    "projectPath": "",
+    "createdAt": "2026-06-22T19:01:45.276Z",
+    "updatedAt": "2026-06-22T19:01:45.279Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T19:01:45.278Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782170213116": {
+    "projectId": "the-following-conversation-led-to-this-b-1782170213116",
+    "projectPath": "",
+    "createdAt": "2026-06-22T23:16:57.106Z",
+    "updatedAt": "2026-06-22T23:16:57.112Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T23:16:57.109Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T23:16:57.109Z"
+      },
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-22T23:16:57.109Z"
+      },
+      {
+        "category": "translate",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-22T23:16:57.109Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782173479528": {
+    "projectId": "the-following-conversation-led-to-this-b-1782173479528",
+    "projectPath": "",
+    "createdAt": "2026-06-23T00:11:25.022Z",
+    "updatedAt": "2026-06-23T00:11:25.025Z",
+    "apis": [
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T00:11:25.025Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T00:11:25.025Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T00:11:25.025Z"
+      },
+      {
+        "category": "translate",
+        "providerId": "",
+        "providerName": "None",
+        "status": "failed",
+        "testedAt": "2026-06-23T00:11:25.025Z",
+        "errorMessage": "No working provider found"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "the-following-conversation-led-to-this-b-1782212060338": {
+    "projectId": "the-following-conversation-led-to-this-b-1782212060338",
+    "projectPath": "",
+    "createdAt": "2026-06-23T10:54:23.359Z",
+    "updatedAt": "2026-06-23T10:54:23.361Z",
+    "apis": [
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      },
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "livescore6.p.rapidapi.com",
+        "providerName": "LiveScore 6",
+        "rapidApiHost": "livescore6.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      },
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      },
+      {
+        "category": "music",
+        "providerId": "deezerdevs-deezer.p.rapidapi.com",
+        "providerName": "Deezer",
+        "rapidApiHost": "deezerdevs-deezer.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      },
+      {
+        "category": "finance",
+        "providerId": "yahoo-finance1.p.rapidapi.com",
+        "providerName": "Yahoo Finance",
+        "rapidApiHost": "yahoo-finance1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-23T10:54:23.361Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782333022801": {
+    "projectId": "--1782333022801",
+    "projectPath": "",
+    "createdAt": "2026-06-24T20:30:22.858Z",
+    "updatedAt": "2026-06-24T20:30:22.865Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-24T20:30:22.863Z"
+      },
+      {
+        "category": "sports",
+        "providerId": "football-web-pages1.p.rapidapi.com",
+        "providerName": "Football Web Pages",
+        "rapidApiHost": "football-web-pages1.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-24T20:30:22.863Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782338845831": {
+    "projectId": "--1782338845831",
+    "projectPath": "",
+    "createdAt": "2026-06-24T22:07:31.641Z",
+    "updatedAt": "2026-06-24T22:07:31.652Z",
+    "apis": [
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-24T22:07:31.650Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782420799082": {
+    "projectId": "--1782420799082",
+    "projectPath": "",
+    "createdAt": "2026-06-25T20:53:19.158Z",
+    "updatedAt": "2026-06-25T20:53:19.167Z",
+    "apis": [
+      {
+        "category": "sports",
+        "providerId": "bet365.p.rapidapi.com",
+        "providerName": "Bet365 Sports Odds",
+        "rapidApiHost": "bet365.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-25T20:53:19.163Z"
+      }
+    ],
+    "platformPort": 3000
   }
 }
