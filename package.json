@@ -6,7 +6,11 @@
     "dev": "next dev",
     "build": "bash scripts/build-safe.sh",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "deploy": "node scripts/one-click-deploy.mjs",
+    "deploy:quick": "node scripts/one-click-deploy.mjs --skip-build",
+    "rollback": "node scripts/one-click-deploy.mjs --rollback --skip-build",
+    "deploy:status": "node scripts/one-click-deploy.mjs --status"
   },
   "dependencies": {
     "@aws-amplify/ui-react": "^6.5.5",

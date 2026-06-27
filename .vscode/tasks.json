@@ -1,0 +1,97 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "🚀 Deploy to Live",
+      "type": "shell",
+      "command": "node scripts/one-click-deploy.mjs",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true,
+        "close": false,
+        "echo": false,
+        "focus": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "runOptions": {
+        "runOn": "default"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "🚀 Deploy to Live (Skip Local Build)",
+      "type": "shell",
+      "command": "node scripts/one-click-deploy.mjs --skip-build",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true,
+        "close": false,
+        "echo": false,
+        "focus": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "⏮ Rollback to Previous Deployment",
+      "type": "shell",
+      "command": "node scripts/one-click-deploy.mjs --rollback --skip-build",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "clear": true,
+        "close": false,
+        "echo": false,
+        "focus": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "📋 View Deployment History",
+      "type": "shell",
+      "command": "node -e \"const h=require('./.dwomoh/deployment-history.json'); h.slice(0,10).forEach((d,i) => { const dur = Math.round(d.durationMs/1000); console.log('\\n#' + (i+1), d.status.toUpperCase(), '|', d.timestamp.slice(0,19), '|', dur+'s', '|', d.commitHash.slice(0,8), '—', d.commitMessage.slice(0,55)); d.urls.forEach(u => console.log('   →', u)); }); console.log('')\"",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "echo": false
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "🔍 Check Live Status",
+      "type": "shell",
+      "command": "node -e \"(async() => { for (const url of ['https://dwomohvibe.com', 'https://www.dwomohvibe.com']) { try { const r = await fetch(url, { headers: { 'User-Agent': 'DWOMOH-Status/1.0' } }); const b = await r.text(); const t = b.match(/<title[^>]*>([^<]+)<\\/title>/i)?.[1] || '?'; console.log(r.status === 200 ? '✅' : '❌', url, '—', t.slice(0,60), '|', r.headers.get('x-powered-by') || 'no-next'); } catch(e) { console.log('❌', url, '—', e.message); } } })()\"",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "echo": false
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
