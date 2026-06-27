@@ -161,7 +161,7 @@ async function addGoogle() {
     log('4. Application type: Web application');
     log('5. Name: DWOMOH Vibe Code');
     log('6. Authorized redirect URIs — add EXACTLY these three:');
-    log('     https://dwomoh-vibecode.auth.us-east-1.amazoncognito.com/oauth2/idpresponse');
+    log('     https://auth.dwomohvibe.com/oauth2/idpresponse');
     log('     https://dwomohvibe.com/auth/callback');
     log('     http://localhost:3000/auth/callback');
     log('7. Click "Create" → copy the Client ID and Client Secret');
