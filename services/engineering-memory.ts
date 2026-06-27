@@ -348,6 +348,65 @@ const BUILTIN_PATTERNS: RepairPattern[] = [
     successfulTier: 'HAIKU',
     successCount: 1,
   },
+
+  // ── Flutter patterns ─────────────────────────────────────────────────────
+  {
+    id: 'flutter-missing-screen-imports',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "Target of URI doesn't exist.*screens/|target of URI doesn't exist.*\\.dart|Error.*lib/screens.*not found",
+    rootCause:
+      'Flutter router/widget references screen files that were never generated. ' +
+      'Common cause: AI generates router.dart with all routes but only creates some screen files, ' +
+      'leaving others as dangling imports.',
+    fixApproach:
+      'PREVENTION (in flutter-verifier.ts auditAndRepairFlutterRoutes): ' +
+      'Scan all .dart files for import patterns matching screens/*.dart. ' +
+      'For every referenced screen, check if the file exists at lib/screens/<name>.dart. ' +
+      'If missing, auto-create a stub screen with the correct class name derived from the filename. ' +
+      'Stub format: StatelessWidget with dark background (#0D0D0D) and "Coming soon" placeholder. ' +
+      'Run this audit BEFORE flutter analyze to ensure no broken imports reach the compiler. ' +
+      'REPAIR (for existing projects): Create the missing screen files manually with full implementations ' +
+      'using the providers already referenced in the router (trackByIdProvider, artistByIdProvider, etc.).',
+    targetFiles: ['lib/screens/', 'lib/router.dart'],
+    tsErrorsToAvoid: [],
+    successfulTier: 'SONNET',
+    successCount: 1,
+  },
+
+  {
+    id: 'flutter-truncated-screen-file',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: "Expected to find ';'.*dart|Expected to find ')'.*dart|Undefined name.*dart|undefined_method.*dart|expected_token.*dart",
+    rootCause:
+      'Flutter screen file was truncated during AI generation — ends mid-expression or is missing helper methods.',
+    fixApproach:
+      'Read the file and find where it ends prematurely. ' +
+      'Common signs: file ends on a partial expression (e.g. "color"), missing closing braces, ' +
+      'or methods referenced in build() but not defined in the class. ' +
+      'Rewrite the complete file ensuring: all methods called in build() are defined, ' +
+      'all braces/brackets are balanced, all imports match actual package identifiers.',
+    targetFiles: ['lib/screens/'],
+    tsErrorsToAvoid: [],
+    successfulTier: 'SONNET',
+    successCount: 1,
+  },
+
+  {
+    id: 'flutter-missing-android-platform',
+    createdAt: 0, updatedAt: 0,
+    errorPattern: 'android/app/build.gradle.*not found|No such file.*build.gradle|Could not find.*android',
+    rootCause:
+      'Flutter project generated without running flutter create — android/ platform directory missing.',
+    fixApproach:
+      'Run: flutter create --platforms android --org com.dwomoh . ' +
+      'from inside the project directory. This generates android/, analysis_options.yaml, and test/. ' +
+      'It does NOT overwrite existing lib/ or pubspec.yaml files. ' +
+      'After this, run: flutter build apk --release.',
+    targetFiles: ['android/'],
+    tsErrorsToAvoid: [],
+    successfulTier: 'HAIKU',
+    successCount: 1,
+  },
 ];
 
 // ─── Storage ──────────────────────────────────────────────────────────────────

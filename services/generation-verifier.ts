@@ -646,6 +646,96 @@ async function runPhase5DeepCrawl(projectPath: string, port: number, onProgress?
   }
 }
 
+// ─── Phase 0 — Template Leak Detector ────────────────────────────────────────
+// Scans generated files for DWOMOH Vibe Code branding/marketing content that
+// should NEVER appear in a user's generated application.
+
+const TEMPLATE_LEAK_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /DWOMOH\s+Vibe\s+Code/i,          label: 'DWOMOH Vibe Code branding in generated file' },
+  { pattern: /AI\s+App\s+Builder/i,             label: '"AI App Builder" marketing text in generated file' },
+  { pattern: /Build\s+any\s+app\s+in\s+seconds/i, label: 'Builder marketing copy leaked into generated file' },
+  { pattern: /How\s+It\s+Works[\s\S]*?Pricing[\s\S]*?Features/i, label: 'Landing page sections (How It Works / Pricing / Features) leaked' },
+  { pattern: /\/builder(?:["' ]|$)/,             label: 'Internal /builder route referenced in generated app' },
+  { pattern: /plan.*Free.*Starter.*Pro.*Business/i, label: 'DWOMOH subscription plans leaked into generated file' },
+  { pattern: /vibe\s+code/i,                    label: '"Vibe Code" platform name in generated file' },
+  { pattern: /ghanasongs@/i,                    label: 'Internal email address leaked into generated file' },
+  // Additional builder-identity patterns
+  { pattern: /Autonomous\s+AI\s+Software\s+Engineer/i, label: 'DWOMOH hero copy leaked into generated file' },
+  { pattern: /Start\s+building\s+free/i,         label: 'DWOMOH CTA copy leaked into generated file' },
+  { pattern: /DWOMOH\b/i,                        label: 'DWOMOH brand name in generated file' },
+  { pattern: /from\s+['"]@\/lib\/auth-context['"]/i, label: 'DWOMOH auth-context imported in generated file' },
+  { pattern: /from\s+['"]@\/services\/project-generator['"]/i, label: 'Builder internal service imported in generated file' },
+];
+
+async function runPhase0TemplateLeakCheck(projectPath: string, onProgress?: (m: string) => void): Promise<PhaseResult> {
+  const t0 = Date.now();
+  const checks: CheckItem[] = [];
+  log('[Phase 0] Template leak check — scanning for DWOMOH branding in generated files…', onProgress);
+
+  // ── Empty project guard ────────────────────────────────────────────────────
+  // If the project directory has no source files, generation never ran.
+  // Fail immediately — starting the dev server on an empty dir causes npm to
+  // walk UP the tree and serve the DWOMOH builder app in the preview instead.
+  try {
+    const appPagePath = join(projectPath, 'app', 'page.tsx');
+    await access(appPagePath);
+  } catch {
+    const errDetail = 'Project has no app/page.tsx — generation did not write files. ' +
+      'This can happen when the AI response was empty or unparseable. ' +
+      'Trigger a new Generate action before starting the dev server.';
+    log(`[Phase 0] ❌ EMPTY PROJECT — ${errDetail}`, onProgress);
+    checks.push({ id: 0, name: 'Empty project guard', passed: false, detail: errDetail });
+    return { phase: 'Template Leak Check', passed: false, checks, repairedFiles: [], durationMs: Date.now() - t0 };
+  }
+
+  const leaks: string[] = [];
+
+  try {
+    // Scan app/ and pages/ and components/ directories recursively
+    const scanDirs = ['app', 'pages', 'components', 'src'];
+    const textExts = new Set(['.tsx', '.ts', '.jsx', '.js', '.css', '.html', '.md']);
+
+    async function scanDir(dir: string): Promise<void> {
+      let entries: import('fs').Dirent[] = [];
+      try { entries = await readdir(join(projectPath, dir), { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === '.next') continue;
+        const relPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await scanDir(relPath);
+        } else if (textExts.has(entry.name.slice(entry.name.lastIndexOf('.')))) {
+          let content = '';
+          try { content = await readFile(join(projectPath, relPath), 'utf-8'); } catch { continue; }
+          for (const { pattern, label } of TEMPLATE_LEAK_PATTERNS) {
+            if (pattern.test(content)) {
+              leaks.push(`${relPath}: ${label}`);
+              log(`[Phase 0] ❌ LEAK DETECTED in ${relPath}: ${label}`, onProgress);
+              break; // one leak report per file is enough
+            }
+          }
+        }
+      }
+    }
+
+    await Promise.all(scanDirs.map(d => scanDir(d)));
+
+    if (leaks.length === 0) {
+      log('[Phase 0] ✅ No template leakage detected', onProgress);
+      checks.push({ id: 0, name: 'Template leak check', passed: true, detail: 'No DWOMOH branding in generated files' });
+      return { phase: 'Template Leak Check', passed: true, checks, repairedFiles: [], durationMs: Date.now() - t0 };
+    } else {
+      checks.push({
+        id: 0, name: 'Template leak check', passed: false,
+        detail: `Builder branding leaked into ${leaks.length} file(s): ${leaks.slice(0, 3).join('; ')}`,
+      });
+      return { phase: 'Template Leak Check', passed: false, checks, repairedFiles: [], durationMs: Date.now() - t0 };
+    }
+  } catch (err) {
+    checks.push({ id: 0, name: 'Template leak check', passed: true, detail: 'Scan skipped (non-fatal)' });
+    return { phase: 'Template Leak Check', passed: true, checks, repairedFiles: [], durationMs: Date.now() - t0, skipped: true, skipReason: String(err) };
+  }
+}
+
 // ─── Master Runner ────────────────────────────────────────────────────────────
 
 export async function runGenerationVerifier(
@@ -662,6 +752,14 @@ export async function runGenerationVerifier(
   log(`DWOMOH Generation Verifier — 18-point completion gate`, onProgress);
   log(`Project: ${projectPath}  Port: ${port}`, onProgress);
   log(`═══════════════════════════════════════════════════\n`, onProgress);
+
+  // Phase 0 — Template leak check (runs ONCE before the repair loop — not round-aware)
+  const p0 = await runPhase0TemplateLeakCheck(projectPath, onProgress);
+  allPhases.push(p0);
+  if (!p0.passed) {
+    log('\n🚨 TEMPLATE LEAKAGE DETECTED — build marked incomplete. The generated app contains DWOMOH Vibe Code branding.', onProgress);
+    log('This means the AI generated the wrong content. The repair pipeline cannot fix intent errors. A new generation is needed.', onProgress);
+  }
 
   for (round = 1; round <= MAX_ROUNDS; round++) {
     log(`\n──── Verification Round ${round}/${MAX_ROUNDS} ────`, onProgress);
@@ -698,7 +796,7 @@ export async function runGenerationVerifier(
 
     allPhases.push(...roundPhases);
 
-    const allPass = roundPhases.every(p => p.passed);
+    const allPass = roundPhases.every(p => p.passed) && p0.passed;
     log(`\nRound ${round} result: ${allPass ? '✅ ALL PHASES PASSED' : '❌ Issues found — will repair and retry'}`, onProgress);
 
     if (allPass) {

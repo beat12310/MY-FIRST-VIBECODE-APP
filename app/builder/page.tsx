@@ -117,6 +117,53 @@ const STATUS_STYLE: Record<string, { bg: string; text: string; icon: string }> =
   error:    { bg: '#3b0000', text: '#f87171', icon: '❌' },
 };
 
+// ─── Build Style Picker ────────────────────────────────────────────────────────
+
+type BuildStyle = 'classic' | 'modern' | 'premium-3d' | 'mobile-first' | 'minimal';
+
+const BUILD_STYLES: Array<{ id: BuildStyle; label: string; icon: string; desc: string; accent: string }> = [
+  { id: 'classic',      label: 'Classic',      icon: '🏛️', desc: 'Professional blue palette, clean grids',      accent: '#3b82f6' },
+  { id: 'modern',       label: 'Modern',       icon: '⚡', desc: 'Bold gradients, vibrant colors, fluid motion', accent: '#8b5cf6' },
+  { id: 'premium-3d',   label: 'Premium 3D',   icon: '💎', desc: 'Glassmorphism, gold accents, depth effects',   accent: '#d4a017' },
+  { id: 'mobile-first', label: 'Mobile First', icon: '📱', desc: 'Native app feel, bottom nav, touch targets',   accent: '#10b981' },
+  { id: 'minimal',      label: 'Minimal',      icon: '○',  desc: 'White space, system font, content-first',     accent: '#94a3b8' },
+];
+
+function BuildStylePickerInline({ value, onChange }: { value: BuildStyle; onChange: (s: BuildStyle) => void }) {
+  const [open, setOpen] = useState(false);
+  const cur = BUILD_STYLES.find(s => s.id === value) ?? BUILD_STYLES[1];
+  return (
+    <div style={{ position: 'relative', flexShrink: 0 }}>
+      <button type="button" onClick={() => setOpen(o => !o)} title="Design style"
+        style={{ padding: '5px 9px', background: open ? `rgba(${cur.accent.slice(1).match(/../g)!.map(h=>parseInt(h,16)).join(',')},0.12)` : 'transparent', border: `1px solid ${open ? cur.accent + '55' : '#1e3a5f'}`, borderRadius: '8px', color: open ? cur.accent : '#475569', cursor: 'pointer', fontSize: '11px', fontWeight: '700', letterSpacing: '0.03em', transition: 'all 0.15s', display: 'flex', alignItems: 'center', gap: '5px', whiteSpace: 'nowrap' }}>
+        <span>{cur.icon}</span>
+        <span>{cur.label}</span>
+        <svg width="9" height="9" viewBox="0 0 9 9" style={{ opacity: 0.5, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
+          <path d="M1.5 3L4.5 6L7.5 3" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+      </button>
+      {open && (
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 49 }} onClick={() => setOpen(false)} />
+          <div style={{ position: 'absolute', bottom: 'calc(100% + 8px)', left: 0, zIndex: 50, background: '#080f1e', border: '1px solid #1e3a5f', borderRadius: '12px', padding: '7px', width: '248px', boxShadow: '0 -8px 32px rgba(0,0,0,0.7)' }}>
+            <div style={{ fontSize: '9px', color: '#334155', fontWeight: '800', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: '5px', padding: '1px 4px' }}>Design Style</div>
+            {BUILD_STYLES.map(s => (
+              <button key={s.id} type="button" onClick={() => { onChange(s.id); setOpen(false); }}
+                style={{ width: '100%', textAlign: 'left', padding: '7px 9px', background: value === s.id ? `rgba(${s.accent.slice(1).match(/../g)!.map(h=>parseInt(h,16)).join(',')},0.1)` : 'transparent', border: `1px solid ${value === s.id ? s.accent + '44' : 'transparent'}`, borderRadius: '8px', cursor: 'pointer', marginBottom: '2px', transition: 'all 0.1s', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '15px' }}>{s.icon}</span>
+                <div>
+                  <div style={{ fontSize: '12px', fontWeight: '600', color: value === s.id ? s.accent : '#e2e8f0', lineHeight: 1.2 }}>{s.label}</div>
+                  <div style={{ fontSize: '10px', color: '#475569', marginTop: '1px' }}>{s.desc}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── Component ─────────────────────────────────────────────────────────────────
 
 function BuilderInner() {
@@ -132,6 +179,9 @@ function BuilderInner() {
 
   // Build target: 'web' = existing Next.js pipeline, 'flutter' = new Flutter pipeline
   const [buildTarget, setBuildTarget] = useState<'web' | 'flutter'>('web');
+
+  // Design style — injected into BUILD_SYSTEM_PROMPT at generation time
+  const [buildStyle, setBuildStyle] = useState<'classic' | 'modern' | 'premium-3d' | 'mobile-first' | 'minimal'>('modern');
 
   // Flutter build progress — completely separate from buildProgress (web-only)
   interface FlutterBuildProgress {
@@ -235,6 +285,14 @@ function BuilderInner() {
   // Browser automation
   const [browserDebugging, setBrowserDebugging] = useState(false);
 
+  // ── IDE Layout state ──────────────────────────────────────────────────────
+  type BuilderMode = 'build' | 'debug' | 'deploy';
+  type SidebarSection = 'projects' | 'builds' | 'templates' | 'agents' | 'deployments' | 'domains' | 'settings';
+  const [builderMode, setBuilderMode] = useState<BuilderMode>('build');
+  const [focusMode, setFocusMode] = useState(false);
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>('projects');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
   // File manager
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
   const [fileRenaming, setFileRenaming] = useState<string | null>(null);
@@ -250,6 +308,60 @@ function BuilderInner() {
   // Deploy
   const [deployTarget, setDeployTarget] = useState('vercel');
   const [deployPreparing, setDeployPreparing] = useState(false);
+  // Real deployment
+  const [deploying, setDeploying] = useState(false);
+  const [deployRecord, setDeployRecord] = useState<{
+    deploymentId: string; status: string; statusDetail?: string; brandedUrl: string; slug: string;
+    providerUrl: string; customDomains: Array<{ domain: string; status: string; dnsRecords?: Array<{ type: string; name: string; value: string }> }>;
+    errorMessage?: string;
+    verificationResult?: {
+      passed: boolean; url: string; httpStatus?: number; pageTitle?: string;
+      checks: Array<{ name: string; label: string; status: string; detail: string; durationMs?: number }>;
+      attempts: number; totalDurationMs: number; completedAt: string; repairLog?: string[];
+    };
+  } | null>(null);
+  const [deployLogs, setDeployLogs] = useState<string[]>([]);
+  const [deployVerificationChecks, setDeployVerificationChecks] = useState<Array<{
+    name: string; label: string; status: string; detail: string; durationMs?: number;
+  }>>([]);
+  const [addDomainInput, setAddDomainInput] = useState('');
+  const [addingDomain, setAddingDomain] = useState(false);
+  const [showDnsInstructions, setShowDnsInstructions] = useState<string | null>(null);
+  const [deployPolling, setDeployPolling] = useState(false);
+
+  // Domains panel
+  interface DomainSearchResult { domain: string; available: boolean; price?: number; currency?: string; tld: string; }
+  interface ProjectDomain { domain: string; projectName: string; brandedUrl: string; status: string; }
+  interface RegisteredDomain { domain: string; expiry?: string; autoRenew?: boolean; }
+  interface DomainsData { registered: RegisteredDomain[]; projectDomains: ProjectDomain[]; platformDomain: string; }
+  const [domainsData, setDomainsData] = useState<DomainsData | null>(null);
+  const [domainsLoading, setDomainsLoading] = useState(false);
+  const [domainSearchQuery, setDomainSearchQuery] = useState('');
+  const [domainSearchResults, setDomainSearchResults] = useState<DomainSearchResult[]>([]);
+  const [domainSearching, setDomainSearching] = useState(false);
+  const [domainPurchasing, setDomainPurchasing] = useState<string | null>(null);
+  const [connectDomainInput, setConnectDomainInput] = useState('');
+  const [connectingDomain, setConnectingDomain] = useState(false);
+  const [domainsTab, setDomainsTab] = useState<'overview' | 'buy' | 'connect'>('overview');
+  const [purchaseSuccess, setPurchaseSuccess] = useState<string | null>(null);
+
+  // AWS Platform Setup
+  interface AwsSetupStep { id: string; label: string; status: 'pending' | 'running' | 'done' | 'error' | 'skipped'; detail?: string; }
+  interface AwsSetupStatusType {
+    domain: string;
+    hostedZone: { id: string; name: string; nameservers?: string[]; recordCount?: number; } | null;
+    certificate: { arn: string; status: string; isWildcard?: boolean; domains?: string[]; issuedAt?: string; expiresAt?: string; } | null;
+    iamRole: { arn: string; name?: string; } | null;
+    amplifyDomain: { verified: boolean; status: string; sentinelAppId: string; cfDistribution?: string; } | null;
+    amplifyDomainVerified: boolean;
+    dnsRecords?: Array<{ type: string; name: string; value: string }>;
+    ready: boolean;
+    steps: AwsSetupStep[];
+    checkedAt?: string;
+  }
+  const [awsSetupStatus, setAwsSetupStatus] = useState<AwsSetupStatusType | null>(null);
+  const [awsSetupRunning, setAwsSetupRunning] = useState(false);
+  const [awsSetupLogs, setAwsSetupLogs] = useState<string[]>([]);
 
   // Auth
   const [authProvider, setAuthProvider] = useState('nextauth');
@@ -479,6 +591,19 @@ function BuilderInner() {
   }, [api]);
 
   useEffect(() => { refreshProjects(); }, [refreshProjects]);
+  useEffect(() => { checkAwsSetup(); loadDomainsData(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Auto-poll platform status every 20s while any AWS service is pending
+  useEffect(() => {
+    const needsPoll = awsSetupStatus && (
+      !awsSetupStatus.ready ||
+      awsSetupStatus.certificate?.status !== 'ISSUED' ||
+      (awsSetupStatus.amplifyDomain && !awsSetupStatus.amplifyDomain.verified)
+    );
+    if (!needsPoll) return;
+    const timer = setInterval(() => { checkAwsSetup(); }, 20_000);
+    return () => clearInterval(timer);
+  }, [awsSetupStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll for VS Code + Claude Code resolution every 5 seconds while escalation is pending.
   useEffect(() => {
@@ -751,6 +876,7 @@ function BuilderInner() {
     setReadyToBuild(false);
     setBuildProgress(null);
     setHistory([]);
+    loadDeployRecord(project.id);
     setDisplayed([]);
 
     addStatus('DWOMOH Vibe Code is checking the selected project…', 'checking');
@@ -819,9 +945,18 @@ function BuilderInner() {
         setPreviewKey(k => k + 1);
         setPreviewLoading(true);
         setPhase('previewing');
-        setBuildProgress({ step: 'done', message: `${project.name} is running`, logs: [`✅ Port ${openResult.port}`], port: openResult.port });
 
-        addStatus(`DWOMOH Vibe Code has loaded ${project.name}. Preview is ready.`, 'done');
+        // Surface home-page probe result so the user knows immediately if the
+        // preview will show a 404 instead of the real app.
+        const hpVerified = openResult.homePageVerified;
+        const hpError    = openResult.homePageError;
+        const statusMsg  = hpVerified === false && hpError
+          ? `⚠️ Home page probe failed: ${hpError}`
+          : `${project.name} is running`;
+        const statusKind = hpVerified === false ? 'error' as const : 'done' as const;
+
+        setBuildProgress({ step: hpVerified === false ? 'error' : 'done', message: statusMsg, logs: [`✅ Port ${openResult.port}`], port: openResult.port });
+        addStatus(statusKind === 'error' ? statusMsg : `DWOMOH Vibe Code has loaded ${project.name}. Preview is ready.`, statusKind);
 
         const disc = openResult.discovery || {};
         const mem = openResult.memory || {};
@@ -3509,6 +3644,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
   const runBuildPipeline = async (conversationHistory: ConversationTurn[], originalPrompt: string) => {
     setPhase('building');
+    setFocusMode(true);     // Enter focus mode — hide marketing, maximise workspace
+    setBuilderMode('build');
     setReadyToBuild(false);
     setLoading(false);
     setPreviewTab('preview');
@@ -3542,11 +3679,35 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       await new Promise(r => setTimeout(r, 600)); // brief pause so user sees the message
       setBuildDetailStep('researching');
       const findApisTimer = setTimeout(() => setBuildDetailStep('finding_apis'), 4000);
-      const genData = await api({ action: 'generate', messages: conversationHistory });
+      const genData = await api({ action: 'generate', messages: conversationHistory, designStyle: buildStyle });
       clearTimeout(findApisTimer);
       // The generate action retries 3 times with escalating strategies and always
       // returns a scaffold as last resort — so success=false only on a genuine API/network failure.
       if (!genData.success || !genData.projectData) throw new Error('Code generation failed — click Retry Build to try again');
+
+      // ── Intent Verification Display ──────────────────────────────────────────
+      // Show the user what was understood BEFORE files are written.
+      // This makes template leakage visible immediately and lets the user correct intent.
+      if (genData.intentSummary) {
+        const intent = genData.intentSummary as {
+          projectName: string; projectType: string; projectTypeLabel: string;
+          detectedFeatures: string[]; detectedPages: string[];
+        };
+        const featuresStr = intent.detectedFeatures.length > 0
+          ? intent.detectedFeatures.join(', ')
+          : 'Full application';
+        const pagesStr = intent.detectedPages.length > 0
+          ? intent.detectedPages.join(', ')
+          : '/';
+        narrate(
+          `**Detected project:** ${intent.projectName}\n` +
+          `**Type:** ${intent.projectTypeLabel}\n` +
+          `**Features:** ${featuresStr}\n` +
+          `**Pages:** ${pagesStr}\n\n` +
+          `Generating your application now…`
+        );
+        appendLog(`🎯 Intent: ${intent.projectTypeLabel} — "${intent.projectName}"`);
+      }
 
       setBuildDetailStep('designing');
       setBuildingProjectName(genData.projectData.projectName || 'your application');
@@ -4030,9 +4191,10 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         }
         appendLog(`🤖 Engineering loop — iteration ${iter}/${MAX_ITERATIONS} (${Math.round(elapsedMs / 1000)}s elapsed)`);
 
-        // ── STEP 1: Full verification ────────────────────────────────────────
+        // ── STEP 1: Full verification (with live server log) ─────────────
+        const serverLogFile = path ? `${path}/.next-dev.log` : undefined;
         try {
-          verifyData = await api({ action: 'verify-app', port, projectPath: path });
+          verifyData = await api({ action: 'verify-app', port, projectPath: path, serverLogFile });
           setLastVerification(verifyData);
         } catch { break; }
 
@@ -4052,7 +4214,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           await new Promise(r => setTimeout(r, 30_000));
           appendLog('🔄 Re-verifying after compile wait…');
           try {
-            verifyData = await api({ action: 'verify-app', port, projectPath: path });
+            verifyData = await api({ action: 'verify-app', port, projectPath: path, serverLogFile });
             setLastVerification(verifyData);
           } catch { break; }
         } else if (serverJustRestarted) {
@@ -5012,7 +5174,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     try {
       // ── Step 1: Generate Flutter project (AI → write Dart files → pub get) ──
       setStep('generating', '🧠 Generating Flutter code with AI…', ['📡 Calling AI (Sonnet)…']);
-      const genData = await api({ action: 'generate-flutter', messages: conversationHistory });
+      const genData = await api({ action: 'generate-flutter', messages: conversationHistory, designStyle: buildStyle });
 
       if (!genData.success || !genData.projectPath) {
         throw new Error(genData.error || 'Flutter generation failed — try again');
@@ -5087,9 +5249,39 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 step:    'done',
                 message: '✅ APK ready — tap below to download',
                 apkPath,
-                logs:    [...(p?.logs ?? []), '✅ APK build complete!', apkPath ? `📦 ${apkPath}` : ''],
+                logs:    [...(p?.logs ?? []), '✅ APK build complete!', apkPath ? `📦 ${apkPath}` : '', '🔬 Running runtime verification…'],
               }));
-              narrate(`🎉 **APK built successfully!**\n\nYour Android APK is ready. Tap **Download APK** in the progress panel to save it to your device.\n\nProject path: \`${flPath}\`\n\nTo install on a device:\n1. Transfer the APK to your Android device\n2. Enable "Install from unknown sources" in Settings\n3. Tap the APK file to install`);
+
+              // ── Runtime verification: install + launch on connected device ───────
+              try {
+                const runtimeRes = await api({ action: 'verify-flutter-runtime', projectPath: flPath });
+                const rpt = runtimeRes?.report ?? '';
+                const errors = runtimeRes?.runtimeErrors ?? [];
+                const deviceFound = runtimeRes?.deviceFound ?? false;
+
+                const verifyLines = deviceFound
+                  ? [
+                      runtimeRes.appLaunched ? '✅ App launched on device' : '❌ App failed to launch',
+                      errors.length === 0 ? '✅ No runtime crashes detected' : `❌ ${errors.length} crash(es): ${errors[0]?.slice(0, 80)}`,
+                      `📊 ${rpt.slice(0, 120)}`,
+                    ]
+                  : ['📵 No device connected — static APK analysis only', `📊 ${rpt.slice(0, 120)}`];
+
+                setFlutterBuildProgress(p => ({
+                  ...p!,
+                  logs: [...(p?.logs ?? []), ...verifyLines],
+                }));
+
+                const verifyNarrative = deviceFound
+                  ? (runtimeRes.appLaunched && errors.length === 0
+                      ? `✅ **Runtime verification passed.** The APK installed and launched on device \`${runtimeRes.deviceId}\` with no crashes.\n\n${rpt}`
+                      : `⚠️ **Runtime issues detected.** ${rpt}`)
+                  : `📱 **No device connected.** ${rpt}\n\nTo test on a device:\n1. Connect an Android device or start an emulator\n2. Enable USB debugging\n3. Re-run "verify runtime" from the project panel`;
+
+                narrate(`🎉 **APK built successfully!**\n\n${verifyNarrative}\n\nProject: \`${flPath}\``);
+              } catch {
+                narrate(`🎉 **APK built successfully!**\n\nYour Android APK is ready. Tap **Download APK** to save it.\n\nProject path: \`${flPath}\``);
+              }
               resolve();
             } else if (status === 'failed') {
               clearInterval(flutterPollRef.current!);
@@ -5350,6 +5542,11 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       'scraper', 'extractor', 'viewer', 'player', 'editor', 'manager', 'monitor',
       'notifier', 'aggregator', 'scheduler', 'automator', 'processor', 'scanner',
       'builder', 'creator', 'designer', 'shortener', 'checker', 'validator',
+      // Common suffixes in branded app names — "Ghana Music Hub", "DeliverGH Pro", etc.
+      'hub', 'suite', 'pro', 'plus', 'zone', 'space', 'base', 'core', 'lab', 'labs',
+      'studio', 'connect', 'flow', 'go', 'link', 'net', 'box', 'pad', 'io', 'ai',
+      'market', 'central', 'center', 'point', 'place', 'spot', 'gate', 'pass',
+      'watch', 'track', 'view', 'scope', 'lens', 'dash', 'pulse', 'stream',
     ];
     const hasBuildVerb    = BUILD_VERBS.some(v => { const i = lower.indexOf(v); return i !== -1 && (i === 0 || lower[i - 1] === ' '); });
     const hasIntentPhrase = INTENT_PHRASES.some(p => lower.includes(p));
@@ -5360,10 +5557,19 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     // Short commands ("Build a marketplace", "Create an app") fall through to feature-score
     // analysis so DWOMOH can ask clarifying questions rather than building blindly.
     // Only bypass feature-score when the message is long enough to be self-descriptive (8+ words).
-    const IMPERATIVE_BUILD_VERBS = /^(build|create|generate|make|develop|code|write|implement)\b/i;
+    const IMPERATIVE_BUILD_VERBS = /^(build|create|generate|make|develop|produce|code|write|implement)\b/i;
     const isDirectCommand = IMPERATIVE_BUILD_VERBS.test(lower) && words.length >= 8
       && !/^(build|create|generate|make|design|implement)\s+(a\s+|me\s+a\s+)?logo\b/i.test(lower);
     if (isDirectCommand) return 'build';
+
+    // NAMED APP BUILD: "Build [ProperCaseName]" — user names their app directly.
+    // Detect: imperative verb + capitalized app name (2–6 words, each starting with uppercase or known word).
+    // Examples: "Build Ghana Music Hub", "Create DeliverGH", "Generate KidLearn AI"
+    const isNamedAppBuild = IMPERATIVE_BUILD_VERBS.test(lower)
+      && words.length >= 2 && words.length <= 8
+      && !/^(build|create|generate|make|design|implement)\s+(a\s+|me\s+a\s+)?logo\b/i.test(lower)
+      && words.slice(1).some(w => /^[A-Z]/.test(w));  // at least one ProperCase word after the verb
+    if (isNamedAppBuild) return 'build';
 
     // Build request referencing unknown external API → research APIs first
     if (hasAction && hasAppType && /sports api|football api|weather api|stock api|crypto api|news api|using an api|using a sports|using weather|real.time score|live score/i.test(lower))
@@ -5482,7 +5688,13 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
   };
 
   const getDeploymentResponse = (): string =>
-    `To deploy your app, open the project from the sidebar on the left. Once your project is open, the Deploy and Domain buttons will appear in the project panel.\n\nIf you want to prepare the app for a specific platform — Vercel, Netlify, or a custom server — open your project first and let me know which one you are targeting.`;
+    `DWOMOH Vibe Code is its own hosting platform powered by AWS Amplify.\n\n` +
+    `**To deploy your app:**\n` +
+    `1. Open your project from the left sidebar\n` +
+    `2. Click **Deployments** (⊕) in the sidebar\n` +
+    `3. Click **⚡ Deploy Now**\n\n` +
+    `Your app will go live at a branded URL like **${currentProject ? `${currentProject.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 25)}.dwomohvibe.app` : '{your-app}.dwomohvibe.app'}**\n\n` +
+    `After it goes live, you can connect a custom domain like \`phonecarmarket.com\` directly in the Deployments panel — SSL is automatic.`;
 
   const getDebugResponse = (): string =>
     `To investigate and fix an issue, please open the project from the sidebar on the left first. Once your project is open, describe what is wrong and I will inspect the code, find the cause, and fix it for you automatically.`;
@@ -5804,7 +6016,11 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       // is either an explicit BUILD_TRIGGER ("build it", "let's build") or is detailed
       // enough on its own (8+ words with features). Shorter messages continue the conversation.
       case 'build': {
-        const isExplicitBuildCommand = /^(build it|build now|create now|generate now|let's build|lets build|build the app|create the app|go build|just build|build please|proceed with build|go ahead and build|execute|start the build|run the build)\b/i.test(userMessage.trim());
+        const isExplicitBuildCommand =
+          // Classic confirmations
+          /^(build it|build now|create now|generate now|let's build|lets build|build the app|create the app|go build|just build|build please|proceed with build|go ahead and build|execute|start the build|run the build|do it|do it now|proceed|go ahead|start|begin|kick it off)\b/i.test(userMessage.trim())
+          // "Build [AppName]" — named app with at least one ProperCase word
+          || (/^(build|create|generate|make|develop|produce)\s+\S/i.test(userMessage.trim()) && userMessage.trim().split(/\s+/).slice(1).some(w => /^[A-Z]/.test(w)));
         if (inActiveSession && msgWords.length < 6 && !isExplicitBuildCommand) {
           // Continue planning conversation rather than jumping to build on a short message
           await respondWithAI(userMessage, newHistory, 'think');
@@ -6099,6 +6315,360 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     } catch { addStatus(`Deploy preparation failed`, 'error'); } finally { setDeployPreparing(false); }
   };
 
+  // ── Real one-click deploy (AWS Amplify → {slug}.dwomohvibe.app) ────────────
+
+  const handleDeploy = async () => {
+    if (!currentProject || deploying) return;
+    setDeploying(true);
+    setDeployLogs([]);
+    setDeployVerificationChecks([]);
+    addStatus('Starting deployment to AWS Amplify…', 'applying');
+
+    try {
+      // Phase 1: Upload + start build
+      const res = await fetch('/api/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'deploy',
+          projectId: currentProject.id,
+          projectName: currentProject.name,
+          projectPath: currentProject.projectPath,
+          provider: 'amplify',
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'Deploy failed');
+
+      const brandedUrl: string = data.deployment.brandedUrl;
+      setDeployRecord({
+        deploymentId: data.deployment.deploymentId,
+        status: 'building',
+        statusDetail: 'Building on AWS Amplify…',
+        brandedUrl,
+        slug: data.deployment.slug,
+        providerUrl: '',
+        customDomains: [],
+      });
+      addStatus(`Building: ${brandedUrl}`, 'applying');
+      setDeploying(false);
+
+      // Phase 2: Connect to SSE watch stream for full lifecycle
+      watchDeployment(currentProject.id, brandedUrl);
+    } catch (err) {
+      addStatus(`Deploy failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      setDeploying(false);
+    }
+  };
+
+  /**
+   * Connect to /api/deploy watch SSE stream.
+   * Receives: status updates, individual verification check results, completion event.
+   * Only reports "Live" once HTTP 200 is confirmed and all checks pass.
+   */
+  const watchDeployment = (projectId: string, brandedUrl: string) => {
+    setDeployPolling(true);
+
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const res = await fetch('/api/deploy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'watch', projectId }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          addStatus('Watch stream unavailable — falling back to polling', 'error');
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // Parse SSE events from buffer
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const event = JSON.parse(line.slice(6)) as {
+                type: string;
+                status?: string;
+                statusDetail?: string;
+                brandedUrl?: string;
+                errorMessage?: string;
+                check?: { name: string; label: string; status: string; detail: string; durationMs?: number };
+                deployment?: { status: string; statusDetail?: string; brandedUrl: string; errorMessage?: string; verificationResult?: typeof deployRecord extends null ? never : NonNullable<typeof deployRecord>['verificationResult'] };
+              };
+
+              if (event.type === 'status') {
+                setDeployRecord(prev => prev ? {
+                  ...prev,
+                  status: event.status ?? prev.status,
+                  statusDetail: event.statusDetail,
+                  errorMessage: event.errorMessage,
+                } : prev);
+
+                // Status label in chat
+                if (event.status === 'configuring_domain') {
+                  addStatus(`Domain provisioning: ${event.statusDetail ?? 'Waiting for DNS…'}`, 'applying');
+                } else if (event.status === 'verifying') {
+                  addStatus('Verifying live URL…', 'applying');
+                }
+              }
+
+              if (event.type === 'verification' && event.check) {
+                const vc = event.check;
+                setDeployVerificationChecks(prev => {
+                  const existing = prev.findIndex(c => c.name === vc.name);
+                  if (existing >= 0) {
+                    const next = [...prev];
+                    next[existing] = vc;
+                    return next;
+                  }
+                  return [...prev, vc];
+                });
+              }
+
+              if (event.type === 'complete' && event.deployment) {
+                const dep = event.deployment;
+                setDeployRecord(prev => prev ? { ...prev, ...dep } : prev);
+
+                if (dep.status === 'live') {
+                  addStatus(`Live: ${dep.brandedUrl}`, 'done');
+                  const vr = dep.verificationResult;
+                  const checkSummary = vr ? `\n\n**Verification:** ${vr.checks.filter((c: { status: string }) => c.status === 'pass').length}/${vr.checks.length} checks passed · HTTP ${vr.httpStatus ?? '200'} · ${Math.round(vr.totalDurationMs / 1000)}s total` : '';
+                  addMsg('assistant',
+                    `Your app is live at **[${dep.brandedUrl}](${dep.brandedUrl})**${checkSummary}\n\nTo connect a custom domain, click **Connect Domain** in the Deployments panel.`
+                  );
+                } else if (dep.status === 'failed') {
+                  addStatus(`Deployment failed: ${dep.errorMessage ?? 'Verification did not pass'}`, 'error');
+                  addMsg('assistant',
+                    `**Deployment verification failed**\n\n${dep.errorMessage ?? 'The app built successfully but the live URL verification did not pass.'}\n\nClick **⚡ Redeploy** to retry, or check the Deployments panel for details.`
+                  );
+                }
+              }
+
+              if (event.type === 'error') {
+                addStatus(`Watch error — ${event.statusDetail ?? 'stream closed'}`, 'error');
+              }
+            } catch { /* malformed SSE line */ }
+          }
+        }
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          addStatus('Deployment watch ended unexpectedly', 'error');
+        }
+      } finally {
+        setDeployPolling(false);
+      }
+    })();
+
+    // Return cleanup function (not used directly but good practice)
+    return () => controller.abort();
+  };
+
+  const handleAddCustomDomain = async () => {
+    if (!currentProject || !addDomainInput.trim() || addingDomain) return;
+    setAddingDomain(true);
+    try {
+      const res = await fetch('/api/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add-domain', projectId: currentProject.id, domain: addDomainInput.trim() }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error);
+      if (data.domain?.dnsRecords?.length > 0) {
+        setShowDnsInstructions(addDomainInput.trim());
+      }
+      setAddDomainInput('');
+      // Refresh record
+      const refreshRes = await fetch('/api/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'status', projectId: currentProject.id }),
+      });
+      const refreshData = await refreshRes.json();
+      if (refreshData.ok) setDeployRecord(refreshData.deployment);
+    } catch (err) {
+      addStatus(`Domain error: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    } finally {
+      setAddingDomain(false);
+    }
+  };
+
+  // ── AWS Platform Setup ─────────────────────────────────────────────────────
+
+  const checkAwsSetup = async () => {
+    try {
+      const res = await fetch('/api/aws-setup');
+      const data = await res.json();
+      if (data.ok) setAwsSetupStatus(data.status);
+    } catch { /* ignore */ }
+  };
+
+  const runAwsSetup = async () => {
+    if (awsSetupRunning) return;
+    setAwsSetupRunning(true);
+    setAwsSetupLogs([]);
+
+    try {
+      const res = await fetch('/api/aws-setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'run-setup' }),
+      });
+
+      if (!res.body) throw new Error('No response stream');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === 'progress') {
+              setAwsSetupLogs(prev => [...prev.slice(-49), `[${event.step}] ${event.detail ?? event.status}`]);
+            }
+            if (event.type === 'complete' && event.status) {
+              setAwsSetupStatus(event.status);
+              if (event.status.ready) {
+                addStatus('AWS Hosting ready — deployment is now fully automatic', 'done');
+              }
+            }
+            if (event.type === 'error') {
+              addStatus(`AWS Setup error: ${event.message}`, 'error');
+            }
+          } catch { /* malformed line */ }
+        }
+      }
+    } catch (err) {
+      addStatus(`Setup failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    } finally {
+      setAwsSetupRunning(false);
+      // Re-check final status
+      checkAwsSetup();
+    }
+  };
+
+  // ── Domain Management ──────────────────────────────────────────────────────
+
+  const loadDomainsData = async () => {
+    setDomainsLoading(true);
+    try {
+      const res = await fetch('/api/domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'list-all' }),
+      });
+      const data = await res.json();
+      if (data.ok) setDomainsData(data);
+    } catch { /* ignore */ } finally { setDomainsLoading(false); }
+  };
+
+  const handleDomainSearch = async () => {
+    if (!domainSearchQuery.trim() || domainSearching) return;
+    setDomainSearching(true);
+    setDomainSearchResults([]);
+    try {
+      const res = await fetch('/api/domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'search', query: domainSearchQuery.trim() }),
+      });
+      const data = await res.json();
+      if (data.ok) setDomainSearchResults(data.results ?? []);
+    } catch { addStatus('Domain search failed', 'error'); } finally { setDomainSearching(false); }
+  };
+
+  const handleDomainPurchase = async (domain: string) => {
+    if (domainPurchasing) return;
+    setDomainPurchasing(domain);
+    try {
+      const res = await fetch('/api/domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'purchase', domain, autoRenew: true }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setPurchaseSuccess(domain);
+        addStatus(`Purchased ${domain} — DNS configures automatically`, 'done');
+        addMsg('assistant', `**${domain} purchased successfully.**\n\nYour domain is being registered through AWS Route 53. It will be ready in a few minutes.\n\nOnce active, you can connect it to any project from the Domains panel.`);
+        setTimeout(loadDomainsData, 5000);
+      } else {
+        addStatus(`Purchase failed: ${data.error}`, 'error');
+      }
+    } catch (err) {
+      addStatus(`Purchase error: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    } finally { setDomainPurchasing(null); }
+  };
+
+  const handleConnectDomain = async () => {
+    if (!connectDomainInput.trim() || connectingDomain) return;
+    setConnectingDomain(true);
+    try {
+      const res = await fetch('/api/domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'connect-external',
+          domain: connectDomainInput.trim(),
+          projectId: currentProject?.id,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setConnectDomainInput('');
+        addStatus(`${connectDomainInput.trim()} connected`, 'done');
+        if (data.instructions) {
+          addMsg('assistant',
+            `**Domain connection started for ${connectDomainInput.trim()}**\n\n` +
+            `Add these DNS records at your registrar:\n\n` +
+            (data.instructions.dnsRecords ?? []).map((r: { type: string; name: string; value: string }) =>
+              `• **${r.type}** \`${r.name}\` → \`${r.value}\``
+            ).join('\n') +
+            `\n\nDNS changes propagate in 15 minutes to 48 hours.`
+          );
+        }
+        loadDomainsData();
+      } else {
+        addStatus(`Connect failed: ${data.error}`, 'error');
+      }
+    } catch (err) {
+      addStatus(`Connect error: ${String(err)}`, 'error');
+    } finally { setConnectingDomain(false); }
+  };
+
+  // Load existing deployment record when switching projects
+  const loadDeployRecord = async (projectId: string) => {
+    try {
+      const res = await fetch(`/api/deploy?projectId=${encodeURIComponent(projectId)}`);
+      const data = await res.json();
+      if (data.ok && data.deployment) setDeployRecord(data.deployment);
+      else setDeployRecord(null);
+    } catch { setDeployRecord(null); }
+  };
+
   const isBusy = loading || editApplying || phase === 'building' || makeSearchWorking;
 
   // ─── Render ───────────────────────────────────────────────────────────────
@@ -6112,406 +6682,1214 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
         @keyframes fadeup { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-      `}</style>
-      <div style={{ display: 'flex', height: '100vh', width: '100vw', background: '#0f172a', color: 'white', fontFamily: 'system-ui,-apple-system,sans-serif', overflow: 'hidden' }}>
+        @keyframes glow { 0%, 100% { box-shadow: 0 0 8px rgba(99,102,241,0.4); } 50% { box-shadow: 0 0 18px rgba(99,102,241,0.7); } }
+        @keyframes gradientShift { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+        @keyframes statusPing { 0% { transform: scale(1); opacity: 1; } 75% { transform: scale(2.2); opacity: 0; } 100% { transform: scale(1); opacity: 0; } }
 
-        {/* ── Sidebar ───────────────────────────────────────────────────── */}
-        <div style={{ width: '220px', minWidth: '220px', background: '#1e293b', borderRight: '1px solid #334155', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <div style={{ padding: '16px', borderBottom: '1px solid #334155' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-              <div style={{ fontSize: '14px', fontWeight: '700', color: '#f8fafc' }}>⚡ DWOMOH Vibe Code</div>
-              <a href="/dashboard" style={{ fontSize: '11px', color: '#64748b', textDecoration: 'none' }}>Dashboard</a>
-            </div>
-            <button onClick={handleNewProject} style={{ width: '100%', padding: '8px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', fontWeight: '500' }}>
-              + New Project
-            </button>
+        :root {
+          --ide-bg: #080c14;
+          --ide-surface: #0d1320;
+          --ide-surface-2: #111927;
+          --ide-border: rgba(255,255,255,0.06);
+          --ide-border-accent: rgba(99,102,241,0.35);
+          --ide-text: #e2e8f0;
+          --ide-text-muted: #64748b;
+          --ide-text-dim: #334155;
+          --ide-accent: #6366f1;
+          --ide-accent-2: #8b5cf6;
+          --ide-green: #22d3a0;
+          --ide-amber: #f59e0b;
+          --ide-red: #f87171;
+          --ide-blue: #3b82f6;
+          --sidebar-icon-w: 56px;
+          --sidebar-content-w: 220px;
+        }
+
+        /* Glassmorphism utility */
+        .glass {
+          background: rgba(13,19,32,0.82);
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+        }
+
+        /* Scrollbar premium styling */
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.25); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.5); }
+
+        /* IDE sidebar nav item */
+        .ide-nav-item {
+          width: 40px; height: 40px;
+          display: flex; align-items: center; justify-content: center;
+          border-radius: 10px; cursor: pointer;
+          transition: all 0.18s ease;
+          border: 1px solid transparent;
+          font-size: 17px;
+          color: var(--ide-text-muted);
+        }
+        .ide-nav-item:hover { background: rgba(99,102,241,0.12); color: var(--ide-text); border-color: var(--ide-border-accent); }
+        .ide-nav-item.active {
+          background: rgba(99,102,241,0.18);
+          color: #a5b4fc;
+          border-color: rgba(99,102,241,0.4);
+          box-shadow: 0 0 0 1px rgba(99,102,241,0.15), inset 0 1px 0 rgba(255,255,255,0.07);
+        }
+
+        /* Mode tab */
+        .mode-tab {
+          padding: 5px 14px; border-radius: 7px; cursor: pointer; border: none;
+          font-size: 12px; font-weight: 600; letter-spacing: 0.03em;
+          transition: all 0.18s ease; background: transparent; color: var(--ide-text-muted);
+        }
+        .mode-tab:hover { color: var(--ide-text); background: rgba(255,255,255,0.05); }
+        .mode-tab.active { background: rgba(99,102,241,0.18); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3) !important; }
+
+        /* Panel tab */
+        .panel-tab {
+          padding: 9px 14px; background: none; border: none; border-bottom: 2px solid transparent;
+          cursor: pointer; font-size: 11px; font-weight: 500; letter-spacing: 0.05em;
+          text-transform: uppercase; color: var(--ide-text-muted); transition: all 0.18s;
+          display: flex; align-items: center; gap: 6px; white-space: nowrap;
+        }
+        .panel-tab:hover { color: var(--ide-text); }
+        .panel-tab.active { color: #e2e8f0; border-bottom-color: var(--ide-accent); }
+
+        /* Premium card hover */
+        .project-card {
+          border-radius: 10px; padding: 11px 13px;
+          border: 1px solid var(--ide-border); cursor: pointer;
+          transition: all 0.18s ease; background: var(--ide-surface);
+          width: 100%; text-align: left;
+        }
+        .project-card:hover { border-color: rgba(99,102,241,0.3); background: rgba(99,102,241,0.07); }
+        .project-card.active { border-color: rgba(99,102,241,0.5); background: rgba(99,102,241,0.12); box-shadow: 0 0 0 1px rgba(99,102,241,0.1); }
+
+        /* Live indicator dot */
+        .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ide-green); display: inline-block; position: relative; }
+        .live-dot::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: var(--ide-green); animation: statusPing 1.5s ease-out infinite; }
+      `}</style>
+      <div style={{ display: 'flex', height: '100vh', width: '100vw', background: 'var(--ide-bg)', color: 'var(--ide-text)', fontFamily: '"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', overflow: 'hidden' }}>
+
+        {/* ── IDE Sidebar ────────────────────────────────────────────────── */}
+        {/* Icon Rail */}
+        <div style={{
+          width: 'var(--sidebar-icon-w)', minWidth: 'var(--sidebar-icon-w)',
+          background: 'var(--ide-surface)',
+          borderRight: '1px solid var(--ide-border)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          paddingTop: '0', zIndex: 10,
+        }}>
+          {/* Logo */}
+          <div style={{ width: '100%', height: '52px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderBottom: '1px solid var(--ide-border)' }}>
+            <div style={{
+              width: 30, height: 30,
+              background: 'linear-gradient(135deg,#6366f1,#8b5cf6)',
+              borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 14, fontWeight: 800, color: '#fff',
+              boxShadow: '0 0 16px rgba(99,102,241,0.4)',
+            }}>⚡</div>
           </div>
 
-          <div style={{ flex: 1, overflowY: 'auto', padding: '12px' }}>
-            {/* Active project details */}
-            {currentProject && (
-              <div style={{ marginBottom: '16px', padding: '10px', background: '#0f172a', borderRadius: '8px', border: '1px solid #1d4ed8' }}>
-                <div style={{ fontSize: '11px', color: '#60a5fa', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '6px' }}>Active Project</div>
-                <div style={{ fontSize: '13px', fontWeight: '600', color: '#e2e8f0', marginBottom: '2px' }}>{currentProject.name}</div>
-                {currentDiscovery && (
-                  <>
-                    <div style={{ fontSize: '11px', color: '#64748b', marginBottom: '6px' }}>{currentDiscovery.framework} · {currentDiscovery.fileCount} files</div>
-                    {currentDiscovery.pages.length > 0 && (
-                      <div style={{ marginBottom: '4px' }}>
-                        <span style={{ fontSize: '10px', color: '#475569', fontWeight: '600' }}>PAGES </span>
-                        <span style={{ fontSize: '11px', color: '#94a3b8' }}>
-                          {currentDiscovery.pages.map(p => p.replace('app/', '').replace('/page.tsx', '') || 'home').join(', ')}
-                        </span>
-                      </div>
-                    )}
-                    {currentDiscovery.components.length > 0 && (
-                      <div style={{ marginBottom: '4px' }}>
-                        <span style={{ fontSize: '10px', color: '#475569', fontWeight: '600' }}>COMPONENTS </span>
-                        <span style={{ fontSize: '11px', color: '#94a3b8' }}>
-                          {currentDiscovery.components.slice(0, 5).map(c => c.replace('components/', '').replace(/\.tsx?/, '')).join(', ')}
-                          {currentDiscovery.components.length > 5 ? ` +${currentDiscovery.components.length - 5}` : ''}
-                        </span>
-                      </div>
-                    )}
-                  </>
-                )}
-                {/* Mode badge */}
-                {currentDiscovery?.mode && (() => {
-                  const modeColors: Record<string, { bg: string; text: string }> = {
-                    'Static Demo':        { bg: '#3b1f00', text: '#fb923c' },
-                    'Frontend Only':      { bg: '#1e2a3b', text: '#93c5fd' },
-                    'Full-Stack App':     { bg: '#0f2818', text: '#4ade80' },
-                    'Production Ready App': { bg: '#1a0a2e', text: '#c084fc' },
-                  };
-                  const mc = modeColors[currentDiscovery.mode] || { bg: '#1e293b', text: '#94a3b8' };
-                  return (
-                    <div style={{ marginTop: '6px', padding: '3px 7px', background: mc.bg, border: `1px solid ${mc.text}44`, borderRadius: '4px', display: 'inline-block' }}>
-                      <span style={{ fontSize: '10px', color: mc.text, fontWeight: '600' }}>{currentDiscovery.mode}</span>
-                      {!currentDiscovery.hasApiRoutes && <span style={{ fontSize: '9px', color: '#f97316', marginLeft: '4px' }}>· no API</span>}
-                    </div>
-                  );
-                })()}
+          {/* Nav items */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: '10px 8px', width: '100%' }}>
+            {([
+              { id: 'projects', icon: '⬡', label: 'Projects' },
+              { id: 'builds',   icon: '⊞', label: 'Builds' },
+              { id: 'templates',icon: '⊟', label: 'Templates' },
+              { id: 'agents',   icon: '◈', label: 'Agents' },
+              { id: 'deployments', icon: '⊕', label: 'Deployments' },
+              { id: 'domains', icon: '🌐', label: 'Domains' },
+            ] as const).map(item => (
+              <button
+                key={item.id}
+                title={item.label}
+                className={`ide-nav-item${sidebarSection === item.id ? ' active' : ''}`}
+                onClick={() => {
+                  setSidebarSection(item.id);
+                  setSidebarCollapsed(false);
+                  if (item.id === 'domains') loadDomainsData();
+                }}
+                style={{ border: 'none' }}
+              >
+                {item.icon}
+              </button>
+            ))}
+          </div>
 
-                {currentMemory && (currentMemory.editsApplied || []).length > 0 && (
-                  <div style={{ fontSize: '10px', color: '#475569', marginTop: '4px' }}>
-                    {currentMemory.editsApplied.length} edit(s) applied
+          {/* Bottom: settings */}
+          <div style={{ padding: '8px', borderTop: '1px solid var(--ide-border)', width: '100%', display: 'flex', justifyContent: 'center' }}>
+            <button
+              title="Settings"
+              className={`ide-nav-item${sidebarSection === 'settings' ? ' active' : ''}`}
+              onClick={() => { setSidebarSection('settings'); setSidebarCollapsed(false); }}
+              style={{ border: 'none' }}
+            >⚙</button>
+          </div>
+        </div>
+
+        {/* Sidebar Content Panel */}
+        {!focusMode && !sidebarCollapsed && (
+        <div style={{
+          width: 'var(--sidebar-content-w)', minWidth: 'var(--sidebar-content-w)',
+          background: 'var(--ide-surface)',
+          borderRight: '1px solid var(--ide-border)',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          {/* Panel header */}
+          <div style={{
+            height: '52px', padding: '0 14px',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            borderBottom: '1px solid var(--ide-border)',
+          }}>
+            <span style={{ fontSize: '11px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+              {sidebarSection === 'projects' ? 'Projects'
+                : sidebarSection === 'builds' ? 'Recent Builds'
+                : sidebarSection === 'templates' ? 'Templates'
+                : sidebarSection === 'agents' ? 'Agents'
+                : sidebarSection === 'deployments' ? 'Deployments'
+                : sidebarSection === 'domains' ? '🌐 Domains'
+                : 'Settings'}
+            </span>
+            <button onClick={() => setSidebarCollapsed(true)} title="Collapse" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-dim)', fontSize: 16, lineHeight: 1, padding: 2 }}>‹</button>
+          </div>
+
+          <div style={{ flex: 1, overflowY: 'auto', padding: '10px' }}>
+
+            {/* ── PROJECTS section ── */}
+            {sidebarSection === 'projects' && (
+              <>
+                <button onClick={handleNewProject} style={{
+                  width: '100%', padding: '8px 10px', marginBottom: '10px',
+                  background: 'linear-gradient(135deg,rgba(99,102,241,0.85),rgba(139,92,246,0.85))',
+                  color: '#fff', border: '1px solid rgba(99,102,241,0.4)', borderRadius: '8px',
+                  cursor: 'pointer', fontSize: '12px', fontWeight: '700',
+                  display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'center',
+                  boxShadow: '0 2px 12px rgba(99,102,241,0.3)',
+                  transition: 'all 0.2s',
+                }}>
+                  <span>+</span> New Project
+                </button>
+
+                {/* Active project info */}
+                {currentProject && (
+                  <div style={{ marginBottom: '10px', padding: '10px', background: 'rgba(99,102,241,0.1)', borderRadius: '9px', border: '1px solid rgba(99,102,241,0.25)' }}>
+                    <div style={{ fontSize: '10px', color: '#a5b4fc', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>Active</div>
+                    <div style={{ fontSize: '12px', fontWeight: '700', color: '#e2e8f0', marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentProject.name}</div>
+                    {currentDiscovery && (
+                      <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)' }}>{currentDiscovery.framework} · {currentDiscovery.fileCount} files</div>
+                    )}
+                    {previewUrl && !scaffoldDetected && buildProgress?.step !== 'error' && (
+                      <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                        <span className="live-dot" />
+                        <span style={{ fontSize: '10px', color: 'var(--ide-green)', fontWeight: '600' }}>Live Preview</span>
+                      </div>
+                    )}
                   </div>
                 )}
-                {discoveryLoading && (
-                  <div style={{ fontSize: '11px', color: '#64748b', fontStyle: 'italic', marginTop: '4px' }}>Scanning…</div>
-                )}
-                {previewUrl && (
-                  <button onClick={() => setPreviewKey(k => k + 1)} style={{ marginTop: '8px', width: '100%', padding: '5px', background: '#1e3a5f', border: '1px solid #1d4ed8', borderRadius: '5px', color: '#60a5fa', cursor: 'pointer', fontSize: '11px' }}>
-                    ↺ Refresh Preview
-                  </button>
+
+                {/* Project list */}
+                {projects.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    {projects.slice(0, 12).map(p => {
+                      const isActive = p.id === currentProject?.id;
+                      return (
+                        <button
+                          key={p.id}
+                          className={`project-card${isActive ? ' active' : ''}`}
+                          onClick={() => handleOpenProject(p)}
+                        >
+                          <div style={{ fontSize: '11px', fontWeight: '600', color: isActive ? '#a5b4fc' : '#cbd5e1', marginBottom: '2px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+                          <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)' }}>{new Date(p.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
                 )}
 
-                {/* Make Search Work button — shown when no API routes exist */}
-                {currentDiscovery && !currentDiscovery.hasApiRoutes && !makeSearchWorking && (
-                  <button
-                    onClick={handleMakeSearchWork}
-                    disabled={isBusy}
-                    style={{ marginTop: '6px', width: '100%', padding: '5px 8px', background: '#14532d', border: '1px solid #16a34a', borderRadius: '5px', color: '#4ade80', cursor: isBusy ? 'not-allowed' : 'pointer', fontSize: '11px', fontWeight: '600' }}
-                  >
-                    ⚡ Make Search Work
-                  </button>
-                )}
-                {makeSearchWorking && (
-                  <div style={{ marginTop: '6px', fontSize: '11px', color: '#4ade80', fontStyle: 'italic' }}>Upgrading search…</div>
+                {projects.length === 0 && !currentProject && (
+                  <div style={{ padding: '16px 8px', textAlign: 'center' }}>
+                    <div style={{ fontSize: '28px', marginBottom: '8px' }}>◈</div>
+                    <div style={{ fontSize: '11px', color: 'var(--ide-text-muted)', lineHeight: 1.6 }}>No projects yet.<br />Describe what you want to build.</div>
+                    <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      {['Property marketplace', 'Music streaming app', 'Hotel booking platform', 'Mobile money app'].map(ex => (
+                        <button key={ex} onClick={() => { setInput(`Build a ${ex.toLowerCase()}`); inputRef.current?.focus(); }}
+                          style={{ textAlign: 'left', background: 'none', border: '1px solid transparent', borderRadius: '6px', padding: '5px 7px', cursor: 'pointer', fontSize: '10px', color: 'var(--ide-text-muted)', transition: 'all 0.12s', display: 'flex', alignItems: 'center', gap: '5px' }}
+                          onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(99,102,241,0.3)'; e.currentTarget.style.color = '#a5b4fc'; e.currentTarget.style.background = 'rgba(99,102,241,0.08)'; }}
+                          onMouseLeave={e => { e.currentTarget.style.borderColor = 'transparent'; e.currentTarget.style.color = 'var(--ide-text-muted)'; e.currentTarget.style.background = 'none'; }}
+                        >
+                          <span>⊞</span> {ex}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 )}
 
-                {/* Missing credentials panel */}
+                {/* Missing credentials */}
                 {(currentDiscovery?.missingCredentials || []).length > 0 && (
-                  <div style={{ marginTop: '8px', padding: '8px', background: '#2d1a00', border: '1px solid #92400e', borderRadius: '6px' }}>
-                    <div style={{ fontSize: '10px', color: '#fbbf24', fontWeight: '700', marginBottom: '6px' }}>⚠️ Setup Required</div>
+                  <div style={{ marginTop: '8px', padding: '8px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: '7px' }}>
+                    <div style={{ fontSize: '10px', color: 'var(--ide-amber)', fontWeight: '700', marginBottom: '6px' }}>⚠ Setup Required</div>
                     {(currentDiscovery!.missingCredentials || []).map(cred => (
                       <div key={cred.key} style={{ marginBottom: '6px' }}>
                         <div style={{ fontSize: '10px', color: '#d97706', marginBottom: '3px', wordBreak: 'break-all' }}>{cred.key}</div>
-                        <div style={{ display: 'flex', gap: '4px' }}>
-                          <input
-                            type="password"
-                            placeholder="paste value…"
-                            value={credentialInputs[cred.key] || ''}
-                            onChange={e => setCredentialInputs(prev => ({ ...prev, [cred.key]: e.target.value }))}
-                            style={{ flex: 1, padding: '4px 6px', background: '#1e293b', border: '1px solid #78350f', borderRadius: '4px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }}
-                          />
-                          <button
-                            onClick={() => handleSetCredential(cred.key)}
-                            disabled={!credentialInputs[cred.key] || credentialSaving === cred.key}
-                            style={{ padding: '4px 8px', background: '#78350f', border: '1px solid #92400e', borderRadius: '4px', color: '#fbbf24', cursor: 'pointer', fontSize: '10px', flexShrink: 0 }}
-                          >
+                        <div style={{ display: 'flex', gap: '3px' }}>
+                          <input type="password" placeholder="paste value…" value={credentialInputs[cred.key] || ''} onChange={e => setCredentialInputs(prev => ({ ...prev, [cred.key]: e.target.value }))}
+                            style={{ flex: 1, padding: '4px 6px', background: 'var(--ide-bg)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '4px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }} />
+                          <button onClick={() => handleSetCredential(cred.key)} disabled={!credentialInputs[cred.key] || credentialSaving === cred.key}
+                            style={{ padding: '4px 8px', background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '4px', color: 'var(--ide-amber)', cursor: 'pointer', fontSize: '10px', flexShrink: 0 }}>
                             {credentialSaving === cred.key ? '…' : 'Save'}
                           </button>
                         </div>
                       </div>
                     ))}
-                    <div style={{ fontSize: '9px', color: '#78350f', marginTop: '4px' }}>Saved to .env.local (never committed)</div>
                   </div>
                 )}
 
-                {/* ── File Manager ────────────────────────────────────── */}
-                <div style={{ marginTop: '8px', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                  <button
-                    onClick={() => setFileManagerOpen(o => !o)}
-                    style={{ width: '100%', textAlign: 'left', padding: '4px 0', background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', alignItems: 'center', gap: '4px' }}
-                  >
+                {/* File manager */}
+                <div style={{ marginTop: '8px', borderTop: '1px solid var(--ide-border)', paddingTop: '8px' }}>
+                  <button onClick={() => setFileManagerOpen(o => !o)}
+                    style={{ width: '100%', textAlign: 'left', padding: '4px 0', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-muted)', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', alignItems: 'center', gap: '4px' }}>
                     <span>{fileManagerOpen ? '▾' : '▸'}</span> Files
                   </button>
                   {fileManagerOpen && (
                     <div style={{ marginTop: '4px' }}>
-                      {/* New file input */}
                       <div style={{ display: 'flex', gap: '3px', marginBottom: '6px' }}>
-                        <input
-                          value={newFilePath}
-                          onChange={e => setNewFilePath(e.target.value)}
-                          placeholder="app/new-page/page.tsx"
-                          onKeyDown={e => { if (e.key === 'Enter') handleFileCreate(); }}
-                          style={{ flex: 1, padding: '3px 5px', background: '#0f172a', border: '1px solid #334155', borderRadius: '3px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }}
-                        />
-                        <button
-                          onClick={handleFileCreate}
-                          disabled={!newFilePath.trim() || newFileCreating}
-                          style={{ padding: '3px 6px', background: '#1e3a5f', border: '1px solid #2563eb', borderRadius: '3px', color: '#60a5fa', cursor: 'pointer', fontSize: '10px', flexShrink: 0 }}
-                        >+</button>
+                        <input value={newFilePath} onChange={e => setNewFilePath(e.target.value)} placeholder="app/page.tsx" onKeyDown={e => { if (e.key === 'Enter') handleFileCreate(); }}
+                          style={{ flex: 1, padding: '3px 5px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '3px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }} />
+                        <button onClick={handleFileCreate} disabled={!newFilePath.trim() || newFileCreating}
+                          style={{ padding: '3px 6px', background: 'rgba(99,102,241,0.15)', border: '1px solid var(--ide-border-accent)', borderRadius: '3px', color: '#a5b4fc', cursor: 'pointer', fontSize: '10px', flexShrink: 0 }}>+</button>
                       </div>
-                      {/* Pages */}
                       {(currentDiscovery?.pages || []).map(f => (
                         <div key={f} style={{ marginBottom: '2px' }}>
                           {fileRenaming === f ? (
                             <div style={{ display: 'flex', gap: '2px' }}>
-                              <input autoFocus value={fileRenameValue} onChange={e => setFileRenameValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleFileRename(f); if (e.key === 'Escape') setFileRenaming(null); }} style={{ flex: 1, padding: '2px 4px', background: '#0f172a', border: '1px solid #2563eb', borderRadius: '3px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }} />
-                              <button onClick={() => handleFileRename(f)} style={{ padding: '2px 5px', background: '#14532d', border: '1px solid #16a34a', borderRadius: '3px', color: '#4ade80', cursor: 'pointer', fontSize: '9px' }}>✓</button>
-                              <button onClick={() => setFileRenaming(null)} style={{ padding: '2px 5px', background: '#3b0000', border: '1px solid #7f1d1d', borderRadius: '3px', color: '#f87171', cursor: 'pointer', fontSize: '9px' }}>✕</button>
+                              <input autoFocus value={fileRenameValue} onChange={e => setFileRenameValue(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleFileRename(f); if (e.key === 'Escape') setFileRenaming(null); }}
+                                style={{ flex: 1, padding: '2px 4px', background: 'var(--ide-bg)', border: '1px solid var(--ide-accent)', borderRadius: '3px', color: '#e2e8f0', fontSize: '10px', minWidth: 0 }} />
+                              <button onClick={() => handleFileRename(f)} style={{ padding: '2px 5px', background: 'rgba(34,211,160,0.1)', border: '1px solid rgba(34,211,160,0.3)', borderRadius: '3px', color: 'var(--ide-green)', cursor: 'pointer', fontSize: '9px' }}>✓</button>
+                              <button onClick={() => setFileRenaming(null)} style={{ padding: '2px 5px', background: 'rgba(248,113,113,0.1)', border: '1px solid rgba(248,113,113,0.2)', borderRadius: '3px', color: 'var(--ide-red)', cursor: 'pointer', fontSize: '9px' }}>✕</button>
                             </div>
                           ) : (
                             <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
                               <span style={{ flex: 1, fontSize: '10px', color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f}>{f.replace('app/', '').replace('/page.tsx', '') || '/'}</span>
-                              <button onClick={() => { setFileRenaming(f); setFileRenameValue(f); }} title="Rename" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: '#475569', fontSize: '10px' }}>✎</button>
-                              <button onClick={() => handleFileDelete(f)} title="Delete" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: '#475569', fontSize: '10px' }}>✕</button>
+                              <button onClick={() => { setFileRenaming(f); setFileRenameValue(f); }} title="Rename" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-muted)', fontSize: '10px' }}>✎</button>
+                              <button onClick={() => handleFileDelete(f)} title="Delete" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-muted)', fontSize: '10px' }}>✕</button>
                             </div>
                           )}
                         </div>
                       ))}
-                      {/* Components */}
                       {(currentDiscovery?.components || []).slice(0, 8).map(f => (
                         <div key={f} style={{ display: 'flex', alignItems: 'center', gap: '2px', marginBottom: '2px' }}>
                           <span style={{ flex: 1, fontSize: '10px', color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={f}>{f.replace('components/', '').replace(/\.tsx?/, '')}</span>
-                          <button onClick={() => handleFileDelete(f)} title="Delete" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: '#475569', fontSize: '10px' }}>✕</button>
+                          <button onClick={() => handleFileDelete(f)} title="Delete" style={{ padding: '1px 4px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-muted)', fontSize: '10px' }}>✕</button>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
+              </>
+            )}
 
-                {/* ── Database Setup ───────────────────────────────────── */}
-                <div style={{ marginTop: '8px', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '6px' }}>Database</div>
-                  <select
-                    value={dbType}
-                    onChange={e => setDbType(e.target.value)}
-                    style={{ width: '100%', padding: '4px 6px', background: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#e2e8f0', fontSize: '11px', marginBottom: '4px' }}
+            {/* ── BUILDS section ── */}
+            {sidebarSection === 'builds' && (
+              <div>
+                {buildProgress ? (
+                  <div style={{ padding: '10px', background: phase === 'building' ? 'rgba(99,102,241,0.08)' : 'rgba(34,211,160,0.06)', borderRadius: '9px', border: `1px solid ${phase === 'building' ? 'rgba(99,102,241,0.25)' : 'rgba(34,211,160,0.2)'}` }}>
+                    <div style={{ fontSize: '10px', fontWeight: '700', color: phase === 'building' ? '#a5b4fc' : 'var(--ide-green)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      {phase === 'building' ? '⟳ Building…' : '✓ Last Build'}
+                    </div>
+                    <div style={{ fontSize: '12px', fontWeight: '600', color: '#e2e8f0', marginBottom: '4px' }}>{buildProgress.projectName || buildingProjectName || '—'}</div>
+                    <div style={{ fontSize: '11px', color: 'var(--ide-text-muted)', lineHeight: 1.5 }}>{buildProgress.message.replace(/^[^\s]+\s/, '').slice(0, 80)}</div>
+                  </div>
+                ) : (
+                  <div style={{ padding: '20px 8px', textAlign: 'center', color: 'var(--ide-text-dim)', fontSize: '11px' }}>No builds yet</div>
+                )}
+              </div>
+            )}
+
+            {/* ── TEMPLATES section ── */}
+            {sidebarSection === 'templates' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {[
+                  { icon: '🛒', name: 'E-Commerce Store', desc: 'Products, cart, Stripe checkout' },
+                  { icon: '🏨', name: 'Hotel Booking', desc: 'Rooms, calendar, reservations' },
+                  { icon: '📱', name: 'Mobile Money App', desc: 'Send, receive, transaction history' },
+                  { icon: '🎵', name: 'Music Platform', desc: 'Player, playlists, artist pages' },
+                  { icon: '🏠', name: 'Property Listing', desc: 'Listings, search, contact' },
+                  { icon: '📊', name: 'Analytics Dashboard', desc: 'Charts, metrics, reports' },
+                  { icon: '🤖', name: 'AI Chat App', desc: 'Chat UI, streaming, history' },
+                  { icon: '📚', name: 'Learning Platform', desc: 'Courses, progress, certificates' },
+                ].map(t => (
+                  <button key={t.name}
+                    onClick={() => { setInput(`Build a ${t.name.toLowerCase()}: ${t.desc}`); inputRef.current?.focus(); setSidebarSection('projects'); }}
+                    style={{ textAlign: 'left', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px', padding: '9px 10px', cursor: 'pointer', transition: 'all 0.16s', width: '100%' }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(99,102,241,0.35)'; e.currentTarget.style.background = 'rgba(99,102,241,0.08)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--ide-border)'; e.currentTarget.style.background = 'var(--ide-surface-2)'; }}
                   >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '2px' }}>
+                      <span style={{ fontSize: '14px' }}>{t.icon}</span>
+                      <span style={{ fontSize: '11px', fontWeight: '700', color: '#cbd5e1' }}>{t.name}</span>
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)', paddingLeft: '21px' }}>{t.desc}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* ── AGENTS section ── */}
+            {sidebarSection === 'agents' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                {[
+                  { name: 'Builder Agent', desc: 'Generates full-stack apps', status: 'active', color: 'var(--ide-green)' },
+                  { name: 'Repair Agent', desc: 'Fixes TypeScript & build errors', status: 'standby', color: 'var(--ide-amber)' },
+                  { name: 'Verifier Agent', desc: '18-point route & UI verification', status: 'standby', color: 'var(--ide-blue)' },
+                  { name: 'Flutter Agent', desc: 'Dart/Flutter mobile apps', status: 'standby', color: '#c084fc' },
+                ].map(agent => (
+                  <div key={agent.name} style={{ padding: '10px 11px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '3px' }}>
+                      <span style={{ fontSize: '11px', fontWeight: '700', color: '#e2e8f0' }}>{agent.name}</span>
+                      <span style={{ fontSize: '9px', fontWeight: '600', color: agent.color, background: `${agent.color}14`, border: `1px solid ${agent.color}33`, borderRadius: '4px', padding: '1px 5px' }}>{agent.status}</span>
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)' }}>{agent.desc}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── DEPLOYMENTS section ── */}
+            {sidebarSection === 'deployments' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {!currentProject ? (
+                  <div style={{ padding: '20px 8px', textAlign: 'center', color: 'var(--ide-text-dim)', fontSize: '11px' }}>Open a project first</div>
+                ) : !deployRecord ? (
+                  /* ── No deployment yet ── */
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>DWOMOH Hosting</div>
+                    <div style={{ padding: '10px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: '8px', fontSize: '10px', color: '#94a3b8', lineHeight: '1.5' }}>
+                      Deploy to AWS Amplify — your app goes live at<br />
+                      <span style={{ color: '#a5b4fc', fontWeight: '600' }}>{currentProject.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').slice(0, 30)}.dwomohvibe.com</span>
+                    </div>
+                    <button onClick={handleDeploy} disabled={deploying}
+                      style={{ padding: '10px', background: deploying ? 'rgba(99,102,241,0.15)' : 'rgba(99,102,241,0.25)', border: '1px solid rgba(99,102,241,0.5)', borderRadius: '8px', cursor: deploying ? 'not-allowed' : 'pointer', color: '#c7d2fe', fontSize: '12px', fontWeight: '700', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                      {deploying ? <><span>◌</span> Starting…</> : '⚡ Deploy Now'}
+                    </button>
+                    <div style={{ fontSize: '10px', color: 'var(--ide-text-dim)', textAlign: 'center' }}>AWS Amplify · ACM SSL · Route 53 DNS · CloudFront CDN</div>
+                  </div>
+                ) : (
+                  /* ── Active / completed deployment ── */
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+
+                    {/* ── Status header ── */}
+                    {(() => {
+                      const s = deployRecord.status;
+                      const isLive    = s === 'live';
+                      const isFailed  = s === 'failed';
+                      const isActive  = !isLive && !isFailed;
+                      const dotColor  = isLive ? '#22d3ee' : isFailed ? '#f87171' : '#facc15';
+                      const label     = isLive ? 'Live'
+                        : isFailed ? 'Failed'
+                        : s === 'building' ? 'Building…'
+                        : s === 'configuring_domain' ? 'Configuring DNS…'
+                        : s === 'verifying' ? 'Verifying…'
+                        : 'Deploying…';
+                      return (
+                        <div style={{ padding: '10px 12px', background: isLive ? 'rgba(34,211,238,0.07)' : isFailed ? 'rgba(248,113,113,0.07)' : 'rgba(250,204,21,0.06)', border: `1px solid ${isLive ? 'rgba(34,211,238,0.25)' : isFailed ? 'rgba(248,113,113,0.25)' : 'rgba(250,204,21,0.2)'}`, borderRadius: '10px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '5px' }}>
+                            <div style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: dotColor, boxShadow: isLive ? `0 0 8px ${dotColor}` : 'none' }} />
+                            <span style={{ fontSize: '12px', fontWeight: '800', color: dotColor, letterSpacing: '0.04em' }}>{label}</span>
+                            {isActive && deployPolling && <span style={{ fontSize: '9px', color: '#64748b' }}>· watching…</span>}
+                          </div>
+                          {deployRecord.statusDetail && (
+                            <div style={{ fontSize: '9px', color: '#94a3b8', marginBottom: '4px', lineHeight: '1.4' }}>{deployRecord.statusDetail}</div>
+                          )}
+                          {/* Branded URL — always shown */}
+                          <a href={deployRecord.brandedUrl} target="_blank" rel="noopener noreferrer"
+                            style={{ fontSize: '11px', color: isLive ? '#22d3ee' : '#94a3b8', textDecoration: 'none', fontWeight: '700', wordBreak: 'break-all', display: 'block', marginTop: '2px' }}>
+                            {deployRecord.brandedUrl.replace('https://', '')} ↗
+                          </a>
+                          {/* Verification summary when live */}
+                          {isLive && deployRecord.verificationResult && (
+                            <div style={{ marginTop: '6px', display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                              <span style={{ fontSize: '9px', color: '#6ee7b7', fontWeight: '600' }}>
+                                HTTP {deployRecord.verificationResult.httpStatus ?? 200}
+                              </span>
+                              {deployRecord.verificationResult.pageTitle && (
+                                <span style={{ fontSize: '9px', color: '#94a3b8' }}>
+                                  · &quot;{deployRecord.verificationResult.pageTitle.slice(0, 30)}&quot;
+                                </span>
+                              )}
+                              <span style={{ fontSize: '9px', color: '#64748b' }}>
+                                · {Math.round((deployRecord.verificationResult.totalDurationMs ?? 0) / 1000)}s
+                              </span>
+                            </div>
+                          )}
+                          {/* Error message when failed */}
+                          {isFailed && deployRecord.errorMessage && (
+                            <div style={{ marginTop: '5px', fontSize: '9px', color: '#fca5a5', lineHeight: '1.4' }}>
+                              {deployRecord.errorMessage.slice(0, 120)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* ── Verification checklist (live during verifying, final when complete) ── */}
+                    {(deployVerificationChecks.length > 0 || deployRecord.verificationResult?.checks?.length) && (() => {
+                      const checks = deployRecord.verificationResult?.checks ?? deployVerificationChecks;
+                      return (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>
+                            Live Verification
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                            {checks.map((vc, i) => {
+                              const isPending = !deployRecord.verificationResult && vc.status === 'warning';
+                              const isPass    = vc.status === 'pass';
+                              const isFail    = vc.status === 'fail';
+                              const icon      = isPass ? '✓' : isFail ? '✗' : isPending ? '⟳' : '○';
+                              const color     = isPass ? '#6ee7b7' : isFail ? '#f87171' : isPending ? '#fde68a' : '#64748b';
+                              return (
+                                <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: '6px', padding: '4px 6px', background: isPass ? 'rgba(34,211,160,0.04)' : isFail ? 'rgba(248,113,113,0.04)' : 'transparent', borderRadius: '5px' }}>
+                                  <span style={{ fontSize: '9px', color, fontWeight: '700', flexShrink: 0, marginTop: '1px', width: '10px' }}>{icon}</span>
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: '10px', color: isPass ? '#cbd5e1' : isFail ? '#fca5a5' : '#94a3b8', fontWeight: '600' }}>{vc.label}</div>
+                                    <div style={{ fontSize: '9px', color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '160px' }}>{vc.detail}</div>
+                                  </div>
+                                  {vc.durationMs && isPass && (
+                                    <span style={{ fontSize: '8px', color: '#475569', flexShrink: 0 }}>{vc.durationMs < 1000 ? `${vc.durationMs}ms` : `${(vc.durationMs / 1000).toFixed(1)}s`}</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {/* ── Re-deploy / Re-verify buttons ── */}
+                    <div style={{ display: 'flex', gap: '5px' }}>
+                      <button onClick={handleDeploy}
+                        disabled={deploying || deployPolling}
+                        style={{ flex: 1, padding: '7px', background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.3)', borderRadius: '7px', cursor: (deploying || deployPolling) ? 'not-allowed' : 'pointer', color: '#a5b4fc', fontSize: '10px', fontWeight: '700' }}>
+                        {deploying ? '◌ Starting…' : '↻ Redeploy'}
+                      </button>
+                      {(deployRecord.status === 'failed' || deployRecord.status === 'live') && (
+                        <button
+                          onClick={() => {
+                            if (!currentProject) return;
+                            setDeployVerificationChecks([]);
+                            watchDeployment(currentProject.id, deployRecord.brandedUrl);
+                          }}
+                          disabled={deployPolling}
+                          style={{ flex: 1, padding: '7px', background: 'rgba(34,211,160,0.08)', border: '1px solid rgba(34,211,160,0.2)', borderRadius: '7px', cursor: deployPolling ? 'not-allowed' : 'pointer', color: '#6ee7b7', fontSize: '10px', fontWeight: '700' }}>
+                          {deployPolling ? '⟳ Checking…' : '✓ Re-verify'}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Custom domain section */}
+                    <div style={{ paddingTop: '8px', borderTop: '1px solid var(--ide-border)' }}>
+                      <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '8px' }}>Custom Domains</div>
+
+                      {/* Existing custom domains */}
+                      {(deployRecord.customDomains ?? []).map((cd) => (
+                        <div key={cd.domain} style={{ padding: '8px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '7px', marginBottom: '6px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: cd.dnsRecords?.length ? '6px' : 0 }}>
+                            <span style={{ fontSize: '11px', color: '#cbd5e1', fontWeight: '600' }}>{cd.domain}</span>
+                            <span style={{ fontSize: '9px', padding: '2px 6px', borderRadius: '4px', background: cd.status === 'active' ? 'rgba(34,211,160,0.15)' : cd.status === 'failed' ? 'rgba(248,113,113,0.15)' : 'rgba(250,204,21,0.15)', color: cd.status === 'active' ? '#6ee7b7' : cd.status === 'failed' ? '#fca5a5' : '#fde68a', fontWeight: '700' }}>
+                              {cd.status === 'active' ? 'Active' : cd.status === 'failed' ? 'Failed' : 'Pending DNS'}
+                            </span>
+                          </div>
+                          {cd.status !== 'active' && cd.dnsRecords && cd.dnsRecords.length > 0 && (
+                            <button
+                              onClick={() => setShowDnsInstructions(showDnsInstructions === cd.domain ? null : cd.domain)}
+                              style={{ fontSize: '10px', color: '#facc15', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                              {showDnsInstructions === cd.domain ? '▲ Hide DNS records' : '▼ Show DNS records'}
+                            </button>
+                          )}
+                          {showDnsInstructions === cd.domain && cd.dnsRecords && (
+                            <div style={{ marginTop: '6px', padding: '6px', background: 'rgba(0,0,0,0.2)', borderRadius: '5px' }}>
+                              <div style={{ fontSize: '9px', color: 'var(--ide-text-dim)', marginBottom: '4px' }}>Add these records to your DNS registrar:</div>
+                              {cd.dnsRecords.map((r, i) => (
+                                <div key={i} style={{ fontSize: '9px', marginBottom: '3px', fontFamily: 'monospace', color: '#94a3b8' }}>
+                                  <span style={{ color: '#a5b4fc' }}>{r.type}</span> {r.name} → {r.value}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+
+                      {/* Add domain input */}
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <input
+                          value={addDomainInput}
+                          onChange={e => setAddDomainInput(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && handleAddCustomDomain()}
+                          placeholder="e.g. phonecarmarket.com"
+                          style={{ flex: 1, padding: '6px 8px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '6px', color: '#e2e8f0', fontSize: '10px', outline: 'none' }}
+                        />
+                        <button
+                          onClick={handleAddCustomDomain}
+                          disabled={addingDomain || !addDomainInput.trim()}
+                          style={{ padding: '6px 10px', background: 'rgba(99,102,241,0.2)', border: '1px solid rgba(99,102,241,0.35)', borderRadius: '6px', color: '#a5b4fc', fontSize: '10px', fontWeight: '700', cursor: 'pointer' }}>
+                          {addingDomain ? '…' : '+'}
+                        </button>
+                      </div>
+                      <div style={{ fontSize: '9px', color: 'var(--ide-text-dim)', marginTop: '4px' }}>
+                        SSL certificate auto-provisioned by AWS
+                      </div>
+                    </div>
+
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── DOMAINS section ── */}
+            {sidebarSection === 'domains' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0', height: '100%', overflow: 'hidden' }}>
+
+                {/* Tab Bar */}
+                <div style={{ display: 'flex', borderBottom: '1px solid var(--ide-border)', background: 'var(--ide-surface)', flexShrink: 0 }}>
+                  {([
+                    { id: 'overview', label: 'Overview' },
+                    { id: 'buy',      label: 'Buy Domain' },
+                    { id: 'connect',  label: 'Connect' },
+                  ] as const).map(tab => (
+                    <button key={tab.id} onClick={() => setDomainsTab(tab.id)}
+                      style={{ flex: 1, padding: '9px 4px', background: 'none', border: 'none', borderBottom: `2px solid ${domainsTab === tab.id ? '#6366f1' : 'transparent'}`, cursor: 'pointer', fontSize: '10px', fontWeight: '600', color: domainsTab === tab.id ? '#a5b4fc' : 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', transition: 'all 0.15s' }}>
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div style={{ flex: 1, overflowY: 'auto', padding: '12px 10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+
+                  {/* ── OVERVIEW TAB ── */}
+                  {domainsTab === 'overview' && (
+                    <>
+                      {/* Refresh + timestamp */}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: '9px', color: 'var(--ide-text-dim)' }}>
+                          {awsSetupStatus?.checkedAt ? `Updated ${new Date(awsSetupStatus.checkedAt).toLocaleTimeString()}` : 'Loading…'}
+                        </span>
+                        <button onClick={() => { checkAwsSetup(); loadDomainsData(); }}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-dim)', fontSize: '12px', padding: '2px 4px' }} title="Refresh all">↻</button>
+                      </div>
+
+                      {/* ── Platform Domain Header ── */}
+                      <div style={{ padding: '10px 12px', background: 'linear-gradient(135deg, rgba(99,102,241,0.14), rgba(139,92,246,0.08))', border: '1px solid rgba(99,102,241,0.35)', borderRadius: '10px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                          <div>
+                            <div style={{ fontSize: '13px', fontWeight: '800', color: '#e2e8f0', letterSpacing: '-0.3px' }}>dwomohvibe.com</div>
+                            <div style={{ fontSize: '9px', color: '#7c8db0', marginTop: '1px' }}>DWOMOH Vibe Code Platform</div>
+                          </div>
+                          <span style={{ fontSize: '9px', padding: '3px 8px', borderRadius: '5px',
+                            background: awsSetupStatus?.ready ? 'rgba(34,211,160,0.15)' : 'rgba(250,204,21,0.1)',
+                            color: awsSetupStatus?.ready ? '#6ee7b7' : '#fde68a',
+                            fontWeight: '700', border: `1px solid ${awsSetupStatus?.ready ? 'rgba(34,211,160,0.3)' : 'rgba(250,204,21,0.2)'}` }}>
+                            {awsSetupStatus?.ready ? 'All Systems Go' : awsSetupStatus ? 'Configuring…' : 'Checking…'}
+                          </span>
+                        </div>
+                        <a href="https://dwomohvibe.com" target="_blank" rel="noopener noreferrer"
+                          style={{ fontSize: '10px', color: '#818cf8', textDecoration: 'none', fontWeight: '600', display: 'block', marginBottom: '8px' }}>
+                          https://dwomohvibe.com ↗
+                        </a>
+                        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                          {[
+                            { label: 'SSL', ok: awsSetupStatus?.certificate?.status === 'ISSUED', pending: awsSetupStatus?.certificate?.status === 'PENDING_VALIDATION' },
+                            { label: 'DNS', ok: !!awsSetupStatus?.hostedZone, pending: false },
+                            { label: 'CDN', ok: awsSetupStatus?.amplifyDomainVerified, pending: awsSetupStatus?.amplifyDomain?.status === 'AWAITING_APP_CNAME' || awsSetupStatus?.amplifyDomain?.status === 'CREATING' },
+                            { label: 'IAM', ok: !!awsSetupStatus?.iamRole, pending: false },
+                          ].map(item => (
+                            <span key={item.label} style={{ fontSize: '9px', padding: '2px 7px', borderRadius: '4px', fontWeight: '700',
+                              background: item.ok ? 'rgba(34,211,160,0.12)' : item.pending ? 'rgba(250,204,21,0.1)' : 'rgba(248,113,113,0.1)',
+                              color: item.ok ? '#6ee7b7' : item.pending ? '#fde68a' : '#f87171',
+                              border: `1px solid ${item.ok ? 'rgba(34,211,160,0.25)' : item.pending ? 'rgba(250,204,21,0.2)' : 'rgba(248,113,113,0.2)'}` }}>
+                              {item.ok ? '✓' : item.pending ? '⟳' : '○'} {item.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* ── Status Cards Grid ── */}
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+
+                        {/* SSL Status */}
+                        {(() => {
+                          const cert = awsSetupStatus?.certificate;
+                          const isIssued = cert?.status === 'ISSUED';
+                          const isPending = cert?.status === 'PENDING_VALIDATION';
+                          return (
+                            <div style={{ padding: '8px 10px', background: isIssued ? 'rgba(34,211,160,0.06)' : isPending ? 'rgba(250,204,21,0.06)' : 'rgba(99,102,241,0.06)', border: `1px solid ${isIssued ? 'rgba(34,211,160,0.2)' : isPending ? 'rgba(250,204,21,0.2)' : 'var(--ide-border)'}`, borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: isIssued ? '#6ee7b7' : isPending ? '#fde68a' : '#94a3b8', marginBottom: '4px' }}>SSL Status</div>
+                              <div style={{ fontSize: '11px', fontWeight: '700', color: isIssued ? '#6ee7b7' : isPending ? '#fde68a' : '#f87171' }}>
+                                {isIssued ? '✓ ISSUED' : isPending ? '⟳ Validating' : cert ? cert.status : '—'}
+                              </div>
+                              {cert?.expiresAt && (
+                                <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>
+                                  Expires {new Date(cert.expiresAt).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}
+                                </div>
+                              )}
+                              {isIssued && (
+                                <div style={{ fontSize: '8px', color: '#6ee7b7', marginTop: '2px' }}>ACM Wildcard *.dwomohvibe.com</div>
+                              )}
+                            </div>
+                          );
+                        })()}
+
+                        {/* DNS Status */}
+                        {(() => {
+                          const hz = awsSetupStatus?.hostedZone;
+                          return (
+                            <div style={{ padding: '8px 10px', background: hz ? 'rgba(34,211,160,0.06)' : 'rgba(99,102,241,0.06)', border: `1px solid ${hz ? 'rgba(34,211,160,0.2)' : 'var(--ide-border)'}`, borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: hz ? '#6ee7b7' : '#94a3b8', marginBottom: '4px' }}>DNS Status</div>
+                              <div style={{ fontSize: '11px', fontWeight: '700', color: hz ? '#6ee7b7' : '#94a3b8' }}>
+                                {hz ? '✓ Active' : '—'}
+                              </div>
+                              {hz && (
+                                <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>
+                                  {hz.recordCount ?? '?'} records · {(hz.nameservers ?? []).length} NS
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+
+                        {/* Hosted Zone */}
+                        {(() => {
+                          const hz = awsSetupStatus?.hostedZone;
+                          return (
+                            <div style={{ padding: '8px 10px', background: hz ? 'rgba(99,102,241,0.06)' : 'rgba(99,102,241,0.03)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '4px' }}>Hosted Zone</div>
+                              <div style={{ fontSize: '10px', fontWeight: '700', color: hz ? '#a5b4fc' : '#64748b', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {hz ? hz.id : '—'}
+                              </div>
+                              <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>Route 53 · us-east-1</div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* ACM Status */}
+                        {(() => {
+                          const cert = awsSetupStatus?.certificate;
+                          return (
+                            <div style={{ padding: '8px 10px', background: 'rgba(99,102,241,0.06)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: '#94a3b8', marginBottom: '4px' }}>ACM Cert</div>
+                              <div style={{ fontSize: '10px', fontWeight: '700', color: cert?.status === 'ISSUED' ? '#6ee7b7' : '#f59e0b', fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {cert ? cert.arn.split('/').pop()?.slice(0, 8) + '…' : '—'}
+                              </div>
+                              <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>ACM · us-east-1</div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* Deployment / Amplify Status */}
+                        {(() => {
+                          const ad = awsSetupStatus?.amplifyDomain;
+                          const statusColor = ad?.verified ? '#6ee7b7' : ad ? '#fde68a' : '#94a3b8';
+                          const statusText = ad?.verified ? '✓ Verified' : ad ? `⟳ ${ad.status}` : '—';
+                          return (
+                            <div style={{ padding: '8px 10px', background: ad?.verified ? 'rgba(34,211,160,0.06)' : 'rgba(250,204,21,0.04)', border: `1px solid ${ad?.verified ? 'rgba(34,211,160,0.2)' : 'rgba(250,204,21,0.15)'}`, borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: statusColor, marginBottom: '4px' }}>Deployment</div>
+                              <div style={{ fontSize: '10px', fontWeight: '700', color: statusColor }}>{statusText}</div>
+                              <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>AWS Amplify Hosting</div>
+                            </div>
+                          );
+                        })()}
+
+                        {/* Live URL */}
+                        {(() => {
+                          const liveProject = currentProject && deployRecord?.status === 'live';
+                          return (
+                            <div style={{ padding: '8px 10px', background: liveProject ? 'rgba(34,211,160,0.06)' : 'rgba(99,102,241,0.03)', border: `1px solid ${liveProject ? 'rgba(34,211,160,0.2)' : 'var(--ide-border)'}`, borderRadius: '8px' }}>
+                              <div style={{ fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', color: liveProject ? '#6ee7b7' : '#94a3b8', marginBottom: '4px' }}>Live URL</div>
+                              {liveProject ? (
+                                <a href={deployRecord!.brandedUrl} target="_blank" rel="noopener noreferrer"
+                                  style={{ fontSize: '9px', color: '#22d3ee', textDecoration: 'none', fontWeight: '700', display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {(deployRecord!.brandedUrl ?? '').replace('https://', '')} ↗
+                                </a>
+                              ) : (
+                                <div style={{ fontSize: '9px', color: '#64748b' }}>Deploy a project</div>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </div>
+
+                      {/* ── Nameservers ── */}
+                      {(awsSetupStatus?.hostedZone?.nameservers ?? []).length > 0 && (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>Route 53 Nameservers</div>
+                          <div style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                            {(awsSetupStatus!.hostedZone!.nameservers!).map((ns, i) => (
+                              <div key={i} style={{ fontSize: '9px', fontFamily: 'monospace', color: '#94a3b8', marginBottom: i < 3 ? '2px' : 0 }}>{ns}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* ── ACM Domains Covered ── */}
+                      {(awsSetupStatus?.certificate?.domains ?? []).length > 0 && (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>SSL Certificate Covers</div>
+                          <div style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                            {(awsSetupStatus!.certificate!.domains!).map((d, i) => (
+                              <div key={i} style={{ fontSize: '9px', fontFamily: 'monospace', color: '#6ee7b7', marginBottom: i < awsSetupStatus!.certificate!.domains!.length - 1 ? '2px' : 0 }}>✓ {d}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* ── CloudFront Distribution ── */}
+                      {awsSetupStatus?.amplifyDomain?.cfDistribution && (
+                        <div style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                          <div style={{ fontSize: '9px', fontWeight: '700', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '3px' }}>CloudFront Distribution</div>
+                          <div style={{ fontSize: '9px', fontFamily: 'monospace', color: '#818cf8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {awsSetupStatus.amplifyDomain.cfDistribution}
+                          </div>
+                          <div style={{ fontSize: '8px', color: '#64748b', marginTop: '2px' }}>Powers all *.dwomohvibe.com subdomains</div>
+                        </div>
+                      )}
+
+                      {/* ── Project Subdomains ── */}
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Project URLs</div>
+                          <button onClick={loadDomainsData} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ide-text-dim)', fontSize: '11px' }} title="Refresh">↻</button>
+                        </div>
+                        {domainsLoading ? (
+                          <div style={{ fontSize: '10px', color: 'var(--ide-text-dim)', textAlign: 'center', padding: '12px' }}>Loading…</div>
+                        ) : (domainsData?.projectDomains ?? []).length === 0 ? (
+                          <div style={{ padding: '10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px', fontSize: '10px', color: 'var(--ide-text-dim)', textAlign: 'center', lineHeight: '1.5' }}>
+                            No deployed projects yet.<br />Deploy a project to get a {`{slug}`}.dwomohvibe.com URL.
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                            {(domainsData?.projectDomains ?? []).slice(0, 8).map((pd: { domain: string; status: string; brandedUrl: string; projectName: string }, i: number) => (
+                              <div key={i} style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2px' }}>
+                                  <span style={{ fontSize: '10px', fontWeight: '600', color: '#cbd5e1', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '130px' }}>{pd.domain}</span>
+                                  <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                    <span style={{ fontSize: '9px', color: pd.status === 'live' ? '#6ee7b7' : pd.status === 'failed' ? '#f87171' : '#fde68a', fontWeight: '700' }}>
+                                      {pd.status === 'live' ? '✓' : pd.status === 'failed' ? '✗' : '◌'}
+                                    </span>
+                                    {pd.status === 'live' && (
+                                      <a href={pd.brandedUrl} target="_blank" rel="noopener noreferrer"
+                                        style={{ fontSize: '9px', color: '#6366f1', textDecoration: 'none', fontWeight: '600' }}>↗</a>
+                                    )}
+                                  </div>
+                                </div>
+                                <div style={{ fontSize: '9px', color: 'var(--ide-text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{pd.projectName}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* ── Registered Domains ── */}
+                      {(domainsData?.registered ?? []).length > 0 && (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>Registered in Route 53</div>
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                            {(domainsData!.registered as Array<{ domain: string }>).map((rd, i) => (
+                              <div key={i} style={{ padding: '7px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '7px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                <span style={{ fontSize: '10px', color: '#e2e8f0', fontWeight: '600' }}>{rd.domain}</span>
+                                <span style={{ fontSize: '9px', color: '#6ee7b7' }}>✓ Owned</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* ── DNS Records ── */}
+                      {(awsSetupStatus?.dnsRecords ?? []).length > 0 && (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '5px' }}>
+                            DNS Records ({(awsSetupStatus!.dnsRecords!).length})
+                          </div>
+                          <div style={{ maxHeight: '140px', overflowY: 'auto', padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                            {(awsSetupStatus!.dnsRecords!).map((r, i) => (
+                              <div key={i} style={{ display: 'flex', gap: '6px', marginBottom: '3px', fontSize: '8px', fontFamily: 'monospace' }}>
+                                <span style={{ color: '#a5b4fc', width: '32px', flexShrink: 0 }}>{r.type}</span>
+                                <span style={{ color: '#94a3b8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '80px' }}>{r.name.replace('dwomohvibe.com', '~')}</span>
+                                <span style={{ color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{r.value.slice(0, 30)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* ── BUY DOMAIN TAB ── */}
+                  {domainsTab === 'buy' && (
+                    <>
+                      <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)', lineHeight: '1.5' }}>
+                        Search and purchase domains through AWS Route 53. They auto-connect to DWOMOH Vibe Code hosting.
+                      </div>
+
+                      {/* Search input */}
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <input
+                          value={domainSearchQuery}
+                          onChange={e => setDomainSearchQuery(e.target.value)}
+                          onKeyDown={e => e.key === 'Enter' && handleDomainSearch()}
+                          placeholder="Search: store, hotel, myapp…"
+                          style={{ flex: 1, padding: '8px 10px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '7px', color: '#e2e8f0', fontSize: '11px', outline: 'none' }}
+                        />
+                        <button
+                          onClick={handleDomainSearch}
+                          disabled={domainSearching || !domainSearchQuery.trim()}
+                          style={{ padding: '8px 12px', background: 'rgba(99,102,241,0.2)', border: '1px solid rgba(99,102,241,0.4)', borderRadius: '7px', cursor: 'pointer', color: '#a5b4fc', fontSize: '11px', fontWeight: '700' }}>
+                          {domainSearching ? '…' : '⌕'}
+                        </button>
+                      </div>
+
+                      {/* Purchase success banner */}
+                      {purchaseSuccess && (
+                        <div style={{ padding: '10px', background: 'rgba(34,211,160,0.1)', border: '1px solid rgba(34,211,160,0.3)', borderRadius: '8px', fontSize: '10px', color: '#6ee7b7', lineHeight: '1.5' }}>
+                          ✓ <strong>{purchaseSuccess}</strong> registration started — usually ready in 5–15 minutes.
+                        </div>
+                      )}
+
+                      {/* Search results */}
+                      {domainSearching && (
+                        <div style={{ fontSize: '10px', color: 'var(--ide-text-dim)', textAlign: 'center', padding: '12px' }}>Checking availability…</div>
+                      )}
+
+                      {domainSearchResults.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          {domainSearchResults.map((r, i) => (
+                            <div key={i} style={{ padding: '8px 10px', background: r.available ? 'rgba(34,211,160,0.04)' : 'rgba(255,255,255,0.02)', border: `1px solid ${r.available ? 'rgba(34,211,160,0.2)' : 'var(--ide-border)'}`, borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px' }}>
+                              <div>
+                                <div style={{ fontSize: '11px', fontWeight: '600', color: r.available ? '#e2e8f0' : '#64748b' }}>{r.domain}</div>
+                                {r.price != null && (
+                                  <div style={{ fontSize: '9px', color: r.available ? '#6ee7b7' : 'var(--ide-text-dim)', marginTop: '1px' }}>
+                                    {r.available ? `$${r.price.toFixed(0)}/yr` : 'Taken'}
+                                  </div>
+                                )}
+                              </div>
+                              {r.available ? (
+                                <button
+                                  onClick={() => handleDomainPurchase(r.domain)}
+                                  disabled={domainPurchasing === r.domain}
+                                  style={{ padding: '5px 10px', background: 'rgba(34,211,160,0.15)', border: '1px solid rgba(34,211,160,0.35)', borderRadius: '6px', cursor: 'pointer', color: '#6ee7b7', fontSize: '10px', fontWeight: '700', flexShrink: 0 }}>
+                                  {domainPurchasing === r.domain ? '…' : 'Buy'}
+                                </button>
+                              ) : (
+                                <span style={{ fontSize: '9px', color: '#64748b', flexShrink: 0 }}>Taken</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Popular TLDs info */}
+                      {domainSearchResults.length === 0 && !domainSearching && (
+                        <div style={{ padding: '10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px', fontSize: '10px', color: '#64748b', lineHeight: '1.6' }}>
+                          Search checks availability across .com, .net, .org, .io, .co, .app, .dev, .store, .online, .site
+                          <div style={{ marginTop: '6px', color: '#94a3b8' }}>Domains are purchased through AWS Route 53 and auto-configured with SSL + DNS.</div>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {/* ── CONNECT TAB ── */}
+                  {domainsTab === 'connect' && (
+                    <>
+                      <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)', lineHeight: '1.5' }}>
+                        Connect a domain you already own (from any registrar) to your project.
+                      </div>
+
+                      {/* Domain input */}
+                      <div>
+                        <div style={{ fontSize: '10px', color: '#94a3b8', marginBottom: '5px', fontWeight: '600' }}>
+                          {currentProject ? `Connect to: ${currentProject.name}` : 'Connect to a project'}
+                        </div>
+                        <div style={{ display: 'flex', gap: '4px' }}>
+                          <input
+                            value={connectDomainInput}
+                            onChange={e => setConnectDomainInput(e.target.value)}
+                            onKeyDown={e => e.key === 'Enter' && handleConnectDomain()}
+                            placeholder="yourapp.com"
+                            style={{ flex: 1, padding: '8px 10px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '7px', color: '#e2e8f0', fontSize: '11px', outline: 'none' }}
+                          />
+                          <button
+                            onClick={handleConnectDomain}
+                            disabled={connectingDomain || !connectDomainInput.trim()}
+                            style={{ padding: '8px 12px', background: 'rgba(99,102,241,0.2)', border: '1px solid rgba(99,102,241,0.4)', borderRadius: '7px', cursor: 'pointer', color: '#a5b4fc', fontSize: '11px', fontWeight: '700' }}>
+                            {connectingDomain ? '…' : '+'}
+                          </button>
+                        </div>
+                        {!currentProject && (
+                          <div style={{ fontSize: '9px', color: '#f59e0b', marginTop: '4px' }}>Open a project first to connect a domain to it</div>
+                        )}
+                      </div>
+
+                      {/* How it works */}
+                      <div style={{ padding: '10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px' }}>
+                        <div style={{ fontSize: '10px', fontWeight: '700', color: '#cbd5e1', marginBottom: '6px' }}>How it works</div>
+                        {[
+                          'Enter your domain name above',
+                          'We generate the CNAME records you need',
+                          'Add them at your registrar (GoDaddy, Namecheap, etc.)',
+                          'SSL certificate provisions automatically (AWS ACM)',
+                          'Domain goes live within 15–60 minutes',
+                        ].map((step, i) => (
+                          <div key={i} style={{ display: 'flex', gap: '7px', marginBottom: '4px', fontSize: '10px', color: '#94a3b8' }}>
+                            <span style={{ color: '#6366f1', fontWeight: '700', flexShrink: 0 }}>{i + 1}.</span>
+                            <span>{step}</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Current project custom domains */}
+                      {deployRecord && (deployRecord.customDomains ?? []).length > 0 && (
+                        <div>
+                          <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>Connected Domains</div>
+                          {deployRecord.customDomains.map((cd, i) => (
+                            <div key={i} style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '8px', marginBottom: '4px' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <span style={{ fontSize: '11px', color: '#e2e8f0', fontWeight: '600' }}>{cd.domain}</span>
+                                <span style={{ fontSize: '9px', padding: '2px 6px', borderRadius: '4px', background: cd.status === 'active' ? 'rgba(34,211,160,0.12)' : 'rgba(250,204,21,0.1)', color: cd.status === 'active' ? '#6ee7b7' : '#fde68a', fontWeight: '700' }}>
+                                  {cd.status === 'active' ? 'Active' : 'Pending DNS'}
+                                </span>
+                              </div>
+                              {cd.dnsRecords && cd.dnsRecords.length > 0 && cd.status !== 'active' && (
+                                <div style={{ marginTop: '6px', padding: '6px', background: 'rgba(0,0,0,0.2)', borderRadius: '5px' }}>
+                                  <div style={{ fontSize: '9px', color: 'var(--ide-text-dim)', marginBottom: '3px' }}>Add at your registrar:</div>
+                                  {cd.dnsRecords.map((r: { type: string; name: string; value: string }, ri: number) => (
+                                    <div key={ri} style={{ fontSize: '9px', fontFamily: 'monospace', color: '#94a3b8', marginBottom: '2px' }}>
+                                      <span style={{ color: '#a5b4fc' }}>{r.type}</span> {r.name.split('.')[0]} → {r.value.slice(0, 30)}…
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                </div>
+              </div>
+            )}
+
+            {/* ── SETTINGS section ── */}
+            {sidebarSection === 'settings' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+
+                {/* ── AWS Platform Setup ── */}
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>AWS Hosting Setup</div>
+                    {awsSetupStatus?.ready && (
+                      <span style={{ fontSize: '9px', padding: '2px 6px', borderRadius: '4px', background: 'rgba(34,211,160,0.12)', color: '#6ee7b7', fontWeight: '700' }}>Ready</span>
+                    )}
+                  </div>
+
+                  {/* Step list */}
+                  {awsSetupStatus ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '8px' }}>
+                      {awsSetupStatus.steps.map((step: AwsSetupStep) => (
+                        <div key={step.id} style={{ display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                          <span style={{ fontSize: '10px', marginTop: '1px', flexShrink: 0,
+                            color: step.status === 'done' ? '#6ee7b7'
+                              : step.status === 'error' ? '#f87171'
+                              : step.status === 'running' ? '#facc15'
+                              : step.status === 'skipped' ? '#64748b'
+                              : '#64748b' }}>
+                            {step.status === 'done' ? '✓' : step.status === 'error' ? '✗' : step.status === 'running' ? '◌' : step.status === 'skipped' ? '–' : '○'}
+                          </span>
+                          <div>
+                            <div style={{ fontSize: '10px', color: step.status === 'done' ? '#cbd5e1' : step.status === 'error' ? '#fca5a5' : '#94a3b8' }}>{step.label}</div>
+                            {step.detail && <div style={{ fontSize: '9px', color: 'var(--ide-text-dim)', marginTop: '1px', wordBreak: 'break-all' }}>{step.detail}</div>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '10px', color: 'var(--ide-text-dim)', marginBottom: '8px', lineHeight: '1.5' }}>
+                      Configure AWS hosting so every project automatically gets a branded URL like <span style={{ color: '#a5b4fc' }}>yourapp.dwomohvibe.app</span>
+                    </div>
+                  )}
+
+                  {/* Setup logs */}
+                  {awsSetupLogs.length > 0 && (
+                    <div style={{ maxHeight: '80px', overflowY: 'auto', marginBottom: '6px', padding: '6px', background: 'rgba(0,0,0,0.3)', borderRadius: '5px' }}>
+                      {awsSetupLogs.map((log, i) => (
+                        <div key={i} style={{ fontSize: '9px', color: '#64748b', fontFamily: 'monospace', lineHeight: '1.4' }}>{log}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    <button
+                      onClick={runAwsSetup}
+                      disabled={awsSetupRunning}
+                      style={{ flex: 1, padding: '8px', background: awsSetupStatus?.ready ? 'rgba(34,211,160,0.1)' : 'rgba(99,102,241,0.18)', border: `1px solid ${awsSetupStatus?.ready ? 'rgba(34,211,160,0.3)' : 'rgba(99,102,241,0.4)'}`, borderRadius: '7px', cursor: awsSetupRunning ? 'not-allowed' : 'pointer', color: awsSetupStatus?.ready ? '#6ee7b7' : '#a5b4fc', fontSize: '11px', fontWeight: '700', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '5px' }}>
+                      {awsSetupRunning
+                        ? <><span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>◌</span> Configuring AWS…</>
+                        : awsSetupStatus?.ready ? '✓ Re-run Setup' : 'Run AWS Setup'}
+                    </button>
+                    <button
+                      onClick={checkAwsSetup}
+                      disabled={awsSetupRunning}
+                      style={{ padding: '8px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '7px', cursor: 'pointer', color: 'var(--ide-text-muted)', fontSize: '11px' }}
+                      title="Refresh status">
+                      ↻
+                    </button>
+                  </div>
+
+                  {!awsSetupStatus?.hostedZone && (
+                    <div style={{ marginTop: '8px', padding: '8px', background: 'rgba(250,204,21,0.06)', border: '1px solid rgba(250,204,21,0.2)', borderRadius: '7px', fontSize: '10px', color: '#fde68a', lineHeight: '1.5' }}>
+                      First: Purchase <strong>dwomohvibe.app</strong> in AWS Route 53 (Registered domains), then click Run AWS Setup — everything configures automatically.
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ borderTop: '1px solid var(--ide-border)', paddingTop: '10px' }}>
+                  <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>Auth</div>
+                  <select value={authProvider} onChange={e => setAuthProvider(e.target.value as typeof authProvider)}
+                    style={{ width: '100%', padding: '6px 8px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '6px', color: '#e2e8f0', fontSize: '11px', marginBottom: '6px' }}>
+                    <option value="nextauth">NextAuth.js</option>
+                    <option value="clerk">Clerk</option>
+                    <option value="supabase">Supabase Auth</option>
+                    <option value="firebase">Firebase Auth</option>
+                    <option value="cognito">AWS Cognito</option>
+                  </select>
+                  {currentProject && (
+                    <button onClick={handleAuthScaffold} disabled={authScaffolding || isBusy}
+                      style={{ width: '100%', padding: '7px', background: 'rgba(99,102,241,0.15)', border: '1px solid var(--ide-border-accent)', borderRadius: '6px', color: '#a5b4fc', cursor: 'pointer', fontSize: '11px', fontWeight: '600' }}>
+                      {authScaffolding ? 'Scaffolding…' : 'Add Auth'}
+                    </button>
+                  )}
+                </div>
+                <div>
+                  <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>Database</div>
+                  <select value={dbType} onChange={e => setDbType(e.target.value)}
+                    style={{ width: '100%', padding: '6px 8px', background: 'var(--ide-bg)', border: '1px solid var(--ide-border-accent)', borderRadius: '6px', color: '#e2e8f0', fontSize: '11px' }}>
                     <option value="supabase">Supabase</option>
                     <option value="postgresql">PostgreSQL</option>
                     <option value="dynamodb">DynamoDB</option>
                     <option value="firebase">Firebase</option>
                   </select>
-                  <input
-                    value={dbResource}
-                    onChange={e => setDbResource(e.target.value)}
-                    placeholder={`resource name (e.g. properties)`}
-                    style={{ width: '100%', padding: '4px 6px', background: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#e2e8f0', fontSize: '11px', marginBottom: '4px', boxSizing: 'border-box' }}
-                  />
-                  <button
-                    onClick={handleDbScaffold}
-                    disabled={dbScaffolding || isBusy}
-                    style={{ width: '100%', padding: '5px', background: '#1e3a5f', border: '1px solid #1d4ed8', borderRadius: '4px', color: '#60a5fa', cursor: dbScaffolding ? 'not-allowed' : 'pointer', fontSize: '11px', fontWeight: '600' }}
-                  >
-                    {dbScaffolding ? 'Scaffolding…' : '+ Add Database'}
-                  </button>
                 </div>
-
-                {/* ── Deploy ───────────────────────────────────────────── */}
-                <div style={{ marginTop: '8px', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '6px' }}>Deploy</div>
-                  <select
-                    value={deployTarget}
-                    onChange={e => setDeployTarget(e.target.value)}
-                    style={{ width: '100%', padding: '4px 6px', background: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#e2e8f0', fontSize: '11px', marginBottom: '4px' }}
-                  >
-                    <option value="vercel">Vercel</option>
-                    <option value="netlify">Netlify</option>
-                    <option value="amplify">AWS Amplify</option>
-                  </select>
-                  <button
-                    onClick={handleDeployPrepare}
-                    disabled={deployPreparing || isBusy}
-                    style={{ width: '100%', padding: '5px', background: '#1a0a2e', border: '1px solid #7c3aed', borderRadius: '4px', color: '#c084fc', cursor: deployPreparing ? 'not-allowed' : 'pointer', fontSize: '11px', fontWeight: '600' }}
-                  >
-                    {deployPreparing ? 'Preparing…' : '🚀 Prepare Deploy'}
-                  </button>
-                </div>
-
-                {/* ── Auth ─────────────────────────────────────────────── */}
-                <div style={{ marginTop: '8px', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '6px' }}>Authentication</div>
-                  <select
-                    value={authProvider}
-                    onChange={e => setAuthProvider(e.target.value)}
-                    style={{ width: '100%', padding: '4px 6px', background: '#0f172a', border: '1px solid #334155', borderRadius: '4px', color: '#e2e8f0', fontSize: '11px', marginBottom: '4px' }}
-                  >
-                    <option value="nextauth">NextAuth.js</option>
-                    <option value="supabase">Supabase Auth</option>
-                    <option value="clerk">Clerk</option>
-                    <option value="jwt">Custom JWT</option>
-                  </select>
-                  <div style={{ fontSize: '9px', color: '#475569', marginBottom: '6px', lineHeight: '1.4' }}>
-                    {authProvider === 'nextauth' && 'Credentials + OAuth providers. Needs NEXTAUTH_SECRET.'}
-                    {authProvider === 'supabase' && 'Uses existing Supabase project. Email + OAuth.'}
-                    {authProvider === 'clerk' && 'Managed auth UI. Needs Clerk account (free tier).'}
-                    {authProvider === 'jwt' && 'Stateless JWT in httpOnly cookies. No external service.'}
-                  </div>
-                  <button
-                    onClick={handleAuthScaffold}
-                    disabled={authScaffolding || isBusy}
-                    style={{ width: '100%', padding: '5px', background: '#1e2a3b', border: '1px solid #0ea5e9', borderRadius: '4px', color: '#38bdf8', cursor: authScaffolding ? 'not-allowed' : 'pointer', fontSize: '11px', fontWeight: '600' }}
-                  >
-                    {authScaffolding ? 'Scaffolding…' : '🔐 Add Authentication'}
-                  </button>
-                </div>
-
-                {/* ── Memory Panel ─────────────────────────────────────── */}
-                {currentMemory && (
-                  <div style={{ marginTop: '8px', borderTop: '1px solid #1e293b', paddingTop: '8px' }}>
-                    <button
-                      onClick={() => setMemoryPanelOpen(o => !o)}
-                      style={{ width: '100%', textAlign: 'left', padding: '4px 0', background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '10px', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'flex', alignItems: 'center', gap: '4px' }}
-                    >
-                      <span>{memoryPanelOpen ? '▾' : '▸'}</span> Memory
+                <div>
+                  <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--ide-text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: '6px' }}>Voice</div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <span style={{ fontSize: '11px', color: '#94a3b8' }}>AI voice replies</span>
+                    <button onClick={() => setVoiceEnabled(v => !v)}
+                      style={{ padding: '4px 10px', background: voiceEnabled ? 'rgba(34,211,160,0.15)' : 'rgba(255,255,255,0.04)', border: `1px solid ${voiceEnabled ? 'rgba(34,211,160,0.35)' : 'var(--ide-border)'}`, borderRadius: '6px', color: voiceEnabled ? 'var(--ide-green)' : 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '10px', fontWeight: '600' }}>
+                      {voiceEnabled ? 'On' : 'Off'}
                     </button>
-                    {memoryPanelOpen && (
-                      <div style={{ marginTop: '4px', fontSize: '10px', color: '#475569', lineHeight: '1.7' }}>
-                        <div>💬 {(currentMemory.conversationHistory || []).length} conversation turns</div>
-                        <div>✏️ {(currentMemory.editsApplied || []).length} edits applied</div>
-                        {currentMemory.authProvider && <div>🔐 Auth: {currentMemory.authProvider}</div>}
-                        {(currentMemory.dbIntegrations || []).length > 0 && <div>🗄 DB: {currentMemory.dbIntegrations!.join(', ')}</div>}
-                        {(currentMemory.deployConfigs || []).length > 0 && <div>🚀 Deploy: {currentMemory.deployConfigs!.join(', ')}</div>}
-                        {(currentMemory.verificationHistory || []).length > 0 && (() => {
-                          const last = currentMemory.verificationHistory![currentMemory.verificationHistory!.length - 1];
-                          return <div>{last.verified ? '✅' : '⚠️'} Last verify: {last.passedCount}/{last.totalCount} checks</div>;
-                        })()}
-                        {(currentMemory.browserSessions || []).length > 0 && (() => {
-                          const last = currentMemory.browserSessions![currentMemory.browserSessions!.length - 1];
-                          return <div>🔍 Last debug: {last.errorCount} errors, {last.requestCount} API calls</div>;
-                        })()}
-                        {(currentMemory.fileOperations || []).length > 0 && <div>📁 {currentMemory.fileOperations!.length} file op(s)</div>}
-                        {currentMemory.lastOpenedAt && (
-                          <div style={{ color: '#334155', marginTop: '2px' }}>
-                            Opened: {new Date(currentMemory.lastOpenedAt).toLocaleDateString()}
-                          </div>
-                        )}
-                        <button
-                          onClick={handleClearMemory}
-                          style={{ marginTop: '6px', width: '100%', padding: '4px', background: '#1e0000', border: '1px solid #7f1d1d', borderRadius: '4px', color: '#f87171', cursor: 'pointer', fontSize: '10px' }}
-                        >
-                          🗑 Clear Memory
-                        </button>
-                      </div>
-                    )}
                   </div>
-                )}
-
+                </div>
+                <div style={{ paddingTop: '8px', borderTop: '1px solid var(--ide-border)' }}>
+                  <a href="/" style={{ fontSize: '11px', color: 'var(--ide-text-muted)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '5px' }}>← Back to home</a>
+                </div>
               </div>
             )}
 
-            {/* Project list */}
-            {projects.length > 0 && (
-              <>
-                <div style={{ fontSize: '11px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '8px', fontWeight: '600' }}>
-                  {currentProject ? 'All Projects' : 'Recent Projects'}
-                </div>
-                {projects.map(p => (
-                  <div key={p.id} style={{ marginBottom: '5px', opacity: discoveryLoading && currentProject?.id !== p.id ? 0.5 : 1 }}>
-                    <button
-                      onClick={() => handleOpenProject(p)}
-                      disabled={discoveryLoading}
-                      style={{
-                        width: '100%', textAlign: 'left', padding: '8px 10px',
-                        background: currentProject?.id === p.id ? '#1e3a5f' : 'transparent',
-                        border: `1px solid ${currentProject?.id === p.id ? '#2563eb' : '#334155'}`,
-                        borderRadius: '6px 6px 0 0', cursor: discoveryLoading ? 'not-allowed' : 'pointer',
-                        color: '#e2e8f0', fontSize: '12px', borderBottom: 'none',
-                      }}
-                    >
-                      <div style={{ fontWeight: '500', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: '2px' }}>{p.name}</div>
-                      <div style={{ color: '#64748b', fontSize: '11px' }}>{p.filesCount} files</div>
-                    </button>
-                    <div style={{ display: 'flex', border: `1px solid ${currentProject?.id === p.id ? '#2563eb' : '#334155'}`, borderRadius: '0 0 6px 6px', overflow: 'hidden', borderTop: '1px solid #0f172a' }}>
-                      <button
-                        onClick={() => handleOpenProject(p)}
-                        title="Open and prepare for deployment"
-                        style={{ flex: 1, padding: '5px 0', background: 'rgba(124,58,237,0.08)', border: 'none', borderRight: '1px solid #1e293b', color: '#c084fc', cursor: 'pointer', fontSize: '10px', fontWeight: '600' }}
-                      >
-                        🚀 Deploy
-                      </button>
-                      <button
-                        onClick={() => handleOpenProject(p)}
-                        title="Open to connect a custom domain"
-                        style={{ flex: 1, padding: '5px 0', background: 'rgba(29,78,216,0.08)', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: '10px', fontWeight: '600' }}
-                      >
-                        🌐 Domain
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </>
-            )}
-
-            {projects.length === 0 && !currentProject && (
-              <div style={{ fontSize: '12px', color: '#64748b', lineHeight: '1.8', marginTop: '8px' }}>
-                <p style={{ marginBottom: '10px' }}>No projects yet.</p>
-                {['A hotel booking app', 'An e-commerce store', 'A task manager', 'A recipe finder'].map(ex => (
-                  <p key={ex} onClick={() => { setInput(ex); inputRef.current?.focus(); }} style={{ color: '#475569', cursor: 'pointer', marginBottom: '4px' }}>
-                    → {ex}
-                  </p>
-                ))}
-              </div>
-            )}
           </div>
 
-          <div style={{ padding: '12px', borderTop: '1px solid #334155', fontSize: '11px', color: '#475569' }}>
+          {/* Sidebar footer */}
+          <div style={{ padding: '10px 12px', borderTop: '1px solid var(--ide-border)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div style={{ width: 24, height: 24, borderRadius: '50%', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px', fontWeight: '700', color: '#fff', flexShrink: 0 }}>BD</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: '11px', fontWeight: '600', color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Bright Dwomoh</div>
+              <div style={{ fontSize: '10px', color: 'var(--ide-text-muted)' }}>AWS Bedrock</div>
+            </div>
             {lastVerification && (
-              <div style={{ marginBottom: '8px', padding: '6px 8px', background: lastVerification.verified ? '#052e16' : '#2d1a00', border: `1px solid ${lastVerification.verified ? '#16a34a' : '#92400e'}`, borderRadius: '6px' }}>
-                <div style={{ fontSize: '10px', fontWeight: '700', color: lastVerification.verified ? '#4ade80' : '#fbbf24', marginBottom: '3px' }}>
-                  {lastVerification.verified ? '✅ Verified' : '⚠️ Verification Issues'}
-                </div>
-                {lastVerification.checks?.slice(0, 4).map((c, i) => (
-                  <div key={i} style={{ fontSize: '10px', color: c.passed ? '#4ade80' : '#f87171', lineHeight: '1.6' }}>
-                    {c.passed ? '✓' : '✗'} {c.name.replace('API: GET ', '').replace('Main page (GET /)', 'Page')}
-                    {c.recordCount !== undefined ? ` (${c.recordCount})` : ''}
-                  </div>
-                ))}
-              </div>
+              <div style={{ width: 8, height: 8, borderRadius: '50%', background: lastVerification.verified ? 'var(--ide-green)' : 'var(--ide-amber)', flexShrink: 0 }} title={lastVerification.verified ? 'Last verification passed' : 'Verification issues'} />
             )}
-            <p>AI Engineering Teammate</p>
-            <p>Powered by AWS Bedrock</p>
           </div>
         </div>
+        )}
 
-        {/* ── Chat Panel ────────────────────────────────────────────────── */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, borderRight: '1px solid #334155' }}>
-          {/* Edit mode indicator */}
-          {currentProject && (
-            <div style={{ padding: '8px 16px', background: '#1e3a5f', borderBottom: '1px solid #1d4ed8', fontSize: '12px', color: '#93c5fd', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <span>✏️ Edit Mode —</span>
-              <span style={{ fontWeight: '600' }}>{currentProject.name}</span>
-              {currentDiscovery?.mode && (
-                <span style={{ padding: '1px 6px', borderRadius: '3px', background: '#0f2818', border: '1px solid #16a34a33', color: '#4ade80', fontSize: '10px', fontWeight: '600' }}>
-                  {currentDiscovery.mode}
-                </span>
-              )}
-              {currentDiscovery && !currentDiscovery.hasApiRoutes && (
-                <span style={{ padding: '1px 6px', borderRadius: '3px', background: '#2d1a00', border: '1px solid #92400e', color: '#fbbf24', fontSize: '10px' }}>
-                  client-side only
-                </span>
-              )}
-              {previewUrl && !scaffoldDetected && buildProgress?.step !== 'error' && <span style={{ color: '#4ade80', fontSize: '11px' }}>● Live</span>}
-              {scaffoldDetected && <span style={{ color: '#f59e0b', fontSize: '11px' }}>⚠ Re-generating</span>}
-              <span style={{ padding: '1px 6px', borderRadius: '3px', background: '#0c1a2e', border: '1px solid #1e3a5f', color: '#4ade80', fontSize: '10px' }}>
-                Memory Active
-              </span>
-              {previewUrl && (
-                <div style={{ marginLeft: 'auto', display: 'flex', gap: '4px', flexShrink: 0 }}>
-                  <button onClick={handleBrowserScreenshot} disabled={browserDebugging || isBusy} title="Capture full-page screenshot" style={{ padding: '2px 8px', background: '#1a2744', border: '1px solid #2563eb', borderRadius: '4px', color: '#93c5fd', cursor: 'pointer', fontSize: '11px' }}>
-                    {browserDebugging ? '…' : '📷 Screenshot'}
-                  </button>
-                  <button onClick={handleBrowserDebug} disabled={browserDebugging || isBusy} title="Inspect console, network, errors" style={{ padding: '2px 8px', background: '#1a2744', border: '1px solid #2563eb', borderRadius: '4px', color: '#93c5fd', cursor: 'pointer', fontSize: '11px' }}>
-                    {browserDebugging ? '…' : '🔍 Debug'}
-                  </button>
-                </div>
-              )}
+        {/* Collapsed sidebar expand button */}
+        {(focusMode || sidebarCollapsed) && (
+          <button onClick={() => { setSidebarCollapsed(false); setFocusMode(false); }} title="Expand sidebar"
+            style={{ position: 'fixed', top: '26px', left: 'calc(var(--sidebar-icon-w) + 8px)', zIndex: 30, background: 'var(--ide-surface)', border: '1px solid var(--ide-border-accent)', borderRadius: '6px', padding: '4px 8px', cursor: 'pointer', color: '#a5b4fc', fontSize: '11px', fontWeight: '600' }}>
+            › Panel
+          </button>
+        )}
+
+
+        {/* ── Chat Panel ─────────────────────────────────────────────── */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, borderRight: '1px solid var(--ide-border)' }}>
+
+          {/* ── Top Header Bar ── */}
+          <div style={{
+            height: '52px', padding: '0 16px',
+            display: 'flex', alignItems: 'center', gap: '12px',
+            borderBottom: '1px solid var(--ide-border)',
+            background: 'var(--ide-surface)',
+            flexShrink: 0,
+          }}>
+            {/* Mode tabs */}
+            <div style={{ display: 'flex', gap: '4px', background: 'var(--ide-bg)', borderRadius: '9px', padding: '3px', border: '1px solid var(--ide-border)' }}>
+              {(['build', 'debug', 'deploy'] as const).map(mode => (
+                <button key={mode} className={`mode-tab${builderMode === mode ? ' active' : ''}`}
+                  onClick={() => setBuilderMode(mode)}
+                  style={{ border: builderMode === mode ? '1px solid rgba(99,102,241,0.3)' : '1px solid transparent' }}
+                >
+                  {mode === 'build' ? '⬡ Build' : mode === 'debug' ? '◈ Debug' : '⊕ Deploy'}
+                </button>
+              ))}
             </div>
-          )}
+
+            {/* Project context */}
+            {currentProject && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: 1, minWidth: 0 }}>
+                <span style={{ fontSize: '11px', color: 'var(--ide-text-muted)' }}>›</span>
+                <span style={{ fontSize: '12px', fontWeight: '600', color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentProject.name}</span>
+                {currentDiscovery?.mode && (
+                  <span style={{ padding: '1px 6px', borderRadius: '4px', background: 'rgba(34,211,160,0.08)', border: '1px solid rgba(34,211,160,0.2)', color: 'var(--ide-green)', fontSize: '9px', fontWeight: '700', textTransform: 'uppercase', flexShrink: 0 }}>
+                    {currentDiscovery.mode}
+                  </span>
+                )}
+                {previewUrl && !scaffoldDetected && buildProgress?.step !== 'error' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
+                    <span className="live-dot" />
+                    <span style={{ fontSize: '10px', color: 'var(--ide-green)', fontWeight: '600' }}>Live</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {!currentProject && phase === 'building' && (
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                <span style={{ fontSize: '11px', color: 'var(--ide-text-muted)' }}>›</span>
+                <span style={{ fontSize: '12px', fontWeight: '600', color: '#a5b4fc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{buildingProjectName || builderContext?.projectName || 'Building…'}</span>
+                <div style={{ display: 'inline-block', width: 14, height: 14, border: '2px solid rgba(99,102,241,0.3)', borderTop: '2px solid #6366f1', borderRadius: '50%', animation: 'spin 0.8s linear infinite', flexShrink: 0 }} />
+              </div>
+            )}
+
+            {!currentProject && phase !== 'building' && <div style={{ flex: 1 }} />}
+
+            {/* Right controls */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+              {previewUrl && (
+                <>
+                  <button onClick={handleBrowserScreenshot} disabled={browserDebugging || isBusy} title="Screenshot"
+                    style={{ padding: '5px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '6px', color: 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '11px', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    {browserDebugging ? '…' : '📷'}
+                  </button>
+                  <button onClick={handleBrowserDebug} disabled={browserDebugging || isBusy} title="Debug console"
+                    style={{ padding: '5px 10px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '6px', color: 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '11px', fontWeight: '500' }}>
+                    {browserDebugging ? '…' : '⬡'}
+                  </button>
+                </>
+              )}
+              <button onClick={() => setFocusMode(f => !f)} title={focusMode ? 'Exit focus mode' : 'Focus mode — maximise workspace'}
+                style={{ padding: '5px 10px', background: focusMode ? 'rgba(99,102,241,0.15)' : 'var(--ide-surface-2)', border: `1px solid ${focusMode ? 'rgba(99,102,241,0.4)' : 'var(--ide-border)'}`, borderRadius: '6px', color: focusMode ? '#a5b4fc' : 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '11px', fontWeight: '600' }}>
+                {focusMode ? '⊞ Focus' : '⊟'}
+              </button>
+            </div>
+          </div>
 
           {/* Builder Mode Indicator — shows current pipeline stage */}
           {builderContext?.active && !currentProject && (() => {
@@ -6528,9 +7906,9 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             ];
 
             return (
-              <div style={{ padding: '5px 16px', background: '#070f1a', borderBottom: '1px solid #1a2e45', display: 'flex', alignItems: 'center', gap: '0', overflow: 'hidden' }}>
+              <div style={{ padding: '5px 16px', background: 'var(--ide-surface)', borderBottom: '1px solid var(--ide-border)', display: 'flex', alignItems: 'center', gap: '0', overflow: 'hidden' }}>
                 {/* Project name */}
-                <span style={{ color: '#93c5fd', fontWeight: '700', fontSize: '10px', marginRight: '12px', flexShrink: 0, maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <span style={{ color: '#a5b4fc', fontWeight: '700', fontSize: '10px', marginRight: '12px', flexShrink: 0, maxWidth: '120px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {builderContext.projectName}
                 </span>
 
@@ -6569,7 +7947,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           })()}
 
           {/* Messages */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '20px' }}>
+          <div style={{ flex: 1, overflowY: 'auto', padding: '20px', background: 'var(--ide-bg)' }}>
             {displayed.map((msg, idx) => {
               const isLast = idx === displayed.length - 1;
               if (msg.role === 'status') {
@@ -6586,8 +7964,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                   {/* Assistant label row */}
                   {msg.role === 'assistant' && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-                      <div style={{ width: '26px', height: '26px', borderRadius: '50%', background: 'linear-gradient(135deg,#1d4ed8,#4f46e5)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '12px', fontWeight: '700', color: '#fff', flexShrink: 0 }}>D</div>
-                      <span style={{ fontSize: '11px', color: '#475569', fontWeight: '600', letterSpacing: '0.02em' }}>DWOMOH Vibe Code</span>
+                      <div style={{ width: '24px', height: '24px', borderRadius: '7px', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', fontWeight: '800', color: '#fff', flexShrink: 0, boxShadow: '0 0 8px rgba(99,102,241,0.35)' }}>⚡</div>
+                      <span style={{ fontSize: '11px', color: 'var(--ide-text-muted)', fontWeight: '600', letterSpacing: '0.02em' }}>DWOMOH Vibe Code</span>
                     </div>
                   )}
                   {/* ── Structured error card ── */}
@@ -6708,12 +8086,14 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                     maxWidth: '86%',
                     padding: msg.role === 'user' ? '11px 16px' : '14px 18px',
                     borderRadius: msg.role === 'user' ? '18px 18px 6px 18px' : '6px 18px 18px 18px',
-                    background: msg.role === 'user' ? 'linear-gradient(135deg,#1d4ed8,#2563eb)' : '#141e2e',
-                    border: msg.role === 'assistant' ? '1px solid #1e3a5f' : 'none',
+                    background: msg.role === 'user'
+                      ? 'linear-gradient(135deg,rgba(99,102,241,0.9),rgba(139,92,246,0.85))'
+                      : 'var(--ide-surface)',
+                    border: msg.role === 'assistant' ? '1px solid var(--ide-border)' : 'none',
                     whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                     fontSize: '14px', lineHeight: '1.75', textAlign: 'left',
-                    color: msg.role === 'user' ? '#eff6ff' : '#cbd5e1',
-                    boxShadow: msg.role === 'user' ? '0 2px 8px rgba(37,99,235,0.25)' : 'none',
+                    color: msg.role === 'user' ? '#f0f0ff' : '#cbd5e1',
+                    boxShadow: msg.role === 'user' ? '0 2px 12px rgba(99,102,241,0.3)' : 'none',
                   }}>
                     {msg.content}
                     {msg.screenshotUrl && (
@@ -7042,7 +8422,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           </div>
 
           {/* ── Premium Composer ───────────────────────────────────────────────── */}
-          <div style={{ padding: '10px 16px 14px', background: '#0a1220', borderTop: '1px solid #1a2744' }}>
+          <div style={{ padding: '10px 16px 14px', background: 'var(--ide-surface)', borderTop: '1px solid var(--ide-border)' }}>
 
             {/* Busy / stuck banner */}
             {isBusy && (
@@ -7124,11 +8504,11 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
             {/* ── Composer box ── */}
             <div style={{
-              background: '#141e2e',
-              border: `1.5px solid ${isRecording ? 'rgba(239,68,68,0.6)' : composerFocused ? '#2563eb' : '#1e3a5f'}`,
-              borderRadius: '16px',
+              background: 'var(--ide-surface-2)',
+              border: `1.5px solid ${isRecording ? 'rgba(239,68,68,0.6)' : composerFocused ? 'rgba(99,102,241,0.7)' : 'var(--ide-border)'}`,
+              borderRadius: '14px',
               transition: 'border-color 0.2s, box-shadow 0.2s',
-              boxShadow: composerFocused && !isRecording ? '0 0 0 3px rgba(37,99,235,0.12)' : isRecording ? '0 0 0 3px rgba(239,68,68,0.1)' : 'none',
+              boxShadow: composerFocused && !isRecording ? '0 0 0 3px rgba(99,102,241,0.12)' : isRecording ? '0 0 0 3px rgba(239,68,68,0.1)' : 'none',
               position: 'relative',
               overflow: 'hidden',
             }}>
@@ -7236,6 +8616,13 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
                   <div style={{ flex: 1 }} />
 
+                  {/* Design style picker — only visible when not building and no project open */}
+                  {!currentProject && phase === 'idle' && (
+                    <div style={{ marginRight: '8px' }}>
+                      <BuildStylePickerInline value={buildStyle} onChange={setBuildStyle} />
+                    </div>
+                  )}
+
                   {/* Build target selector — only visible when not building and no project open */}
                   {!currentProject && phase === 'idle' && (
                     <div style={{ display: 'flex', gap: '4px', marginRight: '10px', background: '#0d1526', borderRadius: '8px', padding: '3px', border: '1px solid #1e3a5f', flexShrink: 0 }}>
@@ -7289,10 +8676,10 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                     style={{
                       padding: '9px 22px',
                       background: input.trim() && !isBusy
-                        ? 'linear-gradient(135deg, #1d4ed8 0%, #4f46e5 100%)'
-                        : '#111827',
-                      color: input.trim() && !isBusy ? '#fff' : '#1e3a5f',
-                      border: 'none',
+                        ? 'linear-gradient(135deg,rgba(99,102,241,0.95),rgba(139,92,246,0.9))'
+                        : 'var(--ide-surface-2)',
+                      color: input.trim() && !isBusy ? '#fff' : 'var(--ide-text-dim)',
+                      border: input.trim() && !isBusy ? '1px solid rgba(99,102,241,0.4)' : '1px solid var(--ide-border)',
                       borderRadius: '10px',
                       cursor: input.trim() && !isBusy ? 'pointer' : 'not-allowed',
                       fontWeight: '700',
@@ -7302,7 +8689,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                       alignItems: 'center',
                       gap: '7px',
                       whiteSpace: 'nowrap',
-                      boxShadow: input.trim() && !isBusy ? '0 2px 10px rgba(37,99,235,0.4)' : 'none',
+                      boxShadow: input.trim() && !isBusy ? '0 2px 14px rgba(99,102,241,0.35)' : 'none',
                       flexShrink: 0,
                     }}>
                     <span>
@@ -7498,51 +8885,48 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           </div>
         )}
 
-        {/* ── Preview Panel ─────────────────────────────────────────────── */}
-        <div style={{ width: '42%', minWidth: '320px', background: '#1e293b', display: 'flex', flexDirection: 'column' }}>
-          {/* Tab bar */}
-          <div style={{ display: 'flex', alignItems: 'center', borderBottom: '1px solid #334155', background: '#0f172a', overflowX: 'auto' }}>
-            {(['preview', 'design', 'terminal', 'logs'] as const).map(tab => (
+        {/* ── Preview Panel ───────────────────────────────────────────── */}
+        <div style={{ width: '42%', minWidth: '320px', background: 'var(--ide-surface)', display: 'flex', flexDirection: 'column', borderLeft: '1px solid var(--ide-border)' }}>
+          {/* Premium tab bar */}
+          <div style={{
+            height: '52px', display: 'flex', alignItems: 'center',
+            borderBottom: '1px solid var(--ide-border)',
+            background: 'var(--ide-surface)',
+            paddingLeft: '4px', overflowX: 'auto', flexShrink: 0,
+          }}>
+            {([
+              { id: 'preview', label: 'Preview', icon: '⬡' },
+              { id: 'design',  label: 'Design',  icon: '◈' },
+              { id: 'terminal',label: 'Terminal', icon: '$' },
+              { id: 'logs',    label: 'Logs',     icon: '≡' },
+            ] as const).map(tab => (
               <button
-                key={tab}
-                onClick={() => setPreviewTab(tab)}
-                style={{
-                  padding: '10px 14px', background: 'none', border: 'none', cursor: 'pointer',
-                  color: previewTab === tab ? '#e2e8f0' : '#64748b',
-                  fontSize: '12px', fontWeight: previewTab === tab ? '700' : '400',
-                  borderBottom: previewTab === tab ? '2px solid #2563eb' : '2px solid transparent',
-                  textTransform: 'uppercase', letterSpacing: '0.06em', whiteSpace: 'nowrap',
-                  position: 'relative',
-                }}
+                key={tab.id}
+                className={`panel-tab${previewTab === tab.id ? ' active' : ''}`}
+                onClick={() => setPreviewTab(tab.id)}
+                style={{ position: 'relative' }}
               >
-                {tab === 'preview' ? (
-                    <span>
-                      ⬜ Preview
-                      {researchActivity && !researchActivity.complete && (
-                        <span style={{ position: 'absolute', top: '6px', right: '4px', width: '6px', height: '6px', borderRadius: '50%', background: '#3b82f6', animation: 'pulse 1.2s ease-in-out infinite' }} />
-                      )}
-                    </span>
-                  )
-                  : tab === 'design' ? (
-                    <span>
-                      🎨 Design
-                      {(assets.some(a => a.role === 'logo') || logoHistory.length > 0) && (
-                        <span style={{ position: 'absolute', top: '6px', right: '4px', width: '6px', height: '6px', borderRadius: '50%', background: '#2563eb' }} />
-                      )}
-                    </span>
-                  )
-                  : tab === 'terminal' ? '$ Terminal' : '📋 Logs'}
+                <span style={{ fontSize: '13px', opacity: previewTab === tab.id ? 1 : 0.5 }}>{tab.icon}</span>
+                <span>{tab.label}</span>
+                {tab.id === 'preview' && researchActivity && !researchActivity.complete && (
+                  <span style={{ position: 'absolute', top: '8px', right: '6px', width: '5px', height: '5px', borderRadius: '50%', background: 'var(--ide-accent)', animation: 'pulse 1.2s ease-in-out infinite' }} />
+                )}
+                {tab.id === 'design' && (assets.some(a => a.role === 'logo') || logoHistory.length > 0) && (
+                  <span style={{ position: 'absolute', top: '8px', right: '6px', width: '5px', height: '5px', borderRadius: '50%', background: '#8b5cf6' }} />
+                )}
               </button>
             ))}
             {previewUrl && previewTab === 'preview' && (
               <div style={{ display: 'flex', gap: '4px', marginLeft: 'auto', padding: '0 10px', flexShrink: 0 }}>
-                <button onClick={() => setPreviewKey(k => k + 1)} title="Refresh" style={{ padding: '4px 8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', cursor: 'pointer', fontSize: '12px' }}>↺</button>
-                <a href={previewUrl} target="_blank" rel="noopener noreferrer" title="Open in new tab" style={{ padding: '4px 8px', background: '#1e293b', border: '1px solid #334155', borderRadius: '4px', color: '#94a3b8', textDecoration: 'none', fontSize: '12px' }}>↗</a>
+                <button onClick={() => setPreviewKey(k => k + 1)} title="Refresh"
+                  style={{ padding: '5px 8px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '5px', color: 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '12px' }}>↺</button>
+                <a href={previewUrl} target="_blank" rel="noopener noreferrer" title="Open in new tab"
+                  style={{ padding: '5px 8px', background: 'var(--ide-surface-2)', border: '1px solid var(--ide-border)', borderRadius: '5px', color: 'var(--ide-text-muted)', textDecoration: 'none', fontSize: '12px', display: 'flex', alignItems: 'center' }}>↗</a>
               </div>
             )}
           </div>
 
-          <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+          <div style={{ flex: 1, overflow: 'hidden', position: 'relative', background: 'var(--ide-bg)' }}>
             {/* ── PREVIEW TAB ── */}
             {previewTab === 'preview' && (
               <>

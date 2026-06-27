@@ -23,6 +23,9 @@ export interface ServerResult extends RunResult {
   port?: number;
   pid?: number;
   crashLog?: string;
+  homePageVerified?: boolean;
+  homePageStatus?: number;
+  homePageError?: string;
 }
 
 // ── Server state file ──────────────────────────────────────────────────────
@@ -225,6 +228,21 @@ export async function startDevServer(projectPath: string, force = false): Promis
         logs.push(`♻️ Reusing existing server on port ${existingState.port}`);
         return { success: true, port: existingState.port, pid: existingState.pid, logs };
       }
+    }
+
+    // ── Project isolation guard ───────────────────────────────────────────────
+    // CRITICAL: Verify the generated project has its own package.json before
+    // running npm. Without this check, npm traverses UP the directory tree and
+    // finds the DWOMOH Vibe Code main app's package.json, serving the builder's
+    // own landing page in the preview instead of the user's generated application.
+    const pkgJsonPath = join(projectPath, 'package.json');
+    const hasPkgJson = await readFile(pkgJsonPath, 'utf-8').then(() => true).catch(() => false);
+    if (!hasPkgJson) {
+      const errMsg = `Project isolation guard: no package.json found at ${projectPath}. ` +
+        'The project was not generated yet, or generation failed to write files. ' +
+        'Run the Generate action before starting the dev server.';
+      logs.push(`❌ ${errMsg}`);
+      return { success: false, logs, error: errMsg };
     }
 
     // Kill any previously running generated-project server first

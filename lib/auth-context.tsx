@@ -33,12 +33,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async (showLoader = false) => {
-    // When called as refresh() after a sign-in, set loading so guards
-    // don't see the brief window of loading:false + user:null.
     if (showLoader) setLoading(true);
-    try {
+    // Single 8-second timeout covers the ENTIRE auth load (getCurrentUser + fetchUserAttributes).
+    // Cognito can hang on both calls if env vars are missing or network is slow.
+    const doLoad = async () => {
       const cu = await getCurrentUser();
       const attrs = await fetchUserAttributes();
+      return { cu, attrs };
+    };
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('auth_timeout')), 8_000)
+    );
+    try {
+      const { cu, attrs } = await Promise.race([doLoad(), timeout]);
       setUser({
         userId: cu.userId,
         email: attrs.email ?? cu.username,

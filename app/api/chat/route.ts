@@ -717,6 +717,8 @@ RULE: A tool invocation is always better than an apology or a question. When in 
         role: t.role,
         content: typeof t.content === 'string' ? t.content : '[image attached]',
       }));
+      // Design style selected by user in the builder UI
+      const designStyle = typeof body.designStyle === 'string' ? body.designStyle : 'modern';
 
       // ── Step 0: Extract and lock the project specification ────────────────────
       // This happens BEFORE building the prompt so the spec anchor can be prepended
@@ -728,6 +730,35 @@ RULE: A tool invocation is always better than an apology or a question. When in 
       const specAnchor = formatSpecAnchor(lockedSpec);
       const archHints = getArchitectureHints(lockedSpec.type);
       console.log(`[generate] Spec locked — name: "${lockedSpec.name}", type: "${lockedSpec.type}"`);
+
+      // ── Intent Verification Stage ─────────────────────────────────────────────
+      // Return this to the builder UI before generation starts so the user can
+      // see what was understood. The builder displays it as a "Detected intent"
+      // card. If the intent is wrong, the user can correct before code is written.
+      const INTENT_LABELS: Record<string, string> = {
+        marketplace:    'Marketplace (listings, sellers, buyers)',
+        booking:        'Booking & Reservations',
+        saas:           'SaaS / Dashboard',
+        social:         'Social Network / Community',
+        ecommerce:      'E-Commerce Store',
+        management:     'Management / CRM',
+        'real-estate':  'Real Estate / Property',
+        education:      'Education / Learning Platform',
+        health:         'Health / Medical',
+        'food-delivery':'Food Delivery',
+        travel:         'Travel / Tourism',
+        finance:        'Finance / Fintech',
+        custom:         'Custom Application',
+      };
+      const intentSummary = {
+        projectName: lockedSpec.name,
+        projectType: lockedSpec.type,
+        projectTypeLabel: INTENT_LABELS[lockedSpec.type] ?? 'Custom Application',
+        detectedFeatures: lockedSpec.features.slice(0, 6),
+        detectedPages: lockedSpec.pages.slice(0, 8),
+      };
+      // The generate action returns intentSummary alongside the generated project.
+      // The builder pipeline reads this and shows it before the first file is written.
 
       const buildUserMessage = stringTurns.length >= 1
         ? generateBuildPromptFromConversation(stringTurns)
@@ -801,11 +832,21 @@ RULE: A tool invocation is always better than an apology or a question. When in 
       // 3. MVP skeleton — minimal working version only
       const apiSuffix = apiPromptInstructions ? `\n${apiPromptInstructions}` : '';
 
+      // Inject design style system prompt based on user's selection
+      const DESIGN_STYLE_TOKENS: Record<string, string> = {
+        classic:       '\n[DESIGN_STYLE: Classic Professional]\nColor palette: Blue (#2563eb), white backgrounds, gray-100 surfaces. Subtle fade-in animations (Framer Motion, 150ms). Traditional header+sidebar grid. rounded-lg, subtle shadow-sm.\n',
+        modern:        '\n[DESIGN_STYLE: Modern Bold]\nColor palette: Purple-to-blue gradient (#7c3aed→#2563eb), dark bg (#0f172a). Spring physics animations, staggered reveals (Framer Motion staggerChildren 0.06s). Pill buttons, gradient borders.\n',
+        'premium-3d':  '\n[DESIGN_STYLE: Premium 3D Glassmorphism]\nColor palette: Deep navy (#050b18), gold (#d4a017), glass cards (backdrop-blur-xl, bg-white/5, border-white/10). 3D tilt on hover (perspective-1000), shimmer effects, floating ambient glow. Gold gradient on hero text.\n',
+        'mobile-first':'\n[DESIGN_STYLE: Mobile First Native App]\nColor palette: White bg, teal (#0ea5e9) accent. 44px+ touch targets, bottom nav bar, full-width CTAs. Bounce tap feedback (Framer Motion whileTap scale 0.97), slide-up modals.\n',
+        minimal:       '\n[DESIGN_STYLE: Minimal Content First]\nColor palette: Pure white bg, #0a0a0a text, ONE accent color used sparingly. No box-shadows, hairline borders, system-ui font, generous whitespace (py-16). Minimal animation (opacity only).\n',
+      };
+      const styleToken = DESIGN_STYLE_TOKENS[designStyle] ?? DESIGN_STYLE_TOKENS.modern;
+
       const buildStrategies: Array<() => string> = [
         // Strategy 1: Full build prompt with spec anchor at top
         () => `${specAnchor}
 ${archHints}
-
+${styleToken}
 ${buildUserMessage}${apiSuffix}`,
 
         // Strategy 2: Same + hard format reminder
@@ -997,6 +1038,9 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         // ── Locked spec — passed back to client so it can be forwarded to the
         //    create action and saved to disk alongside the project files.
         lockedSpec,
+        // ── Intent summary — builder displays this before files are written so
+        //    user can confirm the correct app is being generated.
+        intentSummary,
         // Surface API plan status to the builder for user messaging
         apiPlan: {
           resolved: apiPlanResolved,
@@ -1387,6 +1431,30 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
           previewUrl: `http://localhost:${result.port}`,
           buildStatus: 'success',
         });
+
+        // Post-start home page probe: verify the root returns a real application
+        // (not Next.js 404 or scaffold placeholder) before reporting server-ready.
+        try {
+          const probeCtrl = new AbortController();
+          setTimeout(() => probeCtrl.abort(), 20_000);
+          const probeRes = await fetch(`http://localhost:${result.port}/`, {
+            signal: probeCtrl.signal,
+            headers: { Accept: 'text/html' },
+          });
+          const probeBody = await probeRes.text().catch(() => '');
+          const is404 = /This page could not be found|<title[^>]*>404/i.test(probeBody);
+          const isScaffold = /the agent is generating the full codebase/i.test(probeBody);
+          if (probeRes.ok && !is404 && !isScaffold) {
+            result.homePageVerified = true;
+            result.homePageStatus = probeRes.status;
+          } else {
+            result.homePageVerified = false;
+            result.homePageStatus = probeRes.status;
+            result.homePageError = is404 ? 'Home page shows Next.js 404 — app/page.tsx is missing or crashing'
+              : isScaffold ? 'Home page is still showing generation placeholder — build was incomplete'
+              : `Home page returned HTTP ${probeRes.status}`;
+          }
+        } catch { /* non-critical probe failure — server may still be starting */ }
       }
       return NextResponse.json({ ...result, projectPath });
     }
@@ -1398,11 +1466,12 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       return NextResponse.json({ success: true, logs: logs.slice(-4000) });
     }
 
-    // ── list-projects: return projects owned by the authenticated user ────────
+    // ── list-projects: return projects owned by the authenticated user (or disk-scanned anonymous) ──
     if (action === 'list-projects') {
       const authUser = await getAuthUser(request);
-      if (!authUser) return NextResponse.json({ success: false, error: 'Unauthorized' }, { status: 401 });
-      const projects = await listProjects(authUser.sub);
+      // Allow unauthenticated access — returns anonymous projects + disk-discovered projects
+      const ownerId = authUser?.sub ?? 'anonymous';
+      const projects = await listProjects(ownerId);
       return NextResponse.json({ success: true, projects });
     }
 
@@ -1466,7 +1535,7 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
     }
 
     if (action === 'verify-app') {
-      const { port } = body;
+      const { port, serverLogFile } = body;
       if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
 
       let apiRoutes: string[] = [];
@@ -1480,6 +1549,23 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       }
 
       const result = await verifyRunningApp(port as number, apiRoutes, projectPath as string | undefined, pageRoutes);
+
+      // Live log scan — catch MODULE_NOT_FOUND, chunk 404s, runtime exceptions that
+      // HTTP checks alone cannot detect (they return 200 even for crashed pages in some cases).
+      if (serverLogFile && typeof serverLogFile === 'string') {
+        try {
+          const { healthGateWithLiveLogs, scanServerLogs } = await import('@/services/verification-engine');
+          const logScan = await scanServerLogs(serverLogFile);
+          if (!logScan.clean) {
+            result.verified = false;
+            result.failures = [...(result.failures ?? []), ...logScan.criticalErrors.slice(0, 5)];
+            result.summary = `Live log shows ${logScan.criticalErrors.length} critical error(s). ${result.summary}`;
+          }
+          if (logScan.warnings.length > 0) {
+            result.summary = `${result.summary} Warnings: ${logScan.warnings.slice(0, 2).join('; ')}.`;
+          }
+        } catch { /* non-fatal */ }
+      }
 
       // TypeScript safety gate: only run tsc when HTTP checks all pass.
       // Running tsc on every loop iteration (15 × ~30s) would add 7+ minutes of overhead.
@@ -3656,6 +3742,22 @@ RULES:
       const { verifyFlutterProject } = await import('@/services/flutter-verifier');
       const runAnalyze = body.runAnalyze !== false;
       const result = await verifyFlutterProject(projectPath, runAnalyze);
+      return NextResponse.json({ success: true, ...result });
+    }
+
+    // ── verify-flutter-runtime: install APK on connected device + capture logcat ─
+    if (action === 'verify-flutter-runtime') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { verifyFlutterRuntime } = await import('@/services/flutter-verifier');
+      const result = await verifyFlutterRuntime(projectPath);
+      return NextResponse.json({ success: true, ...result });
+    }
+
+    // ── verify-auth-pages: check Sign In, Sign Up, Forgot Password load correctly ─
+    if (action === 'verify-auth-pages') {
+      const baseUrl = body.baseUrl ?? 'http://localhost:3000';
+      const { verifyAuthPages } = await import('@/services/auth-verifier');
+      const result = await verifyAuthPages(baseUrl);
       return NextResponse.json({ success: true, ...result });
     }
 

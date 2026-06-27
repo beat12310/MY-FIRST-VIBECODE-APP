@@ -207,6 +207,44 @@ const PROVIDER_ERROR_PATTERNS = [
   /api.*(?:key|token|credential).*(?:invalid|expired|missing)/i,
 ];
 
+// ─── Auth endpoint awareness ──────────────────────────────────────────────────
+
+/**
+ * Routes that legitimately return 401/403 when the verifier hits them without
+ * a session. A 401 here means auth is WORKING, not broken. Treat as soft-pass.
+ */
+const AUTH_SESSION_REQUIRED = /\/(api\/)?auth\/(me|profile|session|check|user|whoami|current|verify-session|status)([/?]|$)/i;
+
+/**
+ * Routes that accept credentials. Verifier should POST synthetic test data
+ * instead of an empty `{}` body so we get a real result, not a 400.
+ */
+const AUTH_CREDENTIAL_ROUTE = /\/(api\/)?auth\/(register|signup|login|signin)([/?]|$)/i;
+
+/** Synthetic test credentials — never used for real; just proves the route handles valid input */
+const TEST_CREDS = { email: 'verify@dwomoh.dev', password: 'VibeCode#Test1!', name: 'Verification Bot' };
+
+/**
+ * Routes that legitimately return 401/403 on logout when there is no active session.
+ * A 401 here means the session guard is working correctly.
+ */
+const AUTH_SESSION_LOGOUT = /\/(api\/)?auth\/logout([/?]|$)/i;
+
+// ─── 404-in-200 detection ─────────────────────────────────────────────────────
+
+/**
+ * These patterns appear in Next.js 404 pages that are served with HTTP 200
+ * (happens when a page route exists but the component throws, or when the
+ * app router cannot find a matching segment). A 200 showing these strings
+ * must NOT count as a passing check.
+ */
+const PAGE_404_PATTERNS = [
+  /This page could not be found/i,
+  /<title[^>]*>404[^<]*<\/title>/i,
+  /Next\.js.*404/i,
+  /"statusCode":404/,
+];
+
 function isLocalAlias(p: string): boolean {
   return p.startsWith('@/') || p.startsWith('./') || p.startsWith('../');
 }
@@ -600,6 +638,39 @@ async function checkEndpoint(
 
   const hasBody = (method === 'POST' || method === 'PUT' || method === 'PATCH');
 
+  // ── Auth endpoint: expects session — 401/403 = soft pass (auth is protecting correctly) ──
+  if (AUTH_SESSION_REQUIRED.test(urlPath) || AUTH_SESSION_LOGOUT.test(urlPath)) {
+    clearTimeout(timer);
+    try {
+      const authCtrl = new AbortController();
+      setTimeout(() => authCtrl.abort(), 8000);
+      const res = await fetch(url, {
+        method,
+        signal: authCtrl.signal,
+        headers: { Accept: 'application/json, text/html' },
+        ...(method !== 'GET' ? { body: JSON.stringify({}), headers: { 'Content-Type': 'application/json', Accept: 'application/json' } } : {}),
+      });
+      const bodyText = await res.text().catch(() => '');
+      const isExpected401 = res.status === 401 || res.status === 403;
+      if (isExpected401) {
+        return {
+          name, url,
+          passed: false,
+          softPassed: true,
+          statusCode: res.status,
+          responseBody: bodyText.slice(0, 300),
+          requestBody: '(no session token — testing unauthenticated state)',
+          externalDepName: `Session guard (HTTP ${res.status} is correct when unauthenticated)`,
+          error: `HTTP ${res.status} — auth is working correctly (unauthenticated access is correctly rejected)`,
+        };
+      }
+      // Unexpected response: fall through to normal handling
+    } catch { /* fall through */ }
+  }
+
+  // ── Auth credential routes: register / login — send real test body ──────────
+  const isCredentialRoute = hasBody && AUTH_CREDENTIAL_ROUTE.test(urlPath);
+
   // Build the initial request body. Form-data routes get a test multipart body
   // on the FIRST attempt so we don't trigger a 400 we'd just have to retry anyway.
   let initialRequestDescription: string;
@@ -612,6 +683,16 @@ async function checkEndpoint(
       signal: controller.signal,
       headers: { Accept: 'application/json, text/html' },
       body: fd,
+    };
+  } else if (isCredentialRoute) {
+    // Send well-formed credentials so the route can actually process them
+    // (empty {} always 400s because email/password are required).
+    initialRequestDescription = `application/json: ${JSON.stringify(TEST_CREDS)}`;
+    fetchOpts = {
+      method,
+      signal: controller.signal,
+      headers: { Accept: 'application/json, text/html', 'Content-Type': 'application/json' },
+      body: JSON.stringify(TEST_CREDS),
     };
   } else {
     initialRequestDescription = hasBody ? 'application/json: {}' : '(no body)';
@@ -839,6 +920,39 @@ async function checkEndpoint(
       }
     } else {
       responsePreview = bodyText.slice(0, 200).replace(/\n/g, ' ');
+
+      // ── 404-in-200 detection ─────────────────────────────────────────────
+      // Next.js occasionally serves the 404 page component with HTTP 200
+      // (happens when the app router can't find a matching segment, or when
+      // the root page component throws and falls back to not-found).
+      // A 200 that renders "This page could not be found" must NOT pass.
+      // NOTE: Next.js always embeds the not-found boundary in RSC script tags;
+      // we must strip script tags before checking to avoid false positives.
+      if (!urlPath.startsWith('/api/')) {
+        const visibleHtml = bodyText.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+        for (const re of PAGE_404_PATTERNS) {
+          if (re.test(visibleHtml)) {
+            return {
+              name, url,
+              passed: false,
+              statusCode: res.status,
+              responsePreview,
+              rootCause: {
+                kind: 'route-failure' as const,
+                detail: 'HTTP 200 but Next.js rendered the 404 page — route is missing or the page component threw an error',
+                fixFile: urlPath === '/' ? 'app/page.tsx' : `app${urlPath}/page.tsx`,
+                fixHint: 'Ensure the page component exists and exports a valid default function without unhandled throws',
+              },
+              error: 'HTTP 200 but page shows "This page could not be found" (Next.js 404 component detected)',
+              fixFile: urlPath === '/' ? 'app/page.tsx' : `app${urlPath}/page.tsx`,
+              fixHint: 'Create or fix the page component — it is missing or crashing before it can render',
+              requestBody: initialRequestDescription,
+              responseBody: bodyText.slice(0, 2000),
+            };
+          }
+        }
+      }
+
       // ── Scaffold placeholder detection ──────────────────────────────────
       // The DWOMOH scaffold fallback serves a valid Next.js HTML page with HTTP 200
       // when Bedrock generation failed. We must NOT count this as a passing check.
@@ -991,8 +1105,43 @@ export async function verifyRunningApp(
       })
       .filter((u): u is string => u !== null);
 
-    for (const urlPath of pageUrlPaths) {
+    // Detect auth pages in the project. When present, verify them for
+    // ChunkLoadError and hydration failures — not just HTTP status.
+    const AUTH_PAGE_PATHS = new Set([
+      '/auth/signin', '/auth/signup', '/auth/forgot-password',
+      '/auth/login', '/login', '/signin', '/signup',
+    ]);
+    const authRoutes = pageUrlPaths.filter(u => AUTH_PAGE_PATHS.has(u));
+    const nonAuthRoutes = pageUrlPaths.filter(u => !AUTH_PAGE_PATHS.has(u));
+
+    for (const urlPath of nonAuthRoutes) {
       checks.push(await checkEndpoint(`${base}${urlPath}`, `Page: GET ${urlPath}`));
+    }
+
+    // Auth pages get dedicated chunk-error detection
+    if (authRoutes.length > 0) {
+      const { verifyAuthPages } = await import('./auth-verifier');
+      const authReport = await verifyAuthPages(base);
+      for (const ac of authReport.checks) {
+        const isChunkError = Boolean(ac.error?.toLowerCase().includes('chunk'));
+        checks.push({
+          name: `Auth page: GET ${ac.route}`,
+          url: `${base}${ac.route}`,
+          passed: ac.passed,
+          softPassed: false,
+          statusCode: ac.status ?? 0,
+          error: ac.passed ? undefined : ac.error,
+          rootCause: ac.passed ? undefined : {
+            kind: isChunkError ? 'runtime-crash' : 'route-failure',
+            detail: isChunkError
+              ? `ChunkLoadError on ${ac.route} — stale .next cache. Fix: rm -rf .next && npm run dev`
+              : `Auth page ${ac.route} failed: ${ac.error ?? 'unknown'}`,
+            fixHint: isChunkError
+              ? 'Delete .next and restart the dev server to clear stale chunk references.'
+              : 'Check auth layout.tsx for import errors or missing dependencies.',
+          },
+        });
+      }
     }
   }
 
@@ -1073,13 +1222,14 @@ export function healthGate(result: VerificationResult, missingCredentials?: stri
     blockers.push('App is still showing the AI generation placeholder — real application has not rendered yet');
   }
 
-  // Block on any HTTP failure
+  // Block on any HTTP failure — soft-passed checks (auth 401, external API timeouts)
+  // are deliberately excluded: they indicate correct behaviour, not broken code.
   for (const check of result.checks) {
-    if (!check.passed) {
+    if (!check.passed && !check.softPassed) {
       const sc = check.statusCode;
-      if (sc && (sc >= 400 || sc === 0)) {
+      if (sc && sc >= 400) {
         blockers.push(`${check.name} returned HTTP ${sc} — must be fixed before the app can be verified`);
-      } else if (!sc) {
+      } else if (!sc || sc === 0) {
         blockers.push(`${check.name} is unreachable — server may not be running`);
       }
     }
@@ -1120,4 +1270,84 @@ export function formatVerificationResult(result: VerificationResult): string {
     lines.push(`${icon} ${check.name}${detail}`);
   }
   return lines.join('\n');
+}
+
+// ─── Live server log scanner ─────────────────────────────────────────────────
+// Reads the last N lines from a running dev-server's stdout log file and
+// classifies any critical runtime errors that must block "verified" status.
+
+export interface LiveLogScanResult {
+  clean: boolean;
+  criticalErrors: string[];
+  warnings: string[];
+  rawLines: string[];
+}
+
+const CRITICAL_LOG_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  { re: /MODULE_NOT_FOUND/,                      label: 'MODULE_NOT_FOUND: missing dependency' },
+  { re: /Cannot find module/,                    label: 'Cannot find module: broken import' },
+  { re: /ChunkLoadError|Loading chunk \d+ failed/, label: 'Chunk load error: missing JS chunk (stale build)' },
+  { re: /Error: ENOENT.*no such file/,           label: 'ENOENT: required file missing at runtime' },
+  { re: /SyntaxError:.*Unexpected token/,        label: 'SyntaxError: malformed JS at runtime' },
+  { re: /TypeError: .*is not a function/,        label: 'TypeError: function not found at runtime' },
+  { re: /ReferenceError:/,                       label: 'ReferenceError: undefined variable at runtime' },
+  { re: /Unhandled Runtime Error/,               label: 'Unhandled Runtime Error in client-side code' },
+  { re: /NEXT_REDIRECT.*failed/i,                label: 'Next.js redirect failed' },
+  { re: /Error: No routes matched/,              label: 'No routes matched: missing page or dynamic segment' },
+];
+
+const WARNING_LOG_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  { re: /404.*favicon/i,                         label: 'favicon.ico 404 on every page load' },
+  { re: /Hydration failed/i,                     label: 'Hydration mismatch: server/client HTML differs' },
+  { re: /Warning.*useLayoutEffect/,              label: 'useLayoutEffect SSR warning' },
+];
+
+export async function scanServerLogs(
+  logFilePath: string,
+  tailLines = 200,
+): Promise<LiveLogScanResult> {
+  const criticalErrors: string[] = [];
+  const warnings: string[] = [];
+  let rawLines: string[] = [];
+
+  try {
+    const content = await readFile(logFilePath, 'utf-8');
+    const allLines = content.split('\n').filter(l => l.trim());
+    rawLines = allLines.slice(-tailLines);
+
+    for (const line of rawLines) {
+      for (const { re, label } of CRITICAL_LOG_PATTERNS) {
+        if (re.test(line)) { criticalErrors.push(`${label}: ${line.slice(0, 200)}`); break; }
+      }
+      for (const { re, label } of WARNING_LOG_PATTERNS) {
+        if (re.test(line)) { warnings.push(`${label}: ${line.slice(0, 150)}`); break; }
+      }
+    }
+  } catch {
+    // Log file doesn't exist yet — not an error
+  }
+
+  return { clean: criticalErrors.length === 0, criticalErrors, warnings, rawLines };
+}
+
+/**
+ * Checks the live server log for critical errors and adds them as blockers to the health gate.
+ */
+export async function healthGateWithLiveLogs(
+  result: VerificationResult,
+  logFilePath: string,
+  missingCredentials?: string[],
+): Promise<HealthGateResult> {
+  const base = healthGate(result, missingCredentials);
+  const logScan = await scanServerLogs(logFilePath);
+
+  // Deduplicate: only add new blockers not already in the base set
+  for (const err of logScan.criticalErrors) {
+    const shortErr = err.slice(0, 80);
+    if (!base.blockers.some(b => b.includes(shortErr.slice(0, 40)))) {
+      base.blockers.push(`[Live log] ${err}`);
+    }
+  }
+
+  return { passes: base.blockers.length === 0, blockers: base.blockers };
 }

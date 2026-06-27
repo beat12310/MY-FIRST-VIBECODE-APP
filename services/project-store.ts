@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, readdir, stat } from 'fs/promises';
 import { join } from 'path';
 import { PROJECT_CONFIG } from '@/lib/constants';
 import { logError } from '@/lib/error-handler';
@@ -33,11 +33,90 @@ async function writeManifest(projects: ProjectMeta[]): Promise<void> {
   await writeFile(MANIFEST_PATH, JSON.stringify(projects, null, 2), 'utf-8');
 }
 
+/**
+ * Scan the generated-projects directory for any project directories that are
+ * NOT yet in the manifest and add them. This recovers projects whose manifest
+ * entry was lost (e.g. build-safe.sh isolation, process crash, first-time setup).
+ */
+async function scanAndRepairManifest(ownerUserId: string): Promise<void> {
+  try {
+    const entries = await readdir(PROJECTS_DIR, { withFileTypes: true });
+    const existing = await readManifest();
+    const existingPaths = new Set(existing.map(p => p.projectPath));
+    const toAdd: ProjectMeta[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.')) continue;
+      if (entry.name === 'node_modules' || entry.name === '.next' || entry.name === 'gp-build-backup') continue;
+
+      const projectPath = join(PROJECTS_DIR, entry.name);
+      if (existingPaths.has(projectPath)) continue;
+
+      // Detect project type and extract name
+      let name = entry.name
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase());
+      let filesCount = 0;
+
+      try {
+        // Next.js project
+        const pkgRaw = await readFile(join(projectPath, 'package.json'), 'utf-8');
+        const pkg = JSON.parse(pkgRaw) as { name?: string };
+        if (pkg.name) name = pkg.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      } catch {
+        try {
+          // Flutter project
+          const pubspec = await readFile(join(projectPath, 'pubspec.yaml'), 'utf-8');
+          const match = pubspec.match(/^name:\s*(.+)/m);
+          if (match) name = match[1].trim().replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        } catch { /* not a known project type */ }
+      }
+
+      try {
+        // Count files in project (quick estimate from lib/ or app/ or src/)
+        for (const sub of ['app', 'lib', 'src', 'pages']) {
+          try {
+            const subEntries = await readdir(join(projectPath, sub));
+            filesCount += subEntries.length;
+          } catch { /* subdir doesn't exist */ }
+        }
+      } catch { /* ignore */ }
+
+      // Get mtime for createdAt estimate
+      let createdAt = new Date().toISOString();
+      try {
+        const s = await stat(projectPath);
+        createdAt = s.birthtime.toISOString();
+      } catch { /* use now */ }
+
+      toAdd.push({
+        id: `proj_${Date.now().toString(36)}_${entry.name.slice(0, 8)}`,
+        ownerUserId,
+        name,
+        description: `Recovered from ${entry.name}`,
+        projectPath,
+        createdAt,
+        updatedAt: createdAt,
+        filesCount: Math.max(filesCount, 1),
+      });
+    }
+
+    if (toAdd.length > 0) {
+      const updated = [...existing, ...toAdd];
+      await writeManifest(updated);
+    }
+  } catch { /* silent — scan is best-effort */ }
+}
+
 /** List projects owned by a specific user, most recent first. */
 export async function listProjects(ownerUserId: string): Promise<ProjectMeta[]> {
+  // Always scan disk first so projects created outside the normal flow still appear
+  await scanAndRepairManifest(ownerUserId);
+
   const projects = await readManifest();
   return projects
-    .filter(p => p.ownerUserId === ownerUserId)
+    .filter(p => p.ownerUserId === ownerUserId || p.ownerUserId === 'anonymous')
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 

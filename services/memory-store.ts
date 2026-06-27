@@ -87,6 +87,11 @@ export interface ProjectMemory {
   verificationHistory?: VerificationRecord[];
   browserSessions?: BrowserSessionRecord[];
   fileOperations?: FileOpRecord[];
+  // Deployment tracking
+  deployedUrl?: string;
+  brandedUrl?: string;
+  amplifyAppId?: string;
+  customDomains?: string[];
 }
 
 // ─── Global Memory ────────────────────────────────────────────────────────────

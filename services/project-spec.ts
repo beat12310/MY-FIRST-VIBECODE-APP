@@ -54,7 +54,17 @@ export interface ProjectSpec {
 const SKIP_MESSAGES = /^(create now|build now|start building|generate now|build it|make it|go build|proceed|execute|yes|ok|okay|sure|let's go|yep|yeah|alright|great|perfect|sounds good|do it|go ahead|absolutely|exactly)$/i;
 
 const TYPE_KEYWORDS: Record<ProjectType, string[]> = {
-  marketplace:   ['marketplace', 'list products', 'list services', 'sellers', 'buyers', 'vendors', 'listing', 'listings', 'sell', 'buy'],
+  marketplace:   [
+    'marketplace', 'market', 'bazaar', 'exchange', 'trading platform',
+    'list products', 'list services', 'sellers', 'buyers', 'vendor', 'vendors',
+    'listing', 'listings', 'sell', 'buy', 'classifieds', 'classified ads',
+    'for sale', 'second-hand', 'second hand', 'used items',
+    // domain-specific markets: phone, car, auto, electronics, etc.
+    'phone market', 'car market', 'auto market', 'vehicle market',
+    'electronics market', 'laptop market', 'gadget market',
+    'used phones', 'used cars', 'used vehicles', 'buy phones', 'sell phones',
+    'buy cars', 'sell cars', 'car dealer', 'phone dealer',
+  ],
   booking:       ['book', 'booking', 'reservation', 'reserve', 'appointment', 'schedule', 'availability', 'check-in', 'check-out', 'stay', 'accommodation'],
   saas:          ['saas', 'subscription', 'plans', 'dashboard', 'analytics', 'reports', 'workspace', 'team', 'admin panel', 'metrics'],
   social:        ['social', 'feed', 'posts', 'follow', 'followers', 'likes', 'comments', 'community', 'network', 'profile', 'friends'],
