@@ -38,4 +38,11 @@ next-env.d.ts
 # amplify
 .amplify
 amplify_outputs*
-amplifyconfiguration*
+amplifyconfiguration*node_modules/
+generated-projects/**/node_modules/
+
+# never commit generated app outputs
+generated-projects/
+node_modules/
+**/node_modules/
+public/browser-screenshots/
