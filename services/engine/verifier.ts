@@ -177,6 +177,8 @@ interface StaticAnalysis {
   permissionGaps: string[];
   /** A missing/mismatched table, column, or foreign key (compared against every query that references it). Integration Registry rule "database-schema". */
   databaseSchemaGaps: string[];
+  /** A table queried by a search-named route with no FTS5 index yet. Integration Registry rule "search-indexing". */
+  searchIndexGaps: string[];
 }
 
 export function analyzeStatic(plan: AppPlan, files: { path: string; content: string }[]): StaticAnalysis {
@@ -228,6 +230,7 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
   const breadcrumbGaps = gaps.filter(g => g.integrationId === 'breadcrumbs').map(g => g.detail);
   const permissionGaps = gaps.filter(g => g.integrationId === 'permissions').map(g => g.detail);
   const databaseSchemaGaps = gaps.filter(g => g.integrationId === 'database-schema').map(g => g.detail);
+  const searchIndexGaps = gaps.filter(g => g.integrationId === 'search-indexing').map(g => g.detail);
 
   // planned vs actual — pages are matched by RESOLVED ROUTE (pageSet, built above via
   // fileToRoute), not literal file path, so a page the model placed inside a route
@@ -246,7 +249,7 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
   return {
     fileCount: files.length, routes: [...new Set(routes)].sort(), apiRoutes: [...new Set(apiRoutes)].sort(),
     pagesGenerated: pageSet.size, deadLinks, brokenImports, missingExports, placeholders, placeholderMatches, missingPlanned, buildErrors, orphanedApiCalls, unprotectedRoutes,
-    navigationGaps, dashboardWidgetGaps, breadcrumbGaps, permissionGaps, databaseSchemaGaps,
+    navigationGaps, dashboardWidgetGaps, breadcrumbGaps, permissionGaps, databaseSchemaGaps, searchIndexGaps,
   };
 }
 
@@ -396,6 +399,7 @@ export async function verifyApp(plan: AppPlan, projectPath: string, deps: Verifi
   s.breadcrumbGaps.forEach(d => addInternal('runtime', d, 'breadcrumbs'));
   s.permissionGaps.forEach(d => addInternal('security', d, 'permissions'));
   s.databaseSchemaGaps.forEach(d => addInternal('structural', d, 'database-schema'));
+  s.searchIndexGaps.forEach(d => addInternal('runtime', d, 'search-indexing'));
   // The file path MUST stay at the end of the detail string — repairer.ts's
   // describeTarget() extracts the target file via a regex anchored on `$`,
   // matching the convention every other failure-detail message in this file uses.

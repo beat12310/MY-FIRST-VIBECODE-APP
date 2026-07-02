@@ -379,6 +379,24 @@ export async function buildApp(plan: AppPlan, deps: BuilderDeps, signal?: AbortS
     logs.push('Navigation registry (lib/managed/navigation.ts) injected.');
   }
 
+  // 5.9. Inject lib/managed/search.ts whenever the app has a search feature
+  // (a dedicated route OR a query-param-driven search on an existing
+  // route — see search-template.ts's isSearchFeatureFile for why both
+  // signals are needed), so it has real FTS5-backed search infrastructure
+  // to call into from the moment it's generated rather than only after a
+  // later repair pass adds it. Only injected when actually needed — matches
+  // breadcrumbs' "only when actually needed" gating above.
+  const { isSearchFeatureFile } = await import('./search-template');
+  const hasSearchFeature = all.some(isSearchFeatureFile);
+  if (hasSearchFeature && present.has('lib/managed/db.ts') && !present.has('lib/managed/search.ts')) {
+    const { buildSearchService } = await import('./search-template');
+    const svc = buildSearchService();
+    await deps.appendFiles(created.projectPath, [{ path: svc.filePath, content: svc.content }]);
+    all.push({ path: svc.filePath, content: svc.content });
+    present.add(svc.filePath);
+    logs.push('Search service (lib/managed/search.ts) injected (search route present).');
+  }
+
   // 5.6. Initialize project memory. Confirmed live: .project-memory.json
   // never got created by the build pipeline at all — only the EDIT pipeline
   // created it, reactively, on the FIRST edit request (with a crude fallback

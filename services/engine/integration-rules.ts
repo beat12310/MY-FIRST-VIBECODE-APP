@@ -27,6 +27,7 @@ import { addDashboardResource } from './dashboard-template';
 import { hasBreadcrumbs } from './breadcrumb-template';
 import { deriveRoleGates } from './permissions-template';
 import { extractSchema, extractQueryReferences, detectSchemaGaps, synthesizeTableSchema } from './schema-template';
+import { SEARCH_SERVICE_PATH, buildSearchService, hasSearchIndex, addSearchIndexCall, indexableColumns, isSearchFeatureFile } from './search-template';
 
 async function writeFileAt(projectPath: string, relPath: string, content: string): Promise<void> {
   const { writeFile, mkdir } = await import('fs/promises');
@@ -415,8 +416,69 @@ function stubRule(id: string, label: string, category: 'core' | 'optional', appl
     note,
   });
 }
-stubRule('search-indexing', 'Search indexing', 'core', () => true,
-  'No search infrastructure exists in the generated-app template (no Elasticsearch/Algolia/SQLite-FTS setup). Registered now so a future phase that adds real search infra can activate this rule without redesigning the registry; until then it correctly reports no gaps rather than inventing a search feature outside the scope of "wiring."');
+// ── search-indexing (optional — requires a search feature + the managed DB) ──
+// Upgraded from an honest stub now that SQLite FTS5 was confirmed to work
+// (including the external-content sync-trigger pattern, tested live against
+// a real better-sqlite3 install) and chosen as the architecture consistent
+// with this template's zero-config managed-service philosophy.
+//
+// Deliberately narrow scope: this rule NEVER creates or rewrites an API
+// route — that's api-registration's job for a missing route, and rewriting
+// an EXISTING route's own query logic carries the same risk as any other
+// retrofit-into-arbitrary-code case in this engine (breadcrumbs, nav) — so
+// it isn't attempted here either. This rule only ensures the underlying
+// FTS5 index exists for whatever table a search feature queries, so real
+// search infrastructure (searchRows()) is available to call into, whether
+// or not the route currently uses it.
+//
+// Detection signal lives in search-template.ts (isSearchFeatureFile) so both
+// this rule and builder.ts's build-time injection step share one definition
+// of "this file implements a search feature" — see that module for the full
+// rationale, including the live evidence that motivated the two-signal design.
+
+registerIntegration({
+  id: 'search-indexing',
+  label: 'Search indexing (SQLite FTS5)',
+  category: 'optional',
+  appliesTo: (ctx: IntegrationContext) => ctx.fileSet.has('lib/managed/db.ts') && ctx.files.some(isSearchFeatureFile),
+  detect(ctx: IntegrationContext): IntegrationGap[] {
+    const searchFeatureFiles = ctx.files.filter(isSearchFeatureFile);
+    if (searchFeatureFiles.length === 0) return [];
+    const searchServiceFile = ctx.files.find(f => f.path === SEARCH_SERVICE_PATH);
+    const schema = extractSchema(ctx.files);
+    const refs = extractQueryReferences(searchFeatureFiles);
+    const gaps: IntegrationGap[] = [];
+    const seenTables = new Set<string>();
+    for (const ref of refs) {
+      if (seenTables.has(ref.table) || !schema.has(ref.table)) continue; // missing table entirely is database-schema's concern, not ours
+      seenTables.add(ref.table);
+      if (searchServiceFile && hasSearchIndex(searchServiceFile.content, ref.table)) continue;
+      gaps.push({
+        integrationId: 'search-indexing',
+        detail: `Table ${ref.table} (queried by a search feature) has no FTS5 search index: ${SEARCH_SERVICE_PATH}`,
+        targetFile: SEARCH_SERVICE_PATH,
+      });
+    }
+    return gaps;
+  },
+  async apply(gap, projectPath, ctx): Promise<IntegrationApplyResult | null> {
+    const m = gap.detail.match(/^Table (\w+) \(queried by a search feature\) has no FTS5 search index: /);
+    if (!m) return null;
+    const table = m[1];
+    const schema = extractSchema(ctx.files);
+    const tableSchema = schema.get(table);
+    if (!tableSchema) return null;
+    const columns = indexableColumns([...tableSchema.columns]);
+    if (columns.length === 0) return null;
+    const existing = await readFileAt(projectPath, SEARCH_SERVICE_PATH);
+    const base = existing ?? buildSearchService().content;
+    const { patched, changed } = addSearchIndexCall(base, table, columns);
+    if (!changed && existing !== null) return null;
+    await writeFileAt(projectPath, SEARCH_SERVICE_PATH, patched);
+    return { changedFiles: [SEARCH_SERVICE_PATH] };
+  },
+});
+
 stubRule('migrations', 'Database migrations', 'optional', (ctx) => ctx.fileSet.has('lib/managed/db.ts'),
   'SQLite\'s idempotent CREATE TABLE IF NOT EXISTS (via initTable(), called at import time by every generated route) already serves as a zero-config migration mechanism for this template — there is no separate migration system to wire. The "database-schema" rule actively VERIFIES this mechanism is working (every table/column a query references actually has a matching initTable schema) rather than just assuming it; registered here for catalog completeness under the historical "migrations" name.');
 
