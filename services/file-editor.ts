@@ -35,7 +35,14 @@ export function parseEditFormat(aiResponse: string): EditedFile[] {
 
 function extractFilesFromBlock(block: string, skipMeta = false): EditedFile[] {
   const files: EditedFile[] = [];
-  const filePattern = /\[FILE:\s*([^\]]+)\]\n([\s\S]*?)(?=\n?\[FILE:|$)/g;
+  // Path group is `.+?` (non-greedy, backtracks past embedded `]`), NOT `[^\]]+`
+  // — the old character class stopped at the FIRST `]`, so it could never
+  // correctly parse a Next.js dynamic route path like "app/vendor/[id]/page.tsx"
+  // (the `]` closing "[id]" isn't the real end of the tag). Confirmed via
+  // testing this silently dropped the file entirely — parseEditFormat returned
+  // zero files for any [FILE:] block whose path contained square brackets,
+  // which is common for detail pages and dynamic API routes.
+  const filePattern = /\[FILE:\s*(.+?)\]\n([\s\S]*?)(?=\n?\[FILE:|$)/g;
 
   let match: RegExpExecArray | null;
   while ((match = filePattern.exec(block)) !== null) {

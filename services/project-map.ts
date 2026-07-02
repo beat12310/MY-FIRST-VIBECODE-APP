@@ -116,6 +116,7 @@ function resolveImport(
   fromFile: string,   // relative path of the importing file
   importPath: string,
   projectPath: string,
+  knownFiles: Set<string>,
 ): string | null {
   // Skip node_modules imports (no leading . or @/)
   if (!importPath.startsWith('.') && !importPath.startsWith('@/')) return null;
@@ -127,14 +128,20 @@ function resolveImport(
     absTarget = resolve(join(projectPath, dirname(fromFile)), importPath);
   }
 
-  // Try with various extensions
+  // Try each extension against the ACTUAL file set, not just a sanity check —
+  // the old version returned on the bare '' extension unconditionally (that
+  // candidate always passes the "no .. and under 200 chars" check), so it
+  // never resolved to the real file with its extension (e.g. a page that
+  // imports "@/components/PricingCard" produced "components/PricingCard" in
+  // the graph while the real file is "components/PricingCard.tsx" — every
+  // importGraph/exportGraph lookup for that file silently missed).
   const rel = relative(projectPath, absTarget);
-  for (const ext of ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx']) {
+  for (const ext of ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js', '/index.jsx']) {
     const candidate = rel + ext;
-    if (!candidate.includes('..') && candidate.length < 200) {
-      return candidate;
-    }
+    if (knownFiles.has(candidate)) return candidate;
   }
+  // Fall back to the bare path (e.g. a file this scan didn't include, or a
+  // genuinely broken import) rather than silently dropping the edge.
   return rel;
 }
 
@@ -240,12 +247,13 @@ export async function buildProjectMap(projectPath: string): Promise<ProjectMap> 
   const fileInfos: FileInfo[] = [];
   const importGraph: Record<string, string[]> = {};
   const exportGraph: Record<string, string[]> = {};
+  const knownFiles = new Set(allFiles.map(f => f.relPath));
 
   for (const { relPath } of allFiles) {
     const content = fileContents.get(relPath) ?? '';
     const rawImports = extractRawImports(content);
     const resolvedImports = rawImports
-      .map(i => resolveImport(relPath, i, projectPath))
+      .map(i => resolveImport(relPath, i, projectPath, knownFiles))
       .filter(Boolean) as string[];
 
     fileInfos.push({
@@ -289,6 +297,35 @@ export async function buildProjectMap(projectPath: string): Promise<ProjectMap> 
         routeGroup: extractRouteGroup(fi.path),
         isApi: false,
       });
+    }
+  }
+
+  // ── Fetch-based API-call edges ────────────────────────────────────────────
+  // A page that calls `fetch('/api/auth/register')` has a real, load-bearing
+  // dependency on that API route, but extractRawImports() only sees ES
+  // import/require statements — a string literal URL passed to fetch() is
+  // invisible to it. Without this, an edit-scope computation based purely on
+  // the import graph can update a page's CLIENT-SIDE validation (e.g. "require
+  // an 8-character password") while never discovering the corresponding
+  // SERVER-SIDE route also needs the same check — confirmed live: exactly
+  // this happened on a real generated app, leaving the two sides inconsistent
+  // and the new rule trivially bypassable. Adding these as graph edges lets
+  // any import-graph-based scoping (computeEditScope, root-cause analysis)
+  // correctly treat "the API route this page calls" as in-scope alongside
+  // "the files this page imports".
+  const FETCH_CALL_RE = /(?:fetch|axios(?:\.(?:get|post|put|patch|delete))?)\s*\(\s*[`'"]([^`'"]+)[`'"]/g;
+  for (const fi of fileInfos) {
+    if (fi.layer === 'api') continue; // API routes calling other API routes is rare/noisy; focus on ui/component -> api
+    const content = fileContents.get(fi.path) ?? '';
+    let m: RegExpExecArray | null;
+    while ((m = FETCH_CALL_RE.exec(content)) !== null) {
+      const calledPath = m[1].split('?')[0].replace(/\$\{[^}]+\}/g, '[id]'); // template-literal params -> dynamic segment
+      if (!calledPath.startsWith('/api/')) continue;
+      const route = routes.find(r => r.isApi && (r.url === calledPath || r.url.replace(/\[[^\]]+\]/g, '[id]') === calledPath));
+      if (!route || route.file === fi.path) continue;
+      if (!importGraph[fi.path].includes(route.file)) importGraph[fi.path].push(route.file);
+      if (!exportGraph[route.file]) exportGraph[route.file] = [];
+      if (!exportGraph[route.file].includes(fi.path)) exportGraph[route.file].push(fi.path);
     }
   }
 

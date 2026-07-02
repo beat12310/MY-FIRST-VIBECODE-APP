@@ -406,8 +406,24 @@ export async function buildEditContext(params: {
   userRequest: string;
   mem: { name: string; originalPrompt: string; purpose: string; editsApplied?: Array<{ request: string; filesChanged: string[]; date: string }>; conversationHistory?: Array<{ role: string; content: string }> } | null;
   extraFiles?: string[];
+  /**
+   * Optional project-map.ts scan (routes/layers/auth/db) — when supplied,
+   * gives the model an ACCURATE, freshly-scanned structural summary instead
+   * of relying purely on keyword-matched file dumps. This is the "remembers
+   * its architecture, routes, and components" half of project memory: the
+   * file tree alone lists paths, not what each route actually IS or how
+   * files relate, so the model previously had to re-infer structure from
+   * scratch on every edit rather than being told it directly.
+   */
+  projectMap?: {
+    routes: { url: string; file: string; methods: string[]; isApi: boolean }[];
+    layers: Record<string, string[]>;
+    authProvider: string;
+    dbFile: string | null;
+    dbTables: string[];
+  } | null;
 }): Promise<string> {
-  const { discovery, userRequest, mem, extraFiles = [] } = params;
+  const { discovery, userRequest, mem, extraFiles = [], projectMap = null } = params;
   const req = userRequest.toLowerCase();
 
   // Determine which files are most relevant to edit
@@ -459,8 +475,17 @@ export async function buildEditContext(params: {
     filesToInclude.add(normalized);
   }
 
-  // If still fewer than 3 files, add more from keyContents
-  if (filesToInclude.size < 3) {
+  // If still fewer than 3 files, add more from keyContents — but ONLY when
+  // extraFiles didn't already supply a principled scope (e.g. from
+  // services/engine/edit-scope.ts's import-graph-based computation). Object
+  // key order in discovery.keyContents is arbitrary (filesystem scan order),
+  // not relevance order — confirmed live: this pulled in a completely
+  // unrelated "billing" API route as CONTEXT for a request purely about
+  // adding a "tasks" page, and the model went on to touch it. When the
+  // request is about a genuinely new resource, extraFiles legitimately can be
+  // small (nothing to match by name yet) — that's a reason to trust the
+  // narrower, deliberate scope, not to pad it with arbitrary unrelated files.
+  if (filesToInclude.size < 3 && extraFiles.length === 0) {
     for (const path of Object.keys(discovery.keyContents)) {
       if (!filesToInclude.has(path) && path !== 'package.json') {
         filesToInclude.add(path);
@@ -499,10 +524,19 @@ export async function buildEditContext(params: {
     .map(e => `• "${e.request}" changed: ${e.filesChanged.join(', ')}`)
     .join('\n') || 'None';
 
+  const architectureBlock = projectMap ? `
+APP ARCHITECTURE (routes, layers, auth, database — from a fresh project scan):
+Routes:
+${projectMap.routes.map(r => `  ${r.isApi ? `[API ${r.methods.join('/')}] ` : '[PAGE] '}${r.url} -> ${r.file}`).join('\n') || '  (none detected)'}
+Layers: ${Object.entries(projectMap.layers).filter(([, files]) => files.length > 0).map(([layer, files]) => `${layer}(${files.length})`).join(', ')}
+Auth provider: ${projectMap.authProvider}
+Database: ${projectMap.dbFile ? `${projectMap.dbFile} — tables: ${projectMap.dbTables.join(', ') || '(none detected)'}` : '(no database file detected)'}
+` : '';
+
   return `PROJECT: ${mem?.name || 'Unknown'}
 PURPOSE: ${mem?.purpose || mem?.originalPrompt || 'Unknown'}
 FRAMEWORK: ${discovery.framework}
-
+${architectureBlock}
 COMPLETE FILE TREE:
 ${fileTree}
 

@@ -1,7 +1,7 @@
 export const runtime = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
-import { parseProjectFormat } from '@/lib/json-parser';
+import { parseProjectFormat, parseLooseProjectFiles } from '@/lib/json-parser';
 import { converseWithEngineer, buildWithAI, fixErrorsWithAI, editWithAI, analyzeImageWithAI, generateLogoWithAI, converseAgentically, ConversationTurn } from '@/services/bedrock';
 import { handleError } from '@/lib/error-handler';
 import { generateProject } from '@/services/project-generator';
@@ -71,10 +71,95 @@ async function readProjectFiles(projectPath: string, paths: string[]): Promise<A
 
 // ─── route handler ─────────────────────────────────────────────────────────────
 
+// Public preview URL for a running dev server. On the worker PREVIEW_DOMAIN is set
+// (e.g. dwomohvibe.com) → returns the ALB-routed HTTPS host. On localhost it's
+// unset → returns the same http://localhost:<port> the client already used.
+function publicPreviewUrl(port?: number): string | undefined {
+  const domain = process.env.PREVIEW_DOMAIN?.trim();
+  if (domain) return `https://preview.${domain}`;
+  return port ? `http://localhost:${port}` : undefined;
+}
+
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
     const body = await request.json();
     const { action, messages, prompt, projectPath, projectId } = body;
+
+    // ── Worker inbound guard ─────────────────────────────────────────────────
+    // When this process IS the worker (WORKER_ROLE=worker), every /api/chat call
+    // must carry the shared secret set by the Amplify shim. Blocks the public ALB
+    // endpoint from being driven by anyone but our frontend.
+    if (process.env.WORKER_ROLE === 'worker') {
+      const provided = request.headers.get('x-worker-secret') ?? '';
+      const expected = process.env.WORKER_SECRET ?? '';
+      if (!expected || provided !== expected) {
+        return NextResponse.json({ success: false, error: 'Unauthorized worker request' }, { status: 401 });
+      }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // AMPLIFY → BUILD-WORKER PROXY SHIM
+    // ════════════════════════════════════════════════════════════════════════
+    // On AWS Amplify (Lambda SSR) the filesystem is read-only and we cannot run
+    // npm or a dev server. Any action that needs the project on disk or spawns a
+    // process is forwarded over HTTPS to the Fargate build worker, which runs
+    // this exact same code with WORKER_URL unset (so it executes locally there).
+    //
+    // LOCALHOST: WORKER_URL is unset → this block is skipped entirely → behavior
+    // is identical to today. On Amplify we forward the ENTIRE /api/chat surface to
+    // the worker (deny-by-default): the worker runs this exact code, has Bedrock via
+    // its task role, and a writable disk — so both AI and disk actions work there,
+    // and no action can be accidentally mis-routed to the read-only Lambda.
+    const WORKER_URL = process.env.WORKER_URL?.trim();
+    if (WORKER_URL && process.env.WORKER_ROLE !== 'worker') {
+      try {
+        const auth = request.headers.get('authorization') ?? '';
+        const workerRes = await fetch(`${WORKER_URL.replace(/\/$/, '')}/api/chat`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(auth ? { authorization: auth } : {}),
+            'x-worker-secret': process.env.WORKER_SECRET ?? '',
+          },
+          body: JSON.stringify(body),
+          // Generation/install/build can take minutes — never time out at the shim.
+          signal: AbortSignal.timeout(15 * 60 * 1000),
+        });
+        const text = await workerRes.text();
+        return new NextResponse(text, {
+          status: workerRes.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (proxyErr) {
+        const msg = proxyErr instanceof Error ? proxyErr.message : String(proxyErr);
+        return NextResponse.json(
+          { success: false, error: `Build worker unreachable: ${msg}. Check WORKER_URL and that the Fargate service is healthy.` },
+          { status: 502 },
+        );
+      }
+    }
+
+    // ── claude-bridge-status: check if Claude Code CLI is available + auth'd ──
+    if (action === 'claude-bridge-status') {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFile);
+      const { claudeCliInfo } = await import('@/lib/claude-cli');
+      const cli = claudeCliInfo();
+      if (!cli.path) {
+        return NextResponse.json({
+          available: false, loggedIn: false, cliPath: null, cliSource: cli.source,
+          error: 'Claude Code CLI not found. Install it, or set CLAUDE_CLI_PATH to the executable. Searched PATH and common install locations.',
+        });
+      }
+      try {
+        const { stdout } = await execFileAsync(cli.path, ['auth', 'status'], { timeout: 8000 });
+        const auth = JSON.parse(stdout.trim());
+        return NextResponse.json({ available: true, loggedIn: auth.loggedIn ?? false, email: auth.email, version: auth.claudeCodeVersion, cliPath: cli.path, cliSource: cli.source });
+      } catch (e) {
+        return NextResponse.json({ available: true, loggedIn: false, cliPath: cli.path, cliSource: cli.source, error: String(e) });
+      }
+    }
 
     // ── analyze-image: Claude vision analysis of an uploaded image ────────────
     if (action === 'analyze-image') {
@@ -479,7 +564,13 @@ RULE: A tool invocation is always better than an apology or a question. When in 
       const safeApply: boolean = body.safeApply ?? true;  // default ON
       // Scope constraint: layer-specific file restrictions
       // e.g. { layer: 'api', allowedPrefixes: ['app/api/'], blockedPrefixes: ['app/page.tsx'] }
-      const scopeConstraint: { layer?: string; allowedPrefixes?: string[]; blockedPrefixes?: string[] } =
+      // Caller-supplied constraints are honored as-is; when the caller doesn't
+      // set one (the default chat "edit" action never did), it is now derived
+      // automatically below from services/engine/edit-scope.ts's import-graph
+      // analysis — scope enforcement stops being opt-in and becomes a
+      // guaranteed property of every edit, not just requests that happen to
+      // arrive through the surgical/repair code paths that already set it.
+      let scopeConstraint: { layer?: string; allowedPrefixes?: string[]; blockedPrefixes?: string[] } =
         body.scopeConstraint ?? {};
 
       // Auto-init memory if needed (for projects predating the memory system)
@@ -493,6 +584,36 @@ RULE: A tool invocation is always better than an apology or a question. When in 
       // Fresh discovery to get current file contents
       const discovery = await discoverProject(projectPath);
       mem = await getProjectMemory(projectPath);
+
+      // ── Engine edit-scope: precise, import-graph-based file targeting ─────────
+      // buildEditContext's own file selection (below) is pure keyword matching
+      // against the request text — it has no notion of what actually imports
+      // or is imported by the file being discussed. computeEditScope walks
+      // project-map.ts's import graph one hop from the matched target(s), so
+      // e.g. a page and the ONE component it renders are both in scope while
+      // an unrelated page, or the API/database layer, structurally are not.
+      let editScopeFiles: string[] = [];
+      let editProjectMap: Awaited<ReturnType<typeof import('@/services/project-map').getProjectMap>> | null = null;
+      // Set only when scope was AUTO-computed (not caller-supplied) — carries
+      // the full EditScope (with targetFiles) so the filter below can apply
+      // the stricter isEditAllowed() check instead of prefix-only matching.
+      let autoComputedScope: Awaited<ReturnType<typeof import('@/services/engine/edit-scope').computeEditScope>> | null = null;
+      try {
+        const { getProjectMap } = await import('@/services/project-map');
+        const { computeEditScope } = await import('@/services/engine/edit-scope');
+        const map = await getProjectMap(projectPath);
+        editProjectMap = map;
+        const scope = computeEditScope(map, userRequest);
+        editScopeFiles = scope.targetFiles;
+        if (!body.scopeConstraint) {
+          scopeConstraint = {
+            layer: scope.layers[0],
+            allowedPrefixes: scope.allowedPrefixes,
+            blockedPrefixes: scope.blockedPrefixes,
+          };
+          autoComputedScope = scope;
+        }
+      } catch { /* non-fatal — falls back to buildEditContext's own matching + no auto scope */ }
 
       // ── Baseline TypeScript error count (before any changes) ──────────────────
       // Used for regression detection: if errors increase after the fix, roll back.
@@ -556,7 +677,7 @@ RULE: A tool invocation is always better than an apology or a question. When in 
 
       // Build full edit context, including files mentioned in the auto-detected errors
       const specEnrichedRequest = specPrefixForEdit ? `${specPrefixForEdit}${enrichedRequest}` : enrichedRequest;
-      const contextMessage = await buildEditContext({ discovery, userRequest: specEnrichedRequest, mem, extraFiles: autoErrorFiles });
+      const contextMessage = await buildEditContext({ discovery, userRequest: specEnrichedRequest, mem, extraFiles: [...autoErrorFiles, ...editScopeFiles], projectMap: editProjectMap });
 
       // ── Scope constraint injection into the system prompt ─────────────────────
       // When a specific issue layer is identified (api/frontend/backend/auth/database),
@@ -629,11 +750,38 @@ RULE: A tool invocation is always better than an apology or a question. When in 
       }
 
       // ── Scope filter: drop any AI-generated changes that violate scope ─────────
-      if (scopeConstraint.allowedPrefixes?.length) {
+      // blockedPrefixes is actually ENFORCED here, not just mentioned in the
+      // prompt text — previously only allowedPrefixes was checked, so a broad
+      // allow-prefix like "app/" (needed to permit creating new pages) gave no
+      // real protection against the model also touching "app/api/**", since
+      // that path legitimately starts with "app/" too.
+      //
+      // When scope was auto-computed, isEditAllowed() applies a STRICTER rule
+      // than prefix matching alone: an EXISTING file may only be touched if it
+      // was actually shown to the model (exact membership in targetFiles) — a
+      // broad allow-prefix should only ever permit CREATING a genuinely new
+      // file, never blindly overwriting one the model never saw. Confirmed
+      // live: without this, a request to add a new page also silently
+      // rewrote two completely unrelated, pre-existing API routes that were
+      // never part of the conversation — both matched the broad "app/api/"
+      // prefix needed to let the genuinely new route be created.
+      if (autoComputedScope && editProjectMap) {
+        const existingPaths = new Set(editProjectMap.files.map(f => f.path));
         const before = editedFiles.length;
-        editedFiles = editedFiles.filter(f =>
-          scopeConstraint.allowedPrefixes!.some(prefix => f.path.startsWith(prefix))
-        );
+        const { isEditAllowed } = await import('@/services/engine/edit-scope');
+        editedFiles = editedFiles.filter(f => isEditAllowed(autoComputedScope!, f.path, existingPaths));
+        if (editedFiles.length < before) {
+          const blocked = before - editedFiles.length;
+          autoErrorBlock = (autoErrorBlock ? autoErrorBlock + '\n' : '') +
+            `[SCOPE GATE] Blocked ${blocked} out-of-scope file change(s) — only ${scopeConstraint.layer} files were applied.`;
+        }
+      } else if (scopeConstraint.allowedPrefixes?.length) {
+        const before = editedFiles.length;
+        editedFiles = editedFiles.filter(f => {
+          const allowed = scopeConstraint.allowedPrefixes!.some(prefix => f.path.startsWith(prefix));
+          const blocked = (scopeConstraint.blockedPrefixes ?? []).some(prefix => f.path.startsWith(prefix));
+          return allowed && !blocked;
+        });
         if (editedFiles.length < before) {
           // Some files were blocked by scope — log but don't error
           const blocked = before - editedFiles.length;
@@ -693,6 +841,40 @@ RULE: A tool invocation is always better than an apology or a question. When in 
           // TypeScript check failed (may not be installed) — skip rollback
           await clearSnapshot(projectPath).catch(() => {});
         }
+      }
+
+      // ── Deterministic middleware auto-wiring for newly protected pages ───────
+      // Confirmed live: creating a new page with auth-implying language
+      // ("a /billing page where signed-in users can view and manage...")
+      // correctly created the page but never updated middleware.ts — the new
+      // page shipped completely unprotected. Rather than hoping the edit
+      // model remembers to keep a generated array in sync (the SAME
+      // unreliable pattern the deterministic auth-template.ts routes replaced
+      // for register/login), patch middleware.ts deterministically whenever a
+      // genuinely NEW page was just created and the request implies it needs
+      // a session.
+      if (!regressionDetected && editProjectMap) {
+        try {
+          const AUTH_IMPLIES_RE = /\bsigned.?in\b|\blogged.?in\b|\bauthenticated\b|members?.?only|requires?\s+(a\s+)?login|only\s+(for\s+)?(logged.?in|signed.?in|authenticated)\s+users?|only\s+users?\s+who/i;
+          if (AUTH_IMPLIES_RE.test(userRequest)) {
+            const existingPaths = new Set(editProjectMap.files.map(f => f.path));
+            const newPage = result.filesChanged.find(p => /\/page\.(tsx|jsx)$/.test(p) && !existingPaths.has(p));
+            if (newPage) {
+              const { fileToRoute } = await import('@/services/engine/verifier');
+              const route = fileToRoute(newPage);
+              const mwPath = join(projectPath, 'middleware.ts');
+              const mwContent = await readFile(mwPath, 'utf-8').catch(() => null);
+              if (route && mwContent) {
+                const { addProtectedRoute } = await import('@/services/engine/auth-template');
+                const { patched, changed } = addProtectedRoute(mwContent, route);
+                if (changed) {
+                  await writeFile(mwPath, patched, 'utf-8');
+                  result.filesChanged.push('middleware.ts');
+                }
+              }
+            }
+          }
+        } catch { /* non-fatal — middleware auto-wiring is a best-effort addition, never blocks the edit */ }
       }
 
       // Record the edit in memory
@@ -886,6 +1068,8 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       let projectData = null;
       let lastRawError = '';
+      let winningRaw = ''; // raw AI text of the accepted strategy — holds the [ROUTE_MANIFEST]
+      let lastRaw = '';    // raw AI text of the last attempt (for loose recovery)
 
       for (let attempt = 0; attempt < buildStrategies.length; attempt++) {
         try {
@@ -894,10 +1078,12 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
           // model for generateTier is unavailable it automatically tries the next one
           // in the chain (e.g. Sonnet 4.6 → Sonnet 4.5 → Haiku) without any manual retry.
           const aiResponse = await buildWithAI(strategyPrompt, BUILD_SYSTEM_PROMPT, generateTier);
+          lastRaw = aiResponse;
           const parsed = parseProjectFormat(aiResponse);
 
           if (parsed && parsed.files.length > 0 && hasRequiredFiles(parsed)) {
             projectData = parsed;
+            winningRaw = aiResponse;
             break;
           }
 
@@ -912,6 +1098,29 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
         if (attempt < buildStrategies.length - 1) {
           await new Promise(r => setTimeout(r, (attempt + 1) * 1500));
+        }
+      }
+
+      // ── Loose recovery: the model returned a "spec" with code blocks instead of ──
+      // the strict [START_PROJECT] format. Extract real files from <file> tags or
+      // labelled fenced code blocks so we build a REAL app instead of a placeholder.
+      if (!projectData && lastRaw) {
+        try {
+          const recovered = parseLooseProjectFiles(lastRaw);
+          if (recovered.length > 0 && hasRequiredFiles({ files: recovered })) {
+            projectData = {
+              projectName: lockedSpec.name || 'generated-app',
+              description: shortDesc.slice(0, 200),
+              mode: 'Full-Stack App',
+              files: recovered,
+            };
+            winningRaw = lastRaw;
+            console.log(`[generate] Strict parse failed — recovered ${recovered.length} real file(s) via loose parser`);
+          } else {
+            console.warn(`[generate] Loose parser recovered ${recovered.length} file(s) but no usable root page`);
+          }
+        } catch (e) {
+          console.warn('[generate] Loose recovery error:', e instanceof Error ? e.message : e);
         }
       }
 
@@ -1012,6 +1221,51 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         }
       }
 
+      // ── Route Manifest Reconciliation — fix the #1 cause of broken apps ───────
+      // The build prompt asks the model to declare a [ROUTE_MANIFEST] and create a
+      // page for every route it links to. On large single-pass generations the model
+      // routinely DECLARES pages it never writes — leaving <Link href="/x"> with no
+      // app/x/page.tsx (a 404 / "broken, incomplete app"). Until now the manifest was
+      // never read back, so those gaps survived to the user as dead links or hollow
+      // "coming soon" stubs.
+      //
+      // Here we read the manifest back, diff it against the files actually generated,
+      // and ask the model to emit REAL pages for the gap — merged in before the
+      // project is ever written to disk. Deterministic: no running server / Playwright.
+      if (projectData && winningRaw) {
+        try {
+          const { parseRouteManifest, findMissingManifestPages } = await import('@/services/route-reconciler');
+          const declaredPages = parseRouteManifest(winningRaw);
+          const missingPages = findMissingManifestPages(declaredPages, projectData.files);
+
+          if (missingPages.length > 0) {
+            console.warn(`[generate] Route reconciliation — ${missingPages.length} declared page(s) missing: ${missingPages.join(', ')}`);
+            const { buildMissingPagesPrompt } = await import('@/services/route-reconciler');
+            const fillPrompt = buildMissingPagesPrompt(missingPages, projectData.files, specAnchor);
+            // Use the same generation tier so quality matches the rest of the app.
+            const fillRaw = await buildWithAI(fillPrompt, BUILD_SYSTEM_PROMPT, generateTier);
+            const fillFiles = parseEditFormat(fillRaw);
+
+            const existingPaths = new Set(projectData.files.map((f: { path: string }) => f.path));
+            let filledCount = 0;
+            for (const f of fillFiles) {
+              // Only accept page files for routes we actually flagged as missing.
+              if (!/\/page\.[jt]sx?$/.test(f.path)) continue;
+              if (existingPaths.has(f.path)) continue;
+              projectData.files.push({ path: f.path, content: f.content });
+              existingPaths.add(f.path);
+              filledCount++;
+            }
+            console.log(`[generate] Route reconciliation — generated ${filledCount} real page(s) for missing routes`);
+          } else if (declaredPages.length > 0) {
+            console.log('[generate] Route reconciliation — manifest complete, all declared pages present');
+          }
+        } catch (err) {
+          // Non-fatal: the generation-time auditAndRepairRoutes stub net still runs.
+          console.warn('[generate] Route reconciliation skipped:', err instanceof Error ? err.message : err);
+        }
+      }
+
       // True only when NO root-page file has real content.
       // Must match the same path variants as hasRequiredFiles() to avoid false positives
       // (e.g. AI generates src/app/page.tsx or app/page.jsx → real project, not scaffold).
@@ -1051,6 +1305,33 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
     }
 
     // ── create: write generated files to disk ──────────────────────────────────
+    // ── engine-build: NEW Generation Engine (Planner→Builder→Verifier→Repairer→Learner) ──
+    // SAFE, ADDITIVE EXPOSURE ONLY. Does not replace the existing generate/create
+    // flow and does not change the UI. Returns the full EngineReport. Static
+    // verification (no localhost probe) for now.
+    if (action === 'engine-build') {
+      const enginePrompt = typeof prompt === 'string'
+        ? prompt
+        : (Array.isArray(messages)
+            ? messages.filter((m: ConversationTurn) => m.role === 'user').map((m: ConversationTurn) => (typeof m.content === 'string' ? m.content : '')).join('\n').trim()
+            : '');
+      if (!enginePrompt) {
+        return NextResponse.json({ success: false, error: 'No prompt provided for engine-build' }, { status: 400 });
+      }
+      try {
+        console.log('[engine-build] pipeline starting — Planner → Builder → Verifier → Repairer → Learner');
+        const { runEngineBuild } = await import('@/services/engine/orchestrator');
+        const report = await runEngineBuild(enginePrompt);
+        for (const line of report.logs) console.log('[engine-build]', line);
+        console.log(`[engine-build] FINAL: status=${report.status} success=${report.success} — ${report.summary}`);
+        return NextResponse.json({ success: report.success, report });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[engine-build] pipeline error:', msg);
+        return NextResponse.json({ success: false, error: msg }, { status: 500 });
+      }
+    }
+
     if (action === 'create') {
       const projectData = prompt;
       if (!projectData?.projectName || !Array.isArray(projectData.files)) {
@@ -1060,7 +1341,40 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       const createAuthUser = await getAuthUser(request);
       const ownerUserId = createAuthUser?.sub ?? 'anonymous';
 
+      // ── CREDIT GATE: AI generation costs credits ──────────────────────────────
+      // New users get an initial free-plan grant. If a signed-in user has run out,
+      // block with a clear top-up message. Fail-open on store errors so a billing
+      // outage never bricks the builder. Disable enforcement with ENFORCE_CREDITS=0.
+      if (ownerUserId !== 'anonymous') {
+        try {
+          const { ensureInitialGrant, getBalance } = await import('@/services/credit-wallet');
+          const { getOrCreateSubscription } = await import('@/services/subscription-manager');
+          const { getPlan, CREDIT_CONFIG } = await import('@/lib/billing-config');
+          const sub = await getOrCreateSubscription(ownerUserId, createAuthUser?.email ?? '');
+          await ensureInitialGrant(ownerUserId, getPlan('free').limits.monthlyCredits);
+          const balance = await getBalance(ownerUserId);
+          if (process.env.ENFORCE_CREDITS !== '0' && balance < CREDIT_CONFIG.generationCostCredits) {
+            return NextResponse.json(
+              { success: false, error: 'You are out of credits. Please top up to keep generating.', code: 'NO_CREDITS', balance },
+              { status: 402 },
+            );
+          }
+        } catch (e) {
+          console.warn('[create] credit pre-check skipped (fail-open):', e instanceof Error ? e.message : e);
+        }
+      }
+
       const result = await generateProject(projectData.projectName, projectData.files);
+
+      // Deduct one generation credit now that the project was created successfully.
+      if (ownerUserId !== 'anonymous') {
+        try {
+          const { deduct } = await import('@/services/credit-wallet');
+          await deduct(ownerUserId, `generation: ${result.projectName}`);
+        } catch (e) {
+          console.warn('[create] credit deduct skipped:', e instanceof Error ? e.message : e);
+        }
+      }
 
       // Force-write a known-good Next.js tsconfig immediately after file creation.
       // AI models hallucinate non-existent compiler options (e.g. useDefineForEnumMembers)
@@ -1143,6 +1457,20 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         logs: result.logs,
         projectId: saved.id,
       });
+    }
+
+    // ── build-report: structured proof of what THIS build actually created ──────
+    // Scans the project on disk: file count, pages/routes, api routes, components,
+    // and referenced-but-missing routes (dead links / 404 risk). Real files only.
+    if (action === 'build-report') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      try {
+        const { buildReport } = await import('@/services/build-report');
+        const report = await buildReport(projectPath as string);
+        return NextResponse.json({ success: true, report });
+      } catch (e) {
+        return NextResponse.json({ success: false, error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+      }
     }
 
     // ── install: npm install ──────────────────────────────────────────────────
@@ -1456,7 +1784,7 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
           }
         } catch { /* non-critical probe failure — server may still be starting */ }
       }
-      return NextResponse.json({ ...result, projectPath });
+      return NextResponse.json({ ...result, projectPath, previewUrl: publicPreviewUrl(result.port) });
     }
 
     // ── get-server-logs: return captured Next.js dev output ───────────────────
@@ -1464,6 +1792,59 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
       const logs = await getServerLogs(projectPath);
       return NextResponse.json({ success: true, logs: logs.slice(-4000) });
+    }
+
+    // ── check-preview-health: server-side ping of the generated app's dev server ──
+    // Called by the preview health watchdog every 5 seconds.
+    // Running the check server-side avoids CORS errors that browser fetch would hit.
+    if (action === 'check-preview-health') {
+      const { port: healthPort } = body;
+      if (!healthPort) return NextResponse.json({ healthy: false, error: 'Missing port' });
+      try {
+        const r = await fetch(`http://localhost:${healthPort}/`, {
+          signal: AbortSignal.timeout(4000),
+          redirect: 'follow',
+          headers: { 'Accept': 'text/html,application/json' },
+        });
+        return NextResponse.json({ healthy: true, status: r.status });
+      } catch (e) {
+        return NextResponse.json({ healthy: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
+    // ── create-bridge-project: scaffold an empty project and register it so the bridge
+    // ownership guard accepts it. Bridge test mode skips all Bedrock generation.
+    if (action === 'create-bridge-project') {
+      const { projectName, prompt: userPrompt } = body;
+      const raw = (projectName || userPrompt || 'bridge-project').slice(0, 60);
+      const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'bridge-project';
+      const projectPath = join(process.cwd(), 'generated-projects', slug);
+      await mkdir(projectPath, { recursive: true });
+
+      // Minimal package.json so Claude Code CLI can resolve the project root
+      const pkgPath = join(projectPath, 'package.json');
+      try { await access(pkgPath); } catch {
+        await writeFile(pkgPath, JSON.stringify({
+          name: slug, version: '0.1.0', private: true,
+          scripts: { dev: 'next dev', build: 'next build', start: 'next start' },
+          dependencies: { next: '^14.2.15', react: '^18.3.1', 'react-dom': '^18.3.1', 'better-sqlite3': '^9.6.0' },
+          devDependencies: { typescript: '^5.4.5', '@types/node': '^20.14.0', '@types/react': '^18.3.3', '@types/react-dom': '^18.3.0', '@types/better-sqlite3': '^7.6.10', tailwindcss: '^3.4.4', autoprefixer: '^10.4.19', postcss: '^8.4.39' },
+        }, null, 2), 'utf-8');
+      }
+
+      // Register in the manifest so the bridge ownership guard (Guard 5) accepts this path.
+      const bridgeAuthUser = await getAuthUser(request);
+      const saved = await saveProject({
+        ownerUserId: bridgeAuthUser?.sub ?? 'anonymous',
+        name: slug.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+        description: (userPrompt || projectName || '').slice(0, 200),
+        projectPath,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        filesCount: 0,
+      });
+
+      return NextResponse.json({ success: true, projectPath, slug, id: saved.id });
     }
 
     // ── list-projects: return projects owned by the authenticated user (or disk-scanned anonymous) ──
@@ -1791,12 +2172,22 @@ Complete, working, production-quality code. No placeholders.`;
       if (!Array.isArray(genFiles) || genFiles.length === 0) {
         return NextResponse.json({ success: false, error: 'No files provided' }, { status: 400 });
       }
+      // Load baseline so we never overwrite UI files during scaffold re-gen
+      let baselineFileSet: Set<string> = new Set();
+      try {
+        const { getBaselineFileSet } = await import('@/services/design-baseline');
+        baselineFileSet = await getBaselineFileSet(projectPath);
+      } catch { /* non-critical */ }
+
       let filesWritten = 0;
       const written: string[] = [];
+      const skipped: string[] = [];
       const errors: string[] = [];
       for (const f of genFiles) {
         if (!f.path || f.content === undefined) continue;
         if (f.path.startsWith('lib/managed/')) continue; // never overwrite managed services
+        // Never overwrite baseline UI files during scaffold re-generation
+        if (baselineFileSet.has(f.path)) { skipped.push(f.path); continue; }
         try {
           const abs = join(projectPath, f.path);
           await mkdir(dirname(abs), { recursive: true });
@@ -1807,7 +2198,718 @@ Complete, working, production-quality code. No placeholders.`;
           errors.push(`${f.path}: ${e instanceof Error ? e.message : 'unknown'}`);
         }
       }
-      return NextResponse.json({ success: true, filesWritten, written, errors });
+      return NextResponse.json({ success: true, filesWritten, written, skipped, errors });
+    }
+
+    // ── save-design-baseline: snapshot all UI files after first generation ────────
+    if (action === 'save-design-baseline') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { saveDesignBaseline } = await import('@/services/design-baseline');
+      const savedFiles = await saveDesignBaseline(projectPath);
+      return NextResponse.json({ success: true, savedFiles, count: savedFiles.length });
+    }
+
+    // ── restore-baseline-files: undo UI drift from a repair ──────────────────────
+    if (action === 'restore-baseline-files') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const changedFiles: string[] = body.changedFiles || [];
+      const { restoreBaselineFiles } = await import('@/services/design-baseline');
+      const restored = await restoreBaselineFiles(projectPath, changedFiles);
+      return NextResponse.json({ success: true, restored, count: restored.length });
+    }
+
+    // ── check-baseline-drift: detect which changed files have drifted from baseline
+    if (action === 'check-baseline-drift') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const changedFiles: string[] = body.changedFiles || [];
+      const { loadDesignBaseline, hasSignificantDrift, isUIFile } = await import('@/services/design-baseline');
+      const baseline = await loadDesignBaseline(projectPath);
+      const drifted: string[] = [];
+      for (const f of changedFiles) {
+        if (!isUIFile(f)) continue;
+        if (await hasSignificantDrift(projectPath, f, baseline)) drifted.push(f);
+      }
+      return NextResponse.json({ success: true, drifted, hasDrift: drifted.length > 0 });
+    }
+
+    // ── verify-auth-flow: run the full register→login→session auth loop ──────────
+    if (action === 'verify-auth-flow') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const port: number = body.port;
+      if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
+      const { verifyAuthFlow } = await import('@/services/auth-flow-verifier');
+      const result = await verifyAuthFlow(port, projectPath);
+      return NextResponse.json({ success: true, ...result });
+    }
+
+    // ── fix-auth-fields: deterministic form↔API field name mismatch repair ───────
+    if (action === 'fix-auth-fields') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+
+      const AUTH_ROUTE_PATTERNS: Array<{ role: string; pattern: RegExp }> = [
+        { role: 'login',    pattern: /^app\/api\/auth\/(login|signin|sign-in)\/route\.(ts|tsx)$/ },
+        { role: 'register', pattern: /^app\/api\/auth\/(register|signup|sign-up)\/route\.(ts|tsx)$/ },
+      ];
+      const AUTH_PAGE_PATTERNS: Array<{ role: string; pattern: RegExp }> = [
+        { role: 'login',    pattern: /^app\/(auth\/)?(login|signin|sign-in)\/page\.(tsx|jsx)$/ },
+        { role: 'register', pattern: /^app\/(auth\/)?(register|signup|sign-up)\/page\.(tsx|jsx)$/ },
+      ];
+
+      function extractFieldNames(src: string): Set<string> {
+        const names = new Set<string>();
+        const dm = src.match(/\{\s*([^}]+)\s*\}\s*=\s*(?:await\s+)?(?:body|req|request)(?:\.json\(\))?/);
+        if (dm) dm[1].split(',').forEach(f => { const n = f.trim().split(/\s*[:=]\s*/)[0].trim(); if (n && /^\w+$/.test(n)) names.add(n); });
+        for (const m of src.matchAll(/(?:body|json|data)\.(\w+)/g)) names.add(m[1]);
+        return names;
+      }
+      function extractFormFields(src: string): Set<string> {
+        const names = new Set<string>();
+        for (const m of src.matchAll(/\.append\s*\(\s*['"](\w+)['"]/g)) names.add(m[1]);
+        for (const m of src.matchAll(/body\s*:\s*JSON\.stringify\s*\(\s*\{\s*([^}]+)\s*\}/g)) {
+          m[1].split(',').forEach(p => { const k = p.trim().split(':')[0].trim().replace(/['"]/g, ''); if (/^\w+$/.test(k)) names.add(k); });
+        }
+        for (const m of src.matchAll(/JSON\.stringify\s*\(\s*\{\s*([^}]+)\s*\}/g)) {
+          m[1].split(',').forEach(p => { const k = p.trim().split(':')[0].trim().replace(/['"]/g, ''); if (/^\w+$/.test(k)) names.add(k); });
+        }
+        return names;
+      }
+
+      let fixed = 0;
+      const details: string[] = [];
+
+      // Walk actual files on disk (not the in-memory list)
+      const { readdir: _rd } = await import('fs/promises');
+      async function findFiles(dir: string, pat: RegExp): Promise<string[]> {
+        const results: string[] = [];
+        try {
+          const entries = await _rd(dir, { withFileTypes: true });
+          for (const e of entries) {
+            const rel = join(dir, e.name).replace(projectPath + '/', '');
+            if (e.isDirectory()) results.push(...await findFiles(join(dir, e.name), pat));
+            else if (pat.test(rel)) results.push(rel);
+          }
+        } catch {}
+        return results;
+      }
+
+      const ROLE_PAIRS = [
+        [/^email|username$/i, /^email|username$/i],
+        [/^pass(?:word)?|pwd$/i, /^pass(?:word)?|pwd$/i],
+        [/^name|fullname$/i, /^name|fullname|full_name$/i],
+      ];
+
+      for (const { role, pattern: apiPat } of AUTH_ROUTE_PATTERNS) {
+        const apiFiles = await findFiles(projectPath, apiPat);
+        const pagePat = AUTH_PAGE_PATTERNS.find(p => p.role === role)?.pattern;
+        if (!pagePat) continue;
+        const pageFiles = await findFiles(projectPath, pagePat);
+        if (apiFiles.length === 0 || pageFiles.length === 0) continue;
+
+        const apiSrc = await readFile(join(projectPath, apiFiles[0]), 'utf-8').catch(() => '');
+        const pageSrc = await readFile(join(projectPath, pageFiles[0]), 'utf-8').catch(() => '');
+        if (!apiSrc || !pageSrc) continue;
+
+        const apiFields = extractFieldNames(apiSrc);
+        const formFields = extractFormFields(pageSrc);
+        if (apiFields.size === 0 || formFields.size === 0) continue;
+
+        let patched = apiSrc;
+        let changed = false;
+        for (const apiField of apiFields) {
+          for (const [apiRole, formRole] of ROLE_PAIRS) {
+            if ((apiRole as RegExp).test(apiField)) {
+              const formField = [...formFields].find(f => (formRole as RegExp).test(f));
+              if (formField && formField !== apiField) {
+                patched = patched.replace(new RegExp(`\\b${apiField}\\b`, 'g'), formField);
+                changed = true;
+                details.push(`${role} API: ${apiField} → ${formField}`);
+              }
+            }
+          }
+        }
+        if (changed) {
+          await writeFile(join(projectPath, apiFiles[0]), patched, 'utf-8');
+          fixed++;
+        }
+      }
+
+      return NextResponse.json({ success: true, fixed, details: details.join(', ') || 'no mismatches' });
+    }
+
+    // ── repair-dynamic-routes: detect template-literal hrefs, create [id] pages ──────
+    if (action === 'repair-dynamic-routes') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { readdir: rdDir2, readFile: rdFile2 } = await import('fs/promises');
+      const path2 = await import('path');
+
+      async function walkSrc(dir: string, results: string[] = []): Promise<string[]> {
+        try {
+          const entries = await rdDir2(dir, { withFileTypes: true });
+          for (const e of entries) {
+            if (e.name === 'node_modules' || e.name === '.next' || e.name === 'lib') continue;
+            const full = path2.join(dir, e.name);
+            if (e.isDirectory()) await walkSrc(full, results);
+            else if (/\.[jt]sx?$/.test(e.name)) results.push(full);
+          }
+        } catch {}
+        return results;
+      }
+
+      const srcFiles = await walkSrc(projectPath);
+      const dynamicBases = new Set<string>();
+      const tplPat = /["'`](\/[a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)*)\/?\$\{[^}]+\}/g;
+      const concatPat = /["'`](\/[a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)*)\/['"]\s*\+/g;
+
+      for (const sf of srcFiles) {
+        const src = await rdFile2(sf, 'utf-8').catch(() => '');
+        let m;
+        while ((m = tplPat.exec(src)) !== null) {
+          const base = m[1].replace(/\/$/, '');
+          if (base && base !== '/' && !base.includes('[') && !base.startsWith('/api')) dynamicBases.add(base);
+        }
+        while ((m = concatPat.exec(src)) !== null) {
+          const base = m[1].replace(/\/$/, '');
+          if (base && base !== '/' && !base.includes('[')) dynamicBases.add(base);
+        }
+      }
+
+      const created: string[] = [];
+      const appDir = path2.join(projectPath, 'app');
+
+      for (const base of dynamicBases) {
+        const pageFile = path2.join(appDir, base.slice(1), '[id]', 'page.tsx');
+        try { await rdFile2(pageFile, 'utf-8'); continue; } catch {} // exists — skip
+
+        const resourceName = base.split('/').filter(Boolean).pop() ?? 'item';
+        const componentName = base.split('/').filter(Boolean).map((s: string) =>
+          s.charAt(0).toUpperCase() + s.slice(1).replace(/-([a-z])/g, (_: string, c: string) => c.toUpperCase())
+        ).join('').replace(/[^a-zA-Z0-9]/g, '');
+        const displayName = resourceName.charAt(0).toUpperCase() + resourceName.slice(1).replace(/-/g, ' ');
+
+        const page = `'use client';
+import { useState, useEffect } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+
+export default function ${componentName}DetailPage() {
+  const params = useParams();
+  const router = useRouter();
+  const id = params.id as string;
+  const [item, setItem] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!id) return;
+    fetch(\`/api${base}/\${id}\`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.status))
+      .then(d => { setItem(d.${resourceName} ?? d.item ?? d.data ?? d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [id]);
+
+  if (loading) return <div className="min-h-screen flex items-center justify-center"><div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full"/></div>;
+  if (!item) return <main className="min-h-screen flex items-center justify-center p-8"><div className="text-center"><p className="text-slate-500 mb-4">${displayName} not found</p><Link href="${base}" className="text-blue-600 hover:underline text-sm">← Back</Link></div></main>;
+
+  return (
+    <main className="min-h-screen bg-slate-50">
+      <div className="max-w-3xl mx-auto px-4 py-10">
+        <Link href="${base}" className="text-sm text-slate-400 hover:text-slate-600 mb-6 inline-block">← Back to ${displayName}s</Link>
+        <div className="bg-white rounded-2xl border border-slate-200 p-8">
+          <h1 className="text-2xl font-bold text-slate-900 mb-6">{(item.title ?? item.name ?? item.label ?? '${displayName}') as string}</h1>
+          {item.description != null && <p className="text-slate-600 mb-6">{String(item.description)}</p>}
+          <dl className="grid grid-cols-2 gap-4">
+            {Object.entries(item).filter(([k]) => !['id','_id','description','title','name','created_at'].includes(k)).slice(0,8).map(([k,v]) => (
+              <div key={k}><dt className="text-xs font-medium text-slate-400 uppercase">{k.replace(/_/g,' ')}</dt><dd className="mt-1 text-sm text-slate-900">{String(v??'—')}</dd></div>
+            ))}
+          </dl>
+          <button onClick={() => router.back()} className="mt-8 px-4 py-2 text-sm border border-slate-200 rounded-lg hover:bg-slate-50">← Back</button>
+        </div>
+      </div>
+    </main>
+  );
+}
+`;
+        await mkdir(path2.dirname(pageFile), { recursive: true });
+        await writeFile(pageFile, page, 'utf-8');
+        created.push(`app${base}/[id]/page.tsx`);
+      }
+
+      return NextResponse.json({ success: true, created, total: created.length, message: created.length > 0 ? `Created ${created.length} dynamic page(s)` : 'No missing dynamic routes found' });
+    }
+
+    // ── scan-live-links: fetch homepage HTML and check every href for 404s ──────────
+    if (action === 'scan-live-links') {
+      const { port: scanPort } = body;
+      if (!scanPort) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
+
+      const base = `http://localhost:${scanPort}`;
+
+      // Pages to scan (not just home — also nav-level pages)
+      const pagesToScan = ['/', '/products', '/menu', '/courses', '/listings', '/jobs', '/services', '/blog', '/shop'];
+
+      const allLinks = new Set<string>();
+      for (const startPath of pagesToScan) {
+        try {
+          const ctrl = new AbortController();
+          setTimeout(() => ctrl.abort(), 8000);
+          const res = await fetch(`${base}${startPath}`, { signal: ctrl.signal, headers: { Accept: 'text/html' } });
+          if (!res.ok) continue;
+          const html = await res.text();
+
+          // Extract all internal href links from the HTML
+          const hrefRe = /href=["'](\/?[^"'#?][^"'#?]*?)(?:[?#][^"']*)?["']/g;
+          let m;
+          while ((m = hrefRe.exec(html)) !== null) {
+            const href = m[1].trim();
+            if (!href || href.startsWith('http') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('javascript:')) continue;
+            if (href.startsWith('/_next') || href.startsWith('/api/') || href.startsWith('/static/')) continue;
+            const path = href.startsWith('/') ? href : `/${href}`;
+            // Strip dynamic segments — /products/abc123 → /products/abc123 (check as-is, let 200 from [id] route count)
+            allLinks.add(path);
+          }
+        } catch { /* page unavailable — skip */ }
+      }
+
+      // Check each unique link
+      const broken: Array<{ href: string; status: number }> = [];
+      const working: string[] = [];
+
+      for (const href of allLinks) {
+        try {
+          const ctrl = new AbortController();
+          setTimeout(() => ctrl.abort(), 6000);
+          const res = await fetch(`${base}${href}`, { signal: ctrl.signal, redirect: 'follow' });
+          if (res.status === 404) {
+            broken.push({ href, status: 404 });
+          } else if (res.status < 400) {
+            working.push(href);
+          }
+        } catch { broken.push({ href, status: 0 }); }
+      }
+
+      return NextResponse.json({
+        success: true,
+        scanned: allLinks.size,
+        working: working.length,
+        broken,
+        allClear: broken.length === 0,
+        summary: broken.length === 0
+          ? `All ${allLinks.size} links checked — none return 404`
+          : `${broken.length} broken link(s): ${broken.map(b => b.href).join(', ')}`,
+      });
+    }
+
+    // ── repair-dashboard: create/replace the dashboard page for apps with auth ─────────
+    if (action === 'repair-dashboard') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { readdir: rdDir3, readFile: rdFile3 } = await import('fs/promises');
+      const path3 = await import('path');
+
+      // Check if app has auth pages
+      const hasAuth = await (async () => {
+        const authPaths = ['app/auth/page.tsx','app/login/page.tsx','app/signin/page.tsx','app/(auth)/login/page.tsx'];
+        for (const p of authPaths) {
+          try { await rdFile3(path3.join(projectPath, p), 'utf-8'); return true; } catch {}
+        }
+        return false;
+      })();
+      if (!hasAuth) return NextResponse.json({ success: false, repaired: false, reason: 'No auth pages found — dashboard not needed' });
+
+      const dashPath = path3.join(projectPath, 'app', 'dashboard', 'page.tsx');
+
+      // Detect if existing dashboard is stub or missing
+      let isStub = true;
+      try {
+        const src = await rdFile3(dashPath, 'utf-8');
+        isStub = src.length < 100 ||
+          /router\.(replace|push)\s*\(\s*['"]\/['"]\s*\)/.test(src) ||
+          !/fetch|<main|<div|dashboard|Dashboard/.test(src);
+      } catch { /* file missing — treat as stub */ }
+
+      if (!isStub) return NextResponse.json({ success: true, repaired: false, reason: 'Dashboard already exists and has real content' });
+
+      // Discover API resources
+      const apiRoutes: string[] = [];
+      async function walkForApi(dir: string): Promise<void> {
+        try {
+          const entries = await rdDir3(dir, { withFileTypes: true });
+          for (const e of entries) {
+            if (e.name === 'node_modules' || e.name === '.next') continue;
+            const full = path3.join(dir, e.name);
+            if (e.isDirectory()) await walkForApi(full);
+            else if (/route\.(ts|js)$/.test(e.name)) {
+              const rel = path3.relative(path3.join(projectPath, 'app', 'api'), path3.dirname(full));
+              if (rel && !rel.startsWith('auth') && !rel.includes('[') && !rel.includes('..')) {
+                apiRoutes.push(rel.split(path3.sep)[0]);
+              }
+            }
+          }
+        } catch {}
+      }
+      await walkForApi(path3.join(projectPath, 'app', 'api'));
+      const uniqueApiRoutes = [...new Set(apiRoutes)].slice(0, 4);
+
+      const appName = path3.basename(projectPath)
+        .replace(/-/g, ' ')
+        .replace(/\b\w/g, (c: string) => c.toUpperCase());
+
+      const resourceList = uniqueApiRoutes.map(r => {
+        const label = r.charAt(0).toUpperCase() + r.slice(1).replace(/-/g, ' ');
+        return `{ key: '${r}', label: '${label}', href: '/${r}', apiPath: '/api/${r}' }`;
+      }).join(',\n  ');
+
+      const navItems = uniqueApiRoutes.map(r => {
+        const label = r.charAt(0).toUpperCase() + r.slice(1).replace(/-/g, ' ');
+        const emoji = r.includes('pay') || r.includes('bill') ? '💳'
+          : r.includes('order') ? '📦'
+          : r.includes('course') || r.includes('lesson') ? '📚'
+          : r.includes('product') || r.includes('item') ? '🛍️'
+          : '📋';
+        return `{ href: '/${r}', label: '${label}', emoji: '${emoji}' }`;
+      }).join(',\n  ');
+
+      const dashContent = `'use client';
+import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+
+interface User { id: string; name?: string; email: string; }
+interface Stat { key: string; label: string; href: string; count: number | string; }
+
+const NAV_ITEMS = [
+  { href: '/', label: 'Home', emoji: '🏠' },
+  ${navItems}
+];
+
+const RESOURCES = [${resourceList ? `\n  ${resourceList}\n` : ''}];
+
+export default function DashboardPage() {
+  const router = useRouter();
+  const [user, setUser] = useState<User | null>(null);
+  const [stats, setStats] = useState<Stat[]>([]);
+  const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'unauthenticated'>('loading');
+
+  const loadDashboard = useCallback(async () => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch('/api/auth/me');
+        if (res.ok) {
+          const d = await res.json();
+          const userObj = d.user ?? d;
+          if (userObj?.email) {
+            setUser(userObj);
+            setAuthState('authenticated');
+            if (RESOURCES.length > 0) {
+              const results = await Promise.allSettled(
+                RESOURCES.map(res2 =>
+                  fetch(res2.apiPath)
+                    .then(r => r.json())
+                    .then(d2 => {
+                      const arr = d2[res2.key] ?? d2.data ?? d2.items ?? d2.results ?? (Array.isArray(d2) ? d2 : null);
+                      return { key: res2.key, label: res2.label, href: res2.href, count: Array.isArray(arr) ? arr.length : '—' };
+                    })
+                    .catch(() => ({ key: res2.key, label: res2.label, href: res2.href, count: '—' }))
+                )
+              );
+              setStats(results.filter(r => r.status === 'fulfilled').map(r => (r as PromiseFulfilledResult<Stat>).value));
+            }
+            return;
+          }
+        }
+        if (res.status === 401 || res.status === 403) {
+          setAuthState('unauthenticated');
+          router.replace('/auth');
+          return;
+        }
+        lastError = \`HTTP \${res.status}\`;
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 1500));
+      } catch (e) {
+        lastError = e;
+        if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 1500));
+      }
+    }
+    console.warn('Dashboard auth failed after 3 attempts:', lastError);
+    setAuthState('unauthenticated');
+    router.replace('/auth');
+  }, [router]);
+
+  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+
+  async function handleLogout() {
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch {}
+    router.replace('/auth');
+  }
+
+  if (authState === 'loading') {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-3">
+        <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full" />
+        <p className="text-sm text-slate-400">Loading your dashboard…</p>
+      </div>
+    );
+  }
+
+  if (authState === 'unauthenticated') return null;
+
+  return (
+    <main className="min-h-screen bg-slate-50">
+      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Link href="/" className="text-lg font-bold text-slate-900">${appName}</Link>
+          <span className="text-slate-300">/</span>
+          <span className="text-sm font-medium text-slate-600">Dashboard</span>
+        </div>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-slate-500">{user?.name ?? user?.email}</span>
+          <button onClick={handleLogout} className="text-sm px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 transition-colors">Sign out</button>
+        </div>
+      </header>
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-slate-900">Welcome back{user?.name ? \`, \${user.name}\` : ''}!</h1>
+          <p className="mt-1 text-sm text-slate-500">Here is what is happening with your account.</p>
+        </div>
+        {stats.length > 0 ? (
+          <div className={\`grid gap-4 mb-8 \${stats.length === 1 ? 'grid-cols-1 max-w-xs' : stats.length === 2 ? 'grid-cols-2' : stats.length === 3 ? 'grid-cols-3' : 'grid-cols-2 lg:grid-cols-4'}\`}>
+            {stats.map(s => (
+              <Link key={s.key} href={s.href} className="block bg-white rounded-2xl border border-slate-200 p-5 hover:border-blue-200 transition-colors">
+                <p className="text-xs font-medium text-slate-400 uppercase tracking-wide">{s.label}</p>
+                <p className="mt-2 text-3xl font-bold text-slate-900">{String(s.count)}</p>
+                {(s.count === 0 || s.count === '0') && <p className="mt-1 text-xs text-slate-400">No {s.label.toLowerCase()} yet</p>}
+              </Link>
+            ))}
+          </div>
+        ) : (
+          <div className="bg-white rounded-2xl border border-slate-200 p-8 mb-8 text-center">
+            <p className="text-slate-400 text-sm">Your activity summary will appear here as you use the app.</p>
+          </div>
+        )}
+        <div className="bg-white rounded-2xl border border-slate-200 p-6">
+          <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-4">Quick access</h2>
+          <nav className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {NAV_ITEMS.map(item => (
+              <Link key={item.href} href={item.href} className="flex items-center gap-2 px-4 py-3 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors text-sm font-medium text-slate-700">
+                <span>{item.emoji}</span><span>{item.label}</span>
+              </Link>
+            ))}
+          </nav>
+        </div>
+      </div>
+    </main>
+  );
+}
+`;
+
+      await mkdir(path3.dirname(dashPath), { recursive: true });
+      await writeFile(dashPath, dashContent, 'utf-8');
+      return NextResponse.json({ success: true, repaired: true, file: 'app/dashboard/page.tsx', apiRoutes: uniqueApiRoutes });
+    }
+
+    // ── repair-auth-pages: detect and replace stub auth pages with real forms ────────
+    if (action === 'repair-auth-pages') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+      const { readdir: raDir, readFile: raFile } = await import('fs/promises');
+      const raMod = await import('path');
+
+      const AUTH_PAGE_GLOBS = [
+        'app/auth/page.tsx',
+        'app/auth/page.jsx',
+        'app/login/page.tsx',
+        'app/signin/page.tsx',
+        'app/(auth)/login/page.tsx',
+        'app/(auth)/signin/page.tsx',
+      ];
+
+      const isStub = (src: string) => {
+        const hasRedirectToRoot = /router\.(replace|push)\s*\(\s*['"]\/['"]\s*\)/.test(src);
+        const hasNoForm = !/<form|<input|onSubmit|handleSubmit/.test(src);
+        const hasReturnNull = /return\s+null\s*[;}]/.test(src) && src.length < 400;
+        return hasRedirectToRoot || hasNoForm || hasReturnNull;
+      };
+
+      const combinedAuthPage = `'use client';
+import { useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
+
+function AuthForm() {
+  const router = useRouter();
+  const params = useSearchParams();
+  const [mode, setMode] = useState<'signin' | 'signup'>(params.get('mode') === 'signup' ? 'signup' : 'signin');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const url = mode === 'signup' ? '/api/auth/register' : '/api/auth/login';
+      const body = mode === 'signup' ? { name, email, password } : { email, password };
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Authentication failed'); return; }
+      router.push('/dashboard');
+      router.refresh();
+    } catch { setError('Network error'); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <main className="min-h-screen flex items-center justify-center bg-slate-50 px-4 py-12">
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+          <Link href="/" className="text-2xl font-bold text-slate-900">Welcome</Link>
+          <p className="mt-1 text-sm text-slate-500">{mode === 'signin' ? 'Sign in to your account' : 'Create a new account'}</p>
+        </div>
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
+          <div className="flex rounded-xl bg-slate-100 p-1 mb-6">
+            <button type="button" onClick={() => { setMode('signin'); setError(''); }}
+              className={\`flex-1 py-2 rounded-lg text-sm font-medium transition-colors \${mode === 'signin' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'}\`}>Sign In</button>
+            <button type="button" onClick={() => { setMode('signup'); setError(''); }}
+              className={\`flex-1 py-2 rounded-lg text-sm font-medium transition-colors \${mode === 'signup' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500 hover:text-slate-700'}\`}>Sign Up</button>
+          </div>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {mode === 'signup' && (
+              <input type="text" required value={name} onChange={e => setName(e.target.value)}
+                placeholder="Full name" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            )}
+            <input type="email" required value={email} onChange={e => setEmail(e.target.value)}
+              placeholder="Email address" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            <input type="password" required minLength={6} value={password} onChange={e => setPassword(e.target.value)}
+              placeholder="Password" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            {error && <p className="text-red-600 text-sm rounded-lg bg-red-50 border border-red-200 px-3 py-2">{error}</p>}
+            <button type="submit" disabled={loading}
+              className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition-colors disabled:opacity-60">
+              {loading ? 'Please wait…' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
+            </button>
+          </form>
+          <p className="mt-4 text-center text-sm text-slate-500">
+            {mode === 'signin'
+              ? <button type="button" onClick={() => { setMode('signup'); setError(''); }} className="text-blue-600 font-medium hover:underline">No account? Sign up free</button>
+              : <button type="button" onClick={() => { setMode('signin'); setError(''); }} className="text-blue-600 font-medium hover:underline">Already have an account? Sign in</button>}
+          </p>
+        </div>
+        <p className="mt-4 text-center"><Link href="/" className="text-xs text-slate-400 hover:text-slate-600">← Back to Home</Link></p>
+      </div>
+    </main>
+  );
+}
+
+export default function AuthPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen flex items-center justify-center"><div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full"/></div>}>
+      <AuthForm />
+    </Suspense>
+  );
+}
+`;
+
+      const repaired: string[] = [];
+      for (const rel of AUTH_PAGE_GLOBS) {
+        const abs = raMod.join(projectPath, rel);
+        try {
+          const src = await raFile(abs, 'utf-8');
+          if (isStub(src)) {
+            await writeFile(abs, combinedAuthPage, 'utf-8');
+            repaired.push(rel);
+          }
+        } catch { /* file doesn't exist — skip */ }
+      }
+
+      return NextResponse.json({ success: true, repaired, total: repaired.length, message: repaired.length > 0 ? `Repaired ${repaired.length} stub auth page(s): ${repaired.join(', ')}` : 'No stub auth pages found' });
+    }
+
+    // ── repair-missing-routes: scan disk files, find broken nav links, create stubs ─
+    if (action === 'repair-missing-routes') {
+      if (!projectPath) return NextResponse.json({ success: false, error: 'Missing projectPath' }, { status: 400 });
+
+      const { readdir: rdDir, readFile: rdFile } = await import('fs/promises');
+      const pathMod = await import('path');
+
+      async function walkDir(dir: string, ext: RegExp, results: string[] = []): Promise<string[]> {
+        try {
+          const entries = await rdDir(dir, { withFileTypes: true });
+          for (const e of entries) {
+            if (e.name === 'node_modules' || e.name === '.next') continue;
+            const full = pathMod.join(dir, e.name);
+            if (e.isDirectory()) await walkDir(full, ext, results);
+            else if (ext.test(e.name)) results.push(full);
+          }
+        } catch { /* skip unreadable */ }
+        return results;
+      }
+
+      // Build set of existing page routes
+      const appDir = pathMod.join(projectPath, 'app');
+      const existingPages = new Set<string>();
+      const pageFiles = await walkDir(appDir, /^page\.[jt]sx?$/);
+      for (const pf of pageFiles) {
+        const rel = pf.replace(appDir, '').replace(/\/page\.[jt]sx?$/, '') || '/';
+        // strip route groups like (auth)
+        const clean = rel.replace(/\/\([^)]+\)/g, '') || '/';
+        existingPages.add(clean);
+      }
+
+      // Scan all source files for href references (including object-literal patterns)
+      const srcFiles = await walkDir(projectPath, /\.[jt]sx?$/);
+      const routePatterns = [
+        /\bhref\s*=\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+        /\bhref\s*=\s*\{\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]\s*\}/g,
+        /\bhref\s*:\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+        /\bto\s*:\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+        /\bpath\s*:\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+        /router\.push\s*\(\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+        /\bredirect\s*\(\s*["'`](\/[^"'`[\]{}$]*?)(?:[?#][^"'`]*)?["'`]/g,
+      ];
+
+      const referencedRoutes = new Set<string>();
+      for (const sf of srcFiles) {
+        if (sf.includes('node_modules') || sf.includes('.next')) continue;
+        try {
+          const src = await rdFile(sf, 'utf-8');
+          for (const pat of routePatterns) {
+            let m;
+            while ((m = pat.exec(src)) !== null) {
+              const route = m[1].replace(/\/$/, '') || '/';
+              if (!route || route.startsWith('/api/') || route.includes('[') || route.includes('${')) continue;
+              referencedRoutes.add(route);
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      // Determine which nav routes need page stubs
+      const created: string[] = [];
+      for (const route of referencedRoutes) {
+        if (existingPages.has(route)) continue;
+        // Skip auth-provider routes (Cognito, Next-auth)
+        if (/^\/(api\/)?auth\/callback|cognito|oauth/.test(route)) continue;
+        const pageName = route.split('/').filter(Boolean).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(' ') || 'Home';
+        const componentName = pageName.replace(/[^a-zA-Z0-9]/g, '');
+        const stub = `'use client';
+import Link from 'next/link';
+
+export default function ${componentName}Page() {
+  return (
+    <main className="min-h-screen flex flex-col items-center justify-center p-8 bg-slate-50">
+      <div className="max-w-md w-full text-center">
+        <h1 className="text-3xl font-bold text-slate-900 mb-3">${pageName}</h1>
+        <p className="text-slate-500 mb-6">This page is coming soon.</p>
+        <Link href="/" className="inline-flex items-center gap-2 bg-blue-600 text-white px-5 py-2.5 rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium">← Back Home</Link>
+      </div>
+    </main>
+  );
+}`;
+        const dir = pathMod.join(appDir, route.replace(/^\//, ''));
+        await mkdir(dir, { recursive: true });
+        await writeFile(pathMod.join(dir, 'page.tsx'), stub, 'utf-8');
+        created.push(route);
+      }
+
+      return NextResponse.json({ success: true, created, total: created.length, message: created.length > 0 ? `Created ${created.length} missing page stubs: ${created.join(', ')}` : 'All referenced routes already have pages' });
     }
 
     // ── read-file: read a single file from a project for diagnostics ────────────
@@ -2033,6 +3135,7 @@ Complete, working, production-quality code. No placeholders.`;
 
       return NextResponse.json({
         ...serverResult,
+        previewUrl: publicPreviewUrl(serverResult.port),
         project,
         discovery: {
           summary: discovery.summary,
@@ -2584,12 +3687,29 @@ Return ONLY the corrected file in this exact format:
       const explicitTier: import('@/lib/constants').BedrockTier | undefined =
         body.tier && ['HAIKU', 'SONNET', 'STRONGEST'].includes(body.tier) ? body.tier : undefined;
 
+      // ── Scope-filter targetFiles for backend errors ────────────────────────
+      // When the error kind is a pure backend error (route, DB, auth, provider),
+      // the AI must NOT touch UI page/layout/component files. Remove them from
+      // the target list so they don't appear in file contexts for the repair prompt.
+      const errorKind: string = body.errorKind ?? '';
+      let effectiveTargetFiles = [...targetFiles];
+      try {
+        const { isUIFile: _isUI, isBackendErrorKind: _isBE } = await import('@/services/design-baseline');
+        if (errorKind && _isBE(errorKind)) {
+          const before = effectiveTargetFiles.length;
+          effectiveTargetFiles = effectiveTargetFiles.filter(f => !_isUI(f));
+          if (effectiveTargetFiles.length < before) {
+            console.log(`[agent-fix] Removed ${before - effectiveTargetFiles.length} UI file(s) from target list (backend error: ${errorKind})`);
+          }
+        }
+      } catch { /* non-critical */ }
+
       // ── Build file context ─────────────────────────────────────────────────
       const fileContexts: string[] = [];
       const extraContextFiles: string[] = [];
 
       // Primary target files
-      for (const relPath of targetFiles.slice(0, 6)) {
+      for (const relPath of effectiveTargetFiles.slice(0, 6)) {
         try {
           const content = await readFile(join(projectPath, relPath), 'utf-8');
           fileContexts.push(`=== ${relPath} ===\n${content.slice(0, 4000)}`);
@@ -2727,6 +3847,36 @@ Return ONLY the corrected file in this exact format:
         }
       } catch { /* non-fatal — spec may not exist for older projects */ }
 
+      // ── Design preservation block ─────────────────────────────────────────
+      // Load the baseline file list so repair prompts can explicitly name the
+      // protected files. This prevents broader/rewrite strategies from replacing
+      // working visual code as a side-effect of fixing backend errors.
+      let designPreservationBlock = '';
+      let baselineUIFiles: string[] = [];
+      try {
+        const { getBaselineFileSet, isBackendErrorKind } = await import('@/services/design-baseline');
+        const bSet = await getBaselineFileSet(projectPath);
+        baselineUIFiles = [...bSet];
+        if (baselineUIFiles.length > 0) {
+          const errorKind = body.errorKind ?? '';
+          const isBackend = errorKind ? isBackendErrorKind(errorKind) : false;
+          if (isBackend) {
+            designPreservationBlock =
+              `\n⚠️ DESIGN PRESERVATION — HARD RULE:\n` +
+              `The error you are fixing is a backend/API error. The following UI files contain the app's visual design and MUST NOT be changed:\n` +
+              baselineUIFiles.map(f => `  • ${f}`).join('\n') + '\n' +
+              `Do NOT touch any CSS, colors, layout, component structure, or JSX in these files.\n` +
+              `Only output [EDIT_START] blocks for API routes, lib/, and config files.\n\n`;
+          } else {
+            designPreservationBlock =
+              `\n⚠️ DESIGN PRESERVATION:\n` +
+              `These files contain the project's original visual design — preserve their styling, colors, layout, and component structure exactly:\n` +
+              baselineUIFiles.map(f => `  • ${f}`).join('\n') + '\n' +
+              `If you must edit a UI file to fix a broken import or TypeScript error, change ONLY that import/type line. Do NOT rewrite JSX, styles, or component logic.\n\n`;
+          }
+        }
+      } catch { /* non-critical */ }
+
       // ── Build the fix prompt based on strategy ─────────────────────────────
       const relevantLogs = serverLogs
         ? serverLogs.split('\n').filter(l => /error|failed|cannot find|syntax|warning/i.test(l)).slice(-20).join('\n')
@@ -2759,7 +3909,7 @@ SURGICAL RULES — FOLLOW EXACTLY:
 7. Do NOT add comments describing what changed.
 Format: [EDIT_START] [FILE: ${targetFiles[0] ?? 'unknown'}] <complete modified file content> [EDIT_END]`;
       } else if (strategy === 'rewrite') {
-        fixPrompt = `${repairSpecBlock}FULL REWRITE TASK — Previous targeted fixes failed. Rewrite the broken files completely.
+        fixPrompt = `${repairSpecBlock}${designPreservationBlock}FULL REWRITE TASK — Previous targeted fixes failed. Rewrite the broken files completely.
 
 ERRORS TO FIX:
 ${errorContext || '(see logs below)'}
@@ -2792,7 +3942,7 @@ REWRITE RULES:
 7. Output ALL changed files — complete content, no truncation.
 8. Format: [EDIT_START] [FILE: path] <content> [EDIT_END]`;
       } else if (strategy === 'broader') {
-        fixPrompt = `${repairSpecBlock}AUTONOMOUS AGENT FIX — Broader context repair attempt.
+        fixPrompt = `${repairSpecBlock}${designPreservationBlock}AUTONOMOUS AGENT FIX — Broader context repair attempt.
 
 ERRORS DETECTED:
 ${errorContext || '(see logs below)'}
@@ -2842,7 +3992,7 @@ REPAIR RULES:
           } catch {}
         }
 
-        fixPrompt = `${repairSpecBlock}AUTONOMOUS AGENT FIX — Minimum targeted changes.
+        fixPrompt = `${repairSpecBlock}${designPreservationBlock}AUTONOMOUS AGENT FIX — Minimum targeted changes.
 
 ERRORS DETECTED:
 ${errorContext || '(see logs below)'}
