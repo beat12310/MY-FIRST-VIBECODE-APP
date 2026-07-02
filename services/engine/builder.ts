@@ -319,17 +319,23 @@ export async function buildApp(plan: AppPlan, deps: BuilderDeps, signal?: AbortS
   // place, making it the reliable signal here.
   if (plan.requiresAuth) {
     const { buildMiddleware, deriveProtectedRoutes } = await import('./auth-template');
+    const { deriveRoleGates } = await import('./permissions-template');
     const { fileToRoute } = await import('./verifier');
     const pageRoutes = all
       .filter(f => /\/page\.[jt]sx?$/.test(f.path))
       .map(f => fileToRoute(f.path))
       .filter((r): r is string => r !== null);
-    const mw = buildMiddleware(deriveProtectedRoutes(pageRoutes));
+    const apiRoutes = all
+      .filter(f => /^(?:src\/)?app\/api\/.*route\.[jt]sx?$/.test(f.path))
+      .map(f => '/' + f.path.replace(/^(?:src\/)?app\//, '').replace(/\/route\.[jt]sx?$/, ''));
+    const roleGates = deriveRoleGates(pageRoutes, apiRoutes);
+    const mw = buildMiddleware(deriveProtectedRoutes(pageRoutes), roleGates);
     await deps.appendFiles(created.projectPath, [{ path: mw.filePath, content: mw.content }]);
     const existingMw = all.find(f => f.path === mw.filePath);
     if (existingMw) existingMw.content = mw.content; else all.push({ path: mw.filePath, content: mw.content });
     logs.push('Middleware regenerated against the complete, final page list.');
     blog(`14b) middleware regenerated — protecting: ${pageRoutes.filter(r => deriveProtectedRoutes([r]).length > 0).join(', ') || '(none)'}`);
+    if (roleGates.length > 0) blog(`14c) role gates detected — ${roleGates.map(g => `${g.role}:${g.prefix}`).join(', ')}`);
   }
 
   // 5.7. Ensure the shared Breadcrumbs component exists whenever there's a

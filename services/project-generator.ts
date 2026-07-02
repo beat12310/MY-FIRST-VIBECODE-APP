@@ -284,6 +284,17 @@ export function initTable(sql: string): void {
   getDb().exec(sql);
 }
 
+// Unlike CREATE TABLE IF NOT EXISTS, SQLite's ALTER TABLE ADD COLUMN throws
+// if the column already exists — this makes it idempotent so it's safe to
+// call on every import, the same way initTable() already is.
+export function addColumnIfMissing(table: string, column: string, sqlType: string = 'TEXT'): void {
+  try {
+    getDb().exec(\`ALTER TABLE \${table} ADD COLUMN \${column} \${sqlType}\`);
+  } catch (e) {
+    if (!String((e as Error)?.message).includes('duplicate column')) throw e;
+  }
+}
+
 export const db = {
   all<T = Record<string, unknown>>(sql: string, ...params: unknown[]): T[] {
     return getDb().prepare(sql).all(...params) as T[];

@@ -373,6 +373,7 @@ async function tryFastPathFix(
   const AUTH_FAILURE_RE = /^(Workflow failed: User (signup|login)|Workflow failed: Protected route blocks anonymous|Security failed: Protected page requires auth)$/;
   if (AUTH_FAILURE_RE.test(failure.detail)) {
     const { buildAuthRoutes, buildMiddleware, deriveProtectedRoutes } = await import('./auth-template');
+    const { deriveRoleGates } = await import('./permissions-template');
     const { fileToRoute } = await import('./verifier');
     const { writeFile, mkdir } = await import('fs/promises');
     const { join, dirname } = await import('path');
@@ -390,7 +391,14 @@ async function tryFastPathFix(
       .filter(pf => /\/page\.[jt]sx?$/.test(pf.path))
       .map(pf => fileToRoute(pf.path))
       .filter((r): r is string => r !== null);
-    const mw = buildMiddleware(deriveProtectedRoutes(pageRoutes));
+    // Re-derives role gates from the CURRENT file set rather than reading
+    // them back out of the existing middleware.ts, so this regeneration
+    // (triggered by an unrelated auth-workflow failure) never accidentally
+    // drops role-gating that was already in place.
+    const apiRoutesForRoles = files
+      .filter(pf => /^(?:src\/)?app\/api\/.*route\.[jt]sx?$/.test(pf.path))
+      .map(pf => '/' + pf.path.replace(/^(?:src\/)?app\//, '').replace(/\/route\.[jt]sx?$/, ''));
+    const mw = buildMiddleware(deriveProtectedRoutes(pageRoutes), deriveRoleGates(pageRoutes, apiRoutesForRoles));
     const mwAbs = join(projectPath, mw.filePath);
     await mkdir(dirname(mwAbs), { recursive: true });
     await writeFile(mwAbs, mw.content, 'utf8');

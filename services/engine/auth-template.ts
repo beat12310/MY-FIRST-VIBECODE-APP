@@ -36,6 +36,8 @@
  * cost, zero variance, matches every future app automatically.
  */
 
+import type { RoleGate } from './permissions-template';
+
 export interface AuthFile { filePath: string; content: string }
 
 const COOKIE_OPTS = `{
@@ -172,19 +174,74 @@ export function routeToPatternSource(route: string): string {
   return `/^${escaped}(\\/.*)?$/`;
 }
 
-export function buildMiddleware(protectedRoutes: string[]): AuthFile {
+/**
+ * `roleGates` is additive and defaults to empty — every existing call site
+ * that doesn't pass it (project-generator.ts, builder.ts, repairer.ts's
+ * auth-failure fast-path) gets BYTE-IDENTICAL output to before this
+ * parameter existed. Only when an app actually has role-gated sections
+ * (services/engine/permissions-template.ts's deriveRoleGates) does the
+ * generated middleware.ts grow the extra role-checking scaffolding at all.
+ *
+ * jose's jwtVerify() (not lib/managed/auth.ts's getAuthUser()/verifyToken())
+ * is used to read the role claim directly — getAuthUser() transitively
+ * imports lib/managed/db.ts (better-sqlite3, a native Node addon) which
+ * cannot run in the Edge runtime middleware executes in by default. jose is
+ * Edge-safe and the role claim is already embedded in the JWT payload by
+ * loginUser(), so no database lookup is needed just to read it here.
+ */
+export function buildMiddleware(protectedRoutes: string[], roleGates: RoleGate[] = []): AuthFile {
   const patterns = protectedRoutes.length > 0
     ? protectedRoutes.map(r => `  ${routeToPatternSource(r)}`).join(',\n')
     : '  /^\\/dashboard(\\/.*)?$/';
 
-  const content = `import { NextRequest, NextResponse } from 'next/server';
+  const hasRoleGates = roleGates.length > 0;
 
+  const roleImport = hasRoleGates ? `import { jwtVerify } from 'jose';\n` : '';
+  const jwtSecretDecl = hasRoleGates ? `
+const JWT_SECRET = new TextEncoder().encode(
+  process.env.MANAGED_JWT_SECRET || 'dwomoh-change-in-production-' + process.cwd()
+);
+` : '';
+  const rolePatternsDecl = hasRoleGates ? `
+const ROLE_PATTERNS: { pattern: RegExp; role: string }[] = [
+${roleGates.map(g => `  { pattern: ${routeToPatternSource(g.prefix)}, role: '${g.role}' },\n  { pattern: ${routeToPatternSource('/api' + g.prefix)}, role: '${g.role}' },`).join('\n')}
+];
+` : '';
+  const roleCheckBlock = hasRoleGates ? `
+
+  const roleGate = ROLE_PATTERNS.find((g) => g.pattern.test(pathname));
+  if (roleGate) {
+    const token = request.cookies.get('managed_token')?.value;
+    if (!token) return denyAccess(request, pathname);
+    try {
+      const { payload } = await jwtVerify(token, JWT_SECRET);
+      if (payload.role !== roleGate.role) return denyAccess(request, pathname);
+      return NextResponse.next();
+    } catch {
+      return denyAccess(request, pathname);
+    }
+  }
+` : '';
+  const denyAccessFn = hasRoleGates ? `
+function denyAccess(request: NextRequest, pathname: string) {
+  if (pathname.startsWith('/api/')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  const loginUrl = new URL('/login', request.url);
+  loginUrl.searchParams.set('redirect', pathname);
+  return NextResponse.redirect(loginUrl);
+}
+` : '';
+  const matcherLine = hasRoleGates
+    ? `matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)', ${roleGates.map(g => `'/api${g.prefix}/:path*'`).join(', ')}],`
+    : `matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],`;
+
+  const content = `import { NextRequest, NextResponse } from 'next/server';
+${roleImport}${jwtSecretDecl}
 const PROTECTED_PATTERNS = [
 ${patterns},
 ];
-
-export function middleware(request: NextRequest) {
-  const { pathname } = request.nextUrl;
+${rolePatternsDecl}
+export ${hasRoleGates ? 'async ' : ''}function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;${roleCheckBlock}
   const isProtected = PROTECTED_PATTERNS.some((p) => p.test(pathname));
   if (!isProtected) return NextResponse.next();
 
@@ -196,9 +253,9 @@ export function middleware(request: NextRequest) {
   }
   return NextResponse.next();
 }
-
+${denyAccessFn}
 export const config = {
-  matcher: ['/((?!api|_next/static|_next/image|favicon.ico).*)'],
+  ${matcherLine}
 };
 `;
   return { filePath: 'middleware.ts', content };

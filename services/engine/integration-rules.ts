@@ -25,6 +25,8 @@ import { addNavLink, routeToLabel, NAV_EXCLUDE_RE } from './nav-template';
 import { NAV_REGISTRY_PATH, addRegistryEntry, idFromRoute } from './nav-registry-template';
 import { addDashboardResource } from './dashboard-template';
 import { hasBreadcrumbs } from './breadcrumb-template';
+import { deriveRoleGates } from './permissions-template';
+import { extractSchema, extractQueryReferences, detectSchemaGaps, synthesizeTableSchema } from './schema-template';
 
 async function writeFileAt(projectPath: string, relPath: string, content: string): Promise<void> {
   const { writeFile, mkdir } = await import('fs/promises');
@@ -144,6 +146,82 @@ registerIntegration({
     const { patched, changed } = addProtectedRoute(content, m[1]);
     if (!changed) return null;
     await writeFileAt(projectPath, 'middleware.ts', patched);
+    return { changedFiles: ['middleware.ts'] };
+  },
+});
+
+// ── permissions (core) ───────────────────────────────────────────────────────
+// Upgraded from an honest stub: role NAMES are inherently app-specific data
+// (Admin/Worker/Promoter for an event platform, Admin/Vendor/Customer for a
+// marketplace) so they can't be invented from a generic rule — but once the
+// app's own route structure reveals a role-like section
+// (permissions-template.ts's deriveRoleGates), enforcing it is fully
+// deterministic.
+//
+// apply() derives page/API routes directly from ctx.files rather than
+// ctx.routes/ctx.apiRoutes — those are only reliably populated at VERIFY
+// time (computed by verifier.ts); repairer.ts's generic dispatch passes a
+// minimal context with both left empty, since every OTHER rule's apply()
+// only needs gap.detail/targetFile. Full middleware regeneration (not a
+// surgical patch) is used here deliberately: unlike middleware-protection's
+// single-array append, a FIRST role gate requires adding several new
+// structural pieces at once (a jose import, JWT_SECRET, the ROLE_PATTERNS
+// array, the role-check block, a denyAccess function, matcher entries) —
+// safely splicing all of that into a middleware.ts of unknown existing
+// shape is far riskier than regenerating from the same deterministic
+// template that already builds it correctly the first time.
+function localFileToRoute(path: string): string | null {
+  const m = /^(?:src\/)?app\/page\.[jt]sx?$/.test(path) ? '' : path.match(/^(?:src\/)?app\/(.*?)\/page\.[jt]sx?$/)?.[1];
+  if (m === undefined) return null;
+  const seg = m.split('/').filter(s => !/^\(.*\)$/.test(s)).join('/');
+  return seg ? '/' + seg : '/';
+}
+function deriveRoutesFromFiles(files: { path: string }[]): { pageRoutes: string[]; apiRoutes: string[] } {
+  const pageRoutes: string[] = [], apiRoutes: string[] = [];
+  for (const f of files) {
+    const r = localFileToRoute(f.path);
+    if (r) pageRoutes.push(r);
+    if (/^(?:src\/)?app\/api\/.*route\.[jt]sx?$/.test(f.path)) {
+      apiRoutes.push('/' + f.path.replace(/^(?:src\/)?app\//, '').replace(/\/route\.[jt]sx?$/, ''));
+    }
+  }
+  return { pageRoutes, apiRoutes };
+}
+
+registerIntegration({
+  id: 'permissions',
+  label: 'Role-based permissions',
+  category: 'core',
+  appliesTo: () => true,
+  detect(ctx: IntegrationContext): IntegrationGap[] {
+    if (!ctx.plan.requiresAuth) return [];
+    const mwFile = ctx.files.find(f => f.path === 'middleware.ts');
+    if (!mwFile) return [];
+    const roleGates = deriveRoleGates([...new Set(ctx.routes)], [...new Set(ctx.apiRoutes)]);
+    const gaps: IntegrationGap[] = [];
+    for (const g of roleGates) {
+      const pagePattern = routeToPatternSource(g.prefix);
+      const apiPattern = routeToPatternSource('/api' + g.prefix);
+      if (!mwFile.content.includes(pagePattern) || !mwFile.content.includes(apiPattern)) {
+        gaps.push({
+          integrationId: 'permissions',
+          detail: `Role gate ${g.prefix} (role: ${g.role}) is not enforced — middleware.ts does not cover it: middleware.ts`,
+          targetFile: 'middleware.ts',
+        });
+      }
+    }
+    return gaps;
+  },
+  async apply(_gap, projectPath, ctx): Promise<IntegrationApplyResult | null> {
+    const content = await readFileAt(projectPath, 'middleware.ts');
+    if (!content) return null;
+    const { pageRoutes, apiRoutes } = deriveRoutesFromFiles(ctx.files);
+    const roleGates = deriveRoleGates(pageRoutes, apiRoutes);
+    if (roleGates.length === 0) return null;
+    const { buildMiddleware } = await import('./auth-template');
+    const mw = buildMiddleware(deriveProtectedRoutes(pageRoutes), roleGates);
+    if (mw.content === content) return null;
+    await writeFileAt(projectPath, 'middleware.ts', mw.content);
     return { changedFiles: ['middleware.ts'] };
   },
 });
@@ -339,12 +417,92 @@ function stubRule(id: string, label: string, category: 'core' | 'optional', appl
 }
 stubRule('search-indexing', 'Search indexing', 'core', () => true,
   'No search infrastructure exists in the generated-app template (no Elasticsearch/Algolia/SQLite-FTS setup). Registered now so a future phase that adds real search infra can activate this rule without redesigning the registry; until then it correctly reports no gaps rather than inventing a search feature outside the scope of "wiring."');
-stubRule('permissions', 'Role-based permissions', 'core', () => true,
-  'The `role` field IS tracked on every user (lib/managed/auth.ts, JWT payload), but planner.ts does not yet capture PER-ROUTE role requirements, so there is no signal to drive deterministic role-based middleware. Deferred pending a planner enhancement, not an infrastructure gap — registered for catalog completeness.');
-stubRule('database-registration', 'Database schema registration', 'optional', (ctx) => ctx.fileSet.has('lib/managed/db.ts'),
-  'Already satisfied by construction: crud-template.ts calls initTable() with an idempotent CREATE TABLE IF NOT EXISTS at the top of every generated CRUD route, self-registering its schema on first import. No separate registration step is needed or possible to "gap" — registered for catalog completeness.');
 stubRule('migrations', 'Database migrations', 'optional', (ctx) => ctx.fileSet.has('lib/managed/db.ts'),
-  'SQLite\'s idempotent CREATE TABLE IF NOT EXISTS (via initTable(), called at import time by every generated route) already serves as a zero-config migration mechanism for this template — there is no separate migration system to wire. Registered for catalog completeness; a future move to a schema-versioned database would activate a real implementation here.');
+  'SQLite\'s idempotent CREATE TABLE IF NOT EXISTS (via initTable(), called at import time by every generated route) already serves as a zero-config migration mechanism for this template — there is no separate migration system to wire. The "database-schema" rule actively VERIFIES this mechanism is working (every table/column a query references actually has a matching initTable schema) rather than just assuming it; registered here for catalog completeness under the historical "migrations" name.');
+
+// ── database-schema (optional — requires the managed DB) ────────────────────
+// Upgraded from an honest stub: crud-template.ts's initTable() calls were
+// ASSUMED to keep schema in sync with queries, never actively verified — if
+// the model writes a custom route bypassing the template, or a query
+// drifts out of sync with its own table's columns, the first sign was a
+// runtime "no such table"/"no such column" SQL error, not a build-time
+// signal. See schema-template.ts for the extraction/cross-reference logic.
+registerIntegration({
+  id: 'database-schema',
+  label: 'Database schema (tables, columns, foreign keys)',
+  category: 'optional',
+  appliesTo: (ctx: IntegrationContext) => ctx.fileSet.has('lib/managed/db.ts'),
+  detect(ctx: IntegrationContext): IntegrationGap[] {
+    const schema = extractSchema(ctx.files);
+    const refs = extractQueryReferences(ctx.files);
+    const schemaGaps = detectSchemaGaps(schema, refs);
+    return schemaGaps.map(g => {
+      if (g.kind === 'missing-table') {
+        return {
+          integrationId: 'database-schema',
+          detail: `Table ${g.table} is missing (referenced in ${g.file}), columns needed: ${(g.columns ?? []).join(',')}: ${g.file}`,
+          targetFile: g.file,
+        };
+      }
+      if (g.kind === 'missing-column') {
+        return {
+          integrationId: 'database-schema',
+          detail: `Column ${g.column} is missing from table ${g.table} (referenced in ${g.file}): ${g.file}`,
+          targetFile: g.file,
+        };
+      }
+      return {
+        integrationId: 'database-schema',
+        detail: `Dangling foreign key: table ${g.table} column ${g.column} ${g.file}`,
+        targetFile: '',
+      };
+    });
+  },
+  async apply(gap, projectPath): Promise<IntegrationApplyResult | null> {
+    const missingTableMatch = gap.detail.match(/^Table (\w+) is missing \(referenced in ([^)]+)\), columns needed: ([^:]*): /);
+    if (missingTableMatch) {
+      const [, table, file, colsStr] = missingTableMatch;
+      const columns = colsStr ? colsStr.split(',').filter(Boolean) : [];
+      const content = await readFileAt(projectPath, file);
+      if (content === null) return null;
+      const createTableSql = synthesizeTableSchema(table, columns);
+      // Inserted right after the last import line, matching where
+      // crud-template.ts's own generated routes place their initTable()
+      // call — new code, so there's no existing content to preserve here.
+      const lines = content.split('\n');
+      let lastImportIdx = -1;
+      for (let i = 0; i < lines.length; i++) if (/^import\s/.test(lines[i])) lastImportIdx = i;
+      const injection = `\ninitTable(\`${createTableSql}\`);`;
+      const needsImport = !/from ['"]@\/lib\/managed\/db['"]/.test(content);
+      const importLine = needsImport ? `import { initTable } from '@/lib/managed/db';\n` : '';
+      lines.splice(lastImportIdx + 1, 0, importLine + injection);
+      await writeFileAt(projectPath, file, lines.join('\n'));
+      return { changedFiles: [file] };
+    }
+
+    const missingColMatch = gap.detail.match(/^Column (\w+) is missing from table (\w+) \(referenced in ([^)]+)\): /);
+    if (missingColMatch) {
+      const [, column, table, file] = missingColMatch;
+      const content = await readFileAt(projectPath, file);
+      if (content === null) return null;
+      const lines = content.split('\n');
+      let lastImportIdx = -1;
+      for (let i = 0; i < lines.length; i++) if (/^import\s/.test(lines[i])) lastImportIdx = i;
+      const needsImport = !/addColumnIfMissing/.test(content);
+      const importLine = needsImport ? `import { addColumnIfMissing } from '@/lib/managed/db';\n` : '';
+      const injection = `\naddColumnIfMissing('${table}', '${column}', 'TEXT');`;
+      lines.splice(lastImportIdx + 1, 0, importLine + injection);
+      await writeFileAt(projectPath, file, lines.join('\n'));
+      return { changedFiles: [file] };
+    }
+
+    // Dangling foreign keys decline — safely synthesizing the referenced
+    // table's FULL intended schema (not just the columns one query
+    // happens to touch) risks guessing wrong; the model can see the
+    // relationship's actual usage across the codebase and infer it properly.
+    return null;
+  },
+});
 stubRule('analytics', 'Analytics', 'optional', (ctx) => ctx.fileSet.has('lib/managed/analytics.ts'),
   'No analytics provider exists in the managed-services template yet (lib/managed/ has db/auth/email/storage/qr, no analytics). Gate correctly never fires today; the moment a future phase adds lib/managed/analytics.ts, this rule activates with zero changes elsewhere.');
 stubRule('notifications', 'Notifications', 'optional', (ctx) => ctx.fileSet.has('lib/managed/notifications.ts'),
