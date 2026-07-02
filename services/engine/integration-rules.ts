@@ -21,7 +21,8 @@ import {
   registerIntegration, type IntegrationContext, type IntegrationGap, type IntegrationApplyResult,
 } from './integration-registry';
 import { deriveProtectedRoutes, routeToPatternSource, addProtectedRoute } from './auth-template';
-import { addNavLink, routeToLabel } from './nav-template';
+import { addNavLink, routeToLabel, NAV_EXCLUDE_RE } from './nav-template';
+import { NAV_REGISTRY_PATH, addRegistryEntry, idFromRoute } from './nav-registry-template';
 import { addDashboardResource } from './dashboard-template';
 import { hasBreadcrumbs } from './breadcrumb-template';
 
@@ -40,17 +41,6 @@ async function readFileAt(projectPath: string, relPath: string): Promise<string 
 
 // ── navigation (core) ───────────────────────────────────────────────────────
 const NAV_FILE_RE = /(?:^|\/)(Navbar|Footer|Sidebar)\.[jt]sx?$/;
-// "auth" covers a combined signin/signup page (confirmed live: a generated
-// app used exactly this route with a mode=signup/signin toggle, matching
-// the SAME shape buildRouteStub's own auth-page template produces) — the
-// same reasoning that excludes /login and /signup individually applies to
-// a single page serving both. The (\/.*)? suffix ALSO excludes sub-paths
-// like /auth/login, /auth/register — confirmed live: a dead-link fast-path
-// created exactly these as separate stub pages (duplicating the combined
-// /auth?mode= page), and without the suffix they were flagged as missing
-// from nav even though they're auth-flow pages, not real navigable
-// destinations, same as their exact-match counterparts.
-const NAV_EXCLUDE_RE = /^\/(login|signup|register|sign-in|sign-up|signin|auth|logout|forgot-password|reset-password)(\/.*)?$/i;
 
 registerIntegration({
   id: 'navigation',
@@ -58,12 +48,34 @@ registerIntegration({
   category: 'core',
   appliesTo: () => true,
   detect(ctx: IntegrationContext): IntegrationGap[] {
+    const candidateRoutes = [...new Set(ctx.routes)].filter(
+      r => r !== '/' && !r.includes('[') && !NAV_EXCLUDE_RE.test(r),
+    );
+
+    // The registry (lib/managed/navigation.ts) is the reliable source of
+    // truth once it exists — its shape is entirely engine-controlled, so
+    // checking it is never ambiguous the way scanning arbitrary Navbar/
+    // Footer JSX can be. Falls back to the old text-scan only for apps
+    // built before this file existed.
+    const registryFile = ctx.files.find(f => f.path === NAV_REGISTRY_PATH);
+    if (registryFile) {
+      const gaps: IntegrationGap[] = [];
+      for (const route of candidateRoutes) {
+        if (registryFile.content.includes(`href: '${route}'`) || registryFile.content.includes(`href: "${route}"`)) continue;
+        gaps.push({
+          integrationId: 'navigation',
+          detail: `Route ${route} is not registered in the navigation registry: ${NAV_REGISTRY_PATH}`,
+          targetFile: NAV_REGISTRY_PATH,
+        });
+      }
+      return gaps;
+    }
+
     const navFiles = ctx.files.filter(f => NAV_FILE_RE.test(f.path));
     if (navFiles.length === 0) return [];
     const combined = navFiles.map(f => f.content).join('\n');
     const gaps: IntegrationGap[] = [];
-    for (const route of new Set(ctx.routes)) {
-      if (route === '/' || route.includes('[') || NAV_EXCLUDE_RE.test(route)) continue;
+    for (const route of candidateRoutes) {
       if (combined.includes(`'${route}'`) || combined.includes(`"${route}"`)) continue;
       gaps.push({
         integrationId: 'navigation',
@@ -74,6 +86,18 @@ registerIntegration({
     return gaps;
   },
   async apply(gap, projectPath): Promise<IntegrationApplyResult | null> {
+    if (gap.targetFile === NAV_REGISTRY_PATH) {
+      const m = gap.detail.match(/^Route (\S+) is not registered in the navigation registry: /);
+      if (!m) return null;
+      const route = m[1];
+      const content = await readFileAt(projectPath, NAV_REGISTRY_PATH);
+      if (!content) return null;
+      const result = addRegistryEntry(content, { id: idFromRoute(route), href: route, label: routeToLabel(route), order: 9999 });
+      if (!result.changed) return null;
+      await writeFileAt(projectPath, NAV_REGISTRY_PATH, result.content);
+      return { changedFiles: [NAV_REGISTRY_PATH] };
+    }
+
     const m = gap.detail.match(/^Route (\S+) is not registered in navigation: /);
     if (!m) return null;
     const route = m[1];

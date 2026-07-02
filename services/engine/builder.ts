@@ -352,6 +352,27 @@ export async function buildApp(plan: AppPlan, deps: BuilderDeps, signal?: AbortS
     logs.push('Breadcrumbs component injected (dynamic detail route present).');
   }
 
+  // 5.8. Inject the deterministic navigation registry (lib/managed/
+  // navigation.ts). Root cause: the engine's only record of "does every
+  // page have a nav entry" used to be parsing whatever JSX Navbar/Footer
+  // happened to contain — reliable for a single named or single anonymous
+  // array, but forced to decline safely whenever a file has MULTIPLE
+  // anonymous arrays (confirmed live: a Footer.tsx with separate "Explore"/
+  // "Account" sections). This file's shape is entirely engine-controlled —
+  // always exactly one `export const NAV_ITEMS: NavEntry[]` — so it can be
+  // the always-reliable source of truth for that check, same as
+  // lib/managed/db.ts/auth.ts are for their concerns. Injected fresh from
+  // the plan's pages, using the SAME exclusion rule (auth pages, dynamic
+  // routes, home) the navigation Integration Rule checks against.
+  if (!present.has('lib/managed/navigation.ts')) {
+    const { buildNavigationRegistry, deriveNavEntriesFromPages } = await import('./nav-registry-template');
+    const reg = buildNavigationRegistry(deriveNavEntriesFromPages(plan.pages));
+    await deps.appendFiles(created.projectPath, [{ path: reg.filePath, content: reg.content }]);
+    all.push({ path: reg.filePath, content: reg.content });
+    present.add(reg.filePath);
+    logs.push('Navigation registry (lib/managed/navigation.ts) injected.');
+  }
+
   // 5.6. Initialize project memory. Confirmed live: .project-memory.json
   // never got created by the build pipeline at all — only the EDIT pipeline
   // created it, reactively, on the FIRST edit request (with a crude fallback
