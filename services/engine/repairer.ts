@@ -14,7 +14,7 @@
  * so the loop logic is fully unit-testable without Bedrock or a live server.
  */
 import type {
-  AppPlan, ClassifiedFailure, ExternalServiceIssue, PlannedApiRoute, RepairResult, VerifyResult,
+  AppPlan, ClassifiedFailure, ExternalServiceIssue, RepairResult, VerifyResult,
 } from './types';
 
 export interface ApplyFixResult { changedFiles: string[] }
@@ -319,79 +319,36 @@ async function tryFastPathFix(
     }
   }
 
-  // A page/component calls an API route that was never planned at all (not
-  // just missing from the output — never declared as a route in the first
-  // place). Confirmed live on a FRESH, otherwise-fully-passing build: a
-  // dashboard page called /api/dashboard/stats, list pages called
-  // /api/suppliers and /api/products/[id] — none of which existed anywhere,
-  // fully broken data flow the old missingApiMatch path could never catch
-  // (it only fills PLANNED files; these were never planned). Synthesize a
-  // standard list/detail CRUD route from the URL shape itself — a
-  // best-effort but genuinely working handler is far better than a 404, and
-  // this covers the common case (the model invented a plausible REST path);
-  // anything that doesn't fit the standard shape (e.g. a one-off aggregate
-  // endpoint like /api/dashboard/stats) falls through to the model, which
-  // sees the calling file's own code as context and can infer the right
-  // response shape from how it's used.
-  const orphanedApiMatch = failure.area === 'structural'
-    ? failure.detail.match(/^Orphaned API call: .+, but the route was never created: (app\/api\/\S+\/route\.[jt]sx?)$/)
-    : null;
-  // Non-resource words: an endpoint literally named one of these is almost
-  // certainly a computed/aggregate response (stats, search results, the
-  // current session), not a CRUD-able table — forcing a generic list/create
-  // template onto it would return the WRONG SHAPE (an empty array instead of
-  // the summary object the caller actually expects), silently trading a 404
-  // for an equally-broken 200. Let the model handle these instead, where it
-  // can see the calling file's own code and infer the real response shape.
-  const NON_RESOURCE_SEGMENT = /^(stats|summary|search|export|import|dashboard|me|profile|login|register|logout|session|health|status|ping)$/i;
-  if (orphanedApiMatch) {
-    const filePath = orphanedApiMatch[1];
-    const routeUrl = '/' + filePath.replace(/^app\//, '').replace(/\/route\.[jt]sx?$/, '');
-    const isDetail = /\[id\]$/.test(routeUrl);
-    const resourceSegment = routeUrl.split('/').filter(Boolean).at(isDetail ? -2 : -1) ?? '';
-    if (!NON_RESOURCE_SEGMENT.test(resourceSegment)) {
-      const synthesizedRoute: PlannedApiRoute = {
-        route: routeUrl, filePath,
-        methods: isDetail ? ['GET', 'PUT', 'DELETE'] : ['GET', 'POST'],
-        purpose: 'Auto-generated for a call the app made without ever declaring this route.',
+  // Generic Integration Registry dispatch — a failure the Verifier raised
+  // via a registered IntegrationRule (api-registration, middleware-
+  // protection, navigation, dashboard-widgets, breadcrumbs, ...) carries
+  // that rule's id, so repair here is a single generic lookup-and-apply
+  // rather than one hand-coded regex-match block per integration type.
+  // Adding a new integration going forward means writing a rule in
+  // integration-rules.ts — this function never needs to change.
+  if (failure.integrationId) {
+    const { findRule } = await import('./integration-registry');
+    await import('./integration-rules'); // side-effect: registers every concrete rule
+    const rule = findRule(failure.integrationId);
+    if (rule) {
+      const files = await opts.readProjectFiles(projectPath);
+      // Several rules' apply() (navigation, dashboard-widgets) need to know
+      // WHICH file to read/patch — reuses describeTarget()'s existing
+      // trailing-file-path extraction rather than hardcoding an empty
+      // targetFile, which silently made every such apply() decline.
+      const { targetPath } = describeTarget(plan, failure);
+      const ctx = {
+        plan, files, fileSet: new Set(files.map(f => f.path)),
+        // apply() implementations parse what they need from the gap's own
+        // detail/targetFile (same convention as every other fast path in
+        // this file) rather than reading routes/apiRoutes — see
+        // integration-rules.ts's module doc for why that keeps this call
+        // site simple instead of needing route-resolution logic here too.
+        routes: [] as string[], apiRoutes: [] as string[],
       };
-      const { buildCrudRoute } = await import('./crud-template');
-      const crud = buildCrudRoute(synthesizedRoute, plan.dataModels);
-      if (crud) {
-        const { writeFile, mkdir } = await import('fs/promises');
-        const { join, dirname } = await import('path');
-        const abs = join(projectPath, crud.filePath);
-        await mkdir(dirname(abs), { recursive: true });
-        await writeFile(abs, crud.content, 'utf8');
-        return { changedFiles: [crud.filePath] };
-      }
-    }
-  }
-
-  // A route that should require a session but middleware.ts doesn't cover
-  // it. Self-healing backstop: builder.ts regenerates middleware.ts once
-  // after the initial file set is final, but a page created LATER — e.g. by
-  // THIS repairer's own dead-link fast-path just above, which runs after
-  // that point in the pipeline — can still slip through uncovered.
-  // Confirmed live: a /settings page created by the dead-link fast-path in
-  // the SAME repair batch was never added to PROTECTED_PATTERNS. Reuses the
-  // exact deterministic patcher already proven in the Editing engine phase.
-  const unprotectedMatch = failure.area === 'security'
-    ? failure.detail.match(/^Unprotected route (\S+) — middleware\.ts does not cover it: middleware\.ts$/)
-    : null;
-  if (unprotectedMatch) {
-    const route = unprotectedMatch[1];
-    const { addProtectedRoute } = await import('./auth-template');
-    const { readFile, writeFile } = await import('fs/promises');
-    const { join } = await import('path');
-    const mwPath = join(projectPath, 'middleware.ts');
-    const mwContent = await readFile(mwPath, 'utf8').catch(() => null);
-    if (mwContent) {
-      const { patched, changed } = addProtectedRoute(mwContent, route);
-      if (changed) {
-        await writeFile(mwPath, patched, 'utf8');
-        return { changedFiles: ['middleware.ts'] };
-      }
+      const gap = { integrationId: failure.integrationId, detail: failure.detail, targetFile: targetPath ?? '' };
+      const result = await rule.apply(gap, projectPath, ctx);
+      if (result) return result;
     }
   }
 
@@ -447,7 +404,14 @@ async function tryFastPathFix(
 
 /** Which file a failure targets, and the plan context for prompting about it. */
 function describeTarget(plan: AppPlan, failure: ClassifiedFailure) {
-  const pathMatch = failure.detail.match(/([\w@./-]+\.(?:tsx?|jsx?))\s*$/);
+  // Character class MUST include [ ] — a dynamic route's real file path
+  // (app/courses/[id]/page.tsx) contains brackets, and without them here the
+  // regex silently matches only the suffix after the last bracket ("/page.tsx"),
+  // a meaningless, ambiguous target. Confirmed live: a breadcrumbs failure
+  // targeting exactly this kind of path caused the repair prompt to ask the
+  // model to fix "/page.tsx", so its (correct) response referencing the real
+  // path never matched, and repair stalled at "no progress" every attempt.
+  const pathMatch = failure.detail.match(/([\w@./[\]-]+\.(?:tsx?|jsx?))\s*$/);
   const targetPath = pathMatch ? pathMatch[1] : null;
   const page = targetPath ? plan.pages.find(p => pathsMatch(targetPath, p.filePath)) : undefined;
   const api = targetPath ? plan.apiRoutes.find(r => pathsMatch(targetPath, r.filePath)) : undefined;

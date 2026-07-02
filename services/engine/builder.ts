@@ -332,6 +332,26 @@ export async function buildApp(plan: AppPlan, deps: BuilderDeps, signal?: AbortS
     blog(`14b) middleware regenerated — protecting: ${pageRoutes.filter(r => deriveProtectedRoutes([r]).length > 0).join(', ') || '(none)'}`);
   }
 
+  // 5.7. Ensure the shared Breadcrumbs component exists whenever there's a
+  // dynamic detail route to use it on. There's no safe deterministic hook to
+  // AUTHOR a new dynamic-route page WITH breadcrumbs built in — dead-link
+  // stubs are always literal paths (buildRouteStub), and a missing PLANNED
+  // dynamic page falls through to the model like any other missing page —
+  // so the model ends up writing these pages either way. What this step
+  // guarantees is that a real, ready-to-import components/Breadcrumbs.tsx
+  // always exists first, so the model (or the breadcrumbs Integration Rule's
+  // repair prompt) has one consistent component to reference instead of
+  // inventing a slightly different one on every generation.
+  const hasDynamicRoute = all.some(f => /\/\[[^/]+\]\/page\.[jt]sx?$/.test(f.path));
+  if (hasDynamicRoute && !present.has('components/Breadcrumbs.tsx')) {
+    const { buildBreadcrumbsComponent } = await import('./breadcrumb-template');
+    const bc = buildBreadcrumbsComponent();
+    await deps.appendFiles(created.projectPath, [{ path: bc.filePath, content: bc.content }]);
+    all.push({ path: bc.filePath, content: bc.content });
+    present.add(bc.filePath);
+    logs.push('Breadcrumbs component injected (dynamic detail route present).');
+  }
+
   // 5.6. Initialize project memory. Confirmed live: .project-memory.json
   // never got created by the build pipeline at all — only the EDIT pipeline
   // created it, reactively, on the FIRST edit request (with a crude fallback

@@ -16,13 +16,19 @@ import type {
   PerfMeasurement, PerfMetricName, PerformanceThresholds, SecurityCheck,
   VerifyResult, WorkflowKind, WorkflowStatus, WorkflowStep, WorkflowTest,
 } from './types';
-// The one non-type import in this otherwise standalone module: reuses the
-// EXACT SAME public-route heuristic auth-template.ts's middleware generator
-// uses, so "should this route require a session" is answered identically
-// everywhere in the engine rather than duplicated and risking drift.
-// auth-template.ts is itself a pure, dependency-free module (no Bedrock, no
-// I/O), so this doesn't compromise unit-testability.
-import { deriveProtectedRoutes, routeToPatternSource } from './auth-template';
+// The non-type imports in this otherwise standalone module: the Integration
+// Registry (services/engine/integration-registry.ts) is the single source
+// of truth for "does this generated feature have every wiring guarantee it
+// needs" — middleware protection, API registration, navigation, dashboard
+// widgets, breadcrumbs. Importing it here (rather than re-deriving each
+// check inline) means every registered rule's detect() runs as part of
+// static verification automatically; adding a new integration rule never
+// requires touching this file. './integration-rules' is a side-effect
+// import — it registers every concrete rule into the registry on load and
+// exports nothing itself. Both modules are pure/dependency-free (no
+// Bedrock, no I/O in detect()), so this doesn't compromise unit-testability.
+import { detectIntegrationGaps, type IntegrationContext } from './integration-registry';
+import './integration-rules';
 
 // ── Injected I/O ──────────────────────────────────────────────────────────────
 export interface ProbeRequest { method?: string; path: string; headers?: Record<string, string>; body?: string }
@@ -161,6 +167,12 @@ interface StaticAnalysis {
    * protected-seeming page appears, verify catches it and repair closes it.
    */
   unprotectedRoutes: string[];
+  /** A non-public top-level page missing from Navbar/Footer/Sidebar. Integration Registry rule "navigation". */
+  navigationGaps: string[];
+  /** An existing API resource with no corresponding dashboard stat widget. Integration Registry rule "dashboard-widgets". */
+  dashboardWidgetGaps: string[];
+  /** A dynamic detail page ([id]) with no breadcrumb trail. Integration Registry rule "breadcrumbs". */
+  breadcrumbGaps: string[];
 }
 
 export function analyzeStatic(plan: AppPlan, files: { path: string; content: string }[]): StaticAnalysis {
@@ -194,55 +206,22 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
     if (looksTruncated(f.content)) truncatedFiles.push(f.path);
   }
 
-  // orphaned API calls — fetch()/axios() targets with no matching route,
-  // existing OR planned. Skips files under app/api/ (route-to-route calls
-  // are rare and noisy to flag). Template-literal interpolations
-  // (`/api/x/${id}`) normalize to the literal "[id]" segment so they align
-  // with how route folder names are recorded in `apiRoutes` above. The
-  // detail string ENDS with the resolved route FILE path (not the URL) —
-  // repairer.ts's describeTarget() extracts a fixable target via a regex
-  // anchored on a trailing .ts/.tsx path, matching the convention every
-  // other failure-detail message in this file uses.
-  const orphanedApiCalls: string[] = [];
-  const knownApiPaths = new Set([...apiRoutes, ...plan.apiRoutes.map(r => r.route)]);
-  const fetchCallRe = /(?:fetch|axios(?:\.(?:get|post|put|patch|delete))?)\s*\(\s*[`'"]([^`'"]+)[`'"]/g;
-  for (const f of code) {
-    if (/^(?:src\/)?app\/api\//.test(f.path)) continue;
-    let m; while ((m = fetchCallRe.exec(f.content))) {
-      const raw = m[1].split('?')[0].replace(/\$\{[^}]+\}/g, '[id]');
-      if (!raw.startsWith('/api/')) continue;
-      const withoutTrailingId = raw.replace(/\/\[id\]$/, '');
-      if (!knownApiPaths.has(raw) && !knownApiPaths.has(withoutTrailingId)) {
-        const resolvedFile = `app${raw}/route.ts`;
-        orphanedApiCalls.push(`${f.path} calls ${raw}, but the route was never created: ${resolvedFile}`);
-      }
-    }
-  }
-
-  // unprotected routes — self-healing backstop for middleware coverage. Uses
-  // the SAME public-route heuristic auth-template.ts's deriveProtectedRoutes
-  // uses to build PROTECTED_PATTERNS in the first place, so "should this be
-  // protected" is answered identically everywhere in the engine, not
-  // reimplemented per call site.
-  const unprotectedRoutes: string[] = [];
-  if (plan.requiresAuth) {
-    const mwFile = files.find(f => f.path === 'middleware.ts');
-    if (mwFile) {
-      const expectedProtected = deriveProtectedRoutes([...new Set(routes)]);
-      // MUST go through the same routeToPatternSource() buildMiddleware()
-      // and addProtectedRoute() use to WRITE patterns — a naive substring
-      // check against the raw route string (e.g. does middleware.ts contain
-      // the literal text "/courses/[id]") FALSELY reports every dynamic
-      // route as uncovered forever, since a correctly-generated pattern
-      // replaces "[id]" with the wildcard "[^/]+" and never contains the
-      // literal bracket text at all. Confirmed live: this exact naive check
-      // caused the repair loop to "fix" /courses/[id] twice, re-detect it as
-      // still unprotected both times, and stall with no progress.
-      for (const r of expectedProtected) {
-        if (!mwFile.content.includes(routeToPatternSource(r))) unprotectedRoutes.push(r);
-      }
-    }
-  }
+  // Integration Registry — runs every applicable rule's detect() (API
+  // registration, middleware protection, navigation, dashboard widgets,
+  // breadcrumbs; core-vs-optional gating handled by each rule's appliesTo())
+  // against one shared context, then buckets the results back into the
+  // StaticAnalysis fields the rest of this file already expects. The
+  // detection ALGORITHMS themselves now live in integration-rules.ts (moved,
+  // not duplicated, from what used to be inline here) — this is the single
+  // place they run.
+  const integrationCtx: IntegrationContext = { plan, files, fileSet, routes: [...new Set(routes)], apiRoutes: [...new Set(apiRoutes)] };
+  const gaps = detectIntegrationGaps(integrationCtx);
+  const orphanedApiCalls = gaps.filter(g => g.integrationId === 'api-registration').map(g => g.detail);
+  const unprotectedRoutes = gaps.filter(g => g.integrationId === 'middleware-protection')
+    .map(g => g.detail.match(/^Unprotected route (\S+) /)?.[1]).filter((r): r is string => !!r);
+  const navigationGaps = gaps.filter(g => g.integrationId === 'navigation').map(g => g.detail);
+  const dashboardWidgetGaps = gaps.filter(g => g.integrationId === 'dashboard-widgets').map(g => g.detail);
+  const breadcrumbGaps = gaps.filter(g => g.integrationId === 'breadcrumbs').map(g => g.detail);
 
   // planned vs actual — pages are matched by RESOLVED ROUTE (pageSet, built above via
   // fileToRoute), not literal file path, so a page the model placed inside a route
@@ -261,6 +240,7 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
   return {
     fileCount: files.length, routes: [...new Set(routes)].sort(), apiRoutes: [...new Set(apiRoutes)].sort(),
     pagesGenerated: pageSet.size, deadLinks, brokenImports, missingExports, placeholders, placeholderMatches, missingPlanned, buildErrors, orphanedApiCalls, unprotectedRoutes,
+    navigationGaps, dashboardWidgetGaps, breadcrumbGaps,
   };
 }
 
@@ -389,18 +369,25 @@ export async function verifyApp(plan: AppPlan, projectPath: string, deps: Verifi
   const s = analyzeStatic(plan, files);
 
   const classifiedFailures: ClassifiedFailure[] = [];
-  const addInternal = (area: ClassifiedFailure['area'], detail: string) => classifiedFailures.push({ origin: 'internal', area, detail, repairable: true });
+  const addInternal = (area: ClassifiedFailure['area'], detail: string, integrationId?: string) =>
+    classifiedFailures.push({ origin: 'internal', area, detail, repairable: true, integrationId });
   s.buildErrors.forEach(d => addInternal('structural', d));
   s.missingPlanned.forEach(d => addInternal('structural', `Planned file missing: ${d}`));
   s.deadLinks.forEach(d => addInternal('runtime', `Dead link / 404 risk: ${d}`));
   s.brokenImports.forEach(d => addInternal('structural', `Broken import: ${d}`));
   s.missingExports.forEach(d => addInternal('structural', `Missing export: ${d}`));
-  s.orphanedApiCalls.forEach(d => addInternal('structural', `Orphaned API call: ${d}`));
+  s.orphanedApiCalls.forEach(d => addInternal('structural', `Orphaned API call: ${d}`, 'api-registration'));
   // The route MUST stay right before the trailing "middleware.ts" — repairer.ts's
   // fast-path extracts it via a regex, and describeTarget() separately relies
   // on the string ending in a real file path (middleware.ts), matching the
   // convention every other failure-detail message in this file uses.
-  s.unprotectedRoutes.forEach(r => addInternal('security', `Unprotected route ${r} — middleware.ts does not cover it: middleware.ts`));
+  s.unprotectedRoutes.forEach(r => addInternal('security', `Unprotected route ${r} — middleware.ts does not cover it: middleware.ts`, 'middleware-protection'));
+  // Integration Registry gaps — navigation/dashboard-widgets are UX/discovery
+  // concerns (a working but unlinked page), not build-breaking, so they're
+  // classified 'runtime' rather than 'structural'; breadcrumbs likewise.
+  s.navigationGaps.forEach(d => addInternal('runtime', d, 'navigation'));
+  s.dashboardWidgetGaps.forEach(d => addInternal('runtime', d, 'dashboard-widgets'));
+  s.breadcrumbGaps.forEach(d => addInternal('runtime', d, 'breadcrumbs'));
   // The file path MUST stay at the end of the detail string — repairer.ts's
   // describeTarget() extracts the target file via a regex anchored on `$`,
   // matching the convention every other failure-detail message in this file uses.

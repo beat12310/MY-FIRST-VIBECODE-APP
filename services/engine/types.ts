@@ -212,6 +212,13 @@ export interface ClassifiedFailure {
   external?: ExternalServiceIssue;
   /** internal → Repairer acts; external → reported only, code left untouched. */
   repairable: boolean;
+  /**
+   * Set when this failure came from the Integration Registry
+   * (services/engine/integration-registry.ts) — lets repairer.ts dispatch
+   * generically to the owning IntegrationRule's apply() instead of
+   * regex-matching `detail` against a hand-coded list of known shapes.
+   */
+  integrationId?: string;
 }
 
 // ── 2. Performance verification ──────────────────────────────────────────────
