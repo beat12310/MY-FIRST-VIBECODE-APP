@@ -28,6 +28,7 @@ import { hasBreadcrumbs } from './breadcrumb-template';
 import { deriveRoleGates } from './permissions-template';
 import { extractSchema, extractQueryReferences, detectSchemaGaps, synthesizeTableSchema } from './schema-template';
 import { SEARCH_SERVICE_PATH, buildSearchService, hasSearchIndex, addSearchIndexCall, indexableColumns, isSearchFeatureFile } from './search-template';
+import { NOTIFICATIONS_SERVICE_PATH, buildNotificationsService, isNotificationsFeatureFile } from './notifications-template';
 
 async function writeFileAt(projectPath: string, relPath: string, content: string): Promise<void> {
   const { writeFile, mkdir } = await import('fs/promises');
@@ -567,7 +568,38 @@ registerIntegration({
 });
 stubRule('analytics', 'Analytics', 'optional', (ctx) => ctx.fileSet.has('lib/managed/analytics.ts'),
   'No analytics provider exists in the managed-services template yet (lib/managed/ has db/auth/email/storage/qr, no analytics). Gate correctly never fires today; the moment a future phase adds lib/managed/analytics.ts, this rule activates with zero changes elsewhere.');
-stubRule('notifications', 'Notifications', 'optional', (ctx) => ctx.fileSet.has('lib/managed/notifications.ts'),
-  'No notification provider exists in the managed-services template yet. Same activation pattern as analytics above.');
+// ── notifications (optional — requires a notifications-related route/page + the managed DB) ──
+// Upgraded from an honest stub. Audit before building: lib/managed/email.ts
+// already exports a fully working sendNotificationEmail() (reused directly,
+// not duplicated); api-registration already auto-synthesizes a missing
+// /api/notifications CRUD route; database-schema already detects/repairs a
+// missing notifications table generically. The genuine gap this rule closes
+// is a CONSISTENT, well-designed schema + helper contract (user_id, message,
+// type, read, created_at) — the same problem lib/managed/auth.ts solves for
+// authentication — so the model doesn't reinvent an ad-hoc shape per app.
+//
+// Deliberately narrow: never creates or rewrites an API route, only ensures
+// lib/managed/notifications.ts exists when a notifications feature is present.
+registerIntegration({
+  id: 'notifications',
+  label: 'In-app notifications',
+  category: 'optional',
+  appliesTo: (ctx: IntegrationContext) => ctx.fileSet.has('lib/managed/db.ts') && ctx.files.some(isNotificationsFeatureFile),
+  detect(ctx: IntegrationContext): IntegrationGap[] {
+    if (ctx.fileSet.has(NOTIFICATIONS_SERVICE_PATH)) return [];
+    return [{
+      integrationId: 'notifications',
+      detail: `Notifications feature present but lib/managed/notifications.ts does not exist: ${NOTIFICATIONS_SERVICE_PATH}`,
+      targetFile: NOTIFICATIONS_SERVICE_PATH,
+    }];
+  },
+  async apply(_gap, projectPath): Promise<IntegrationApplyResult | null> {
+    const existing = await readFileAt(projectPath, NOTIFICATIONS_SERVICE_PATH);
+    if (existing !== null) return null;
+    const svc = buildNotificationsService();
+    await writeFileAt(projectPath, svc.filePath, svc.content);
+    return { changedFiles: [svc.filePath] };
+  },
+});
 
 export {};

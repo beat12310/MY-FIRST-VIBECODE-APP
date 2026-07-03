@@ -397,6 +397,22 @@ export async function buildApp(plan: AppPlan, deps: BuilderDeps, signal?: AbortS
     logs.push('Search service (lib/managed/search.ts) injected (search route present).');
   }
 
+  // 5.10. Inject lib/managed/notifications.ts whenever the app has a
+  // notifications-related route/page, so it has a consistent, well-designed
+  // notifications schema + helper contract from the moment it's generated,
+  // the same reasoning as auth.ts's contract for authentication. Only
+  // injected when actually needed.
+  const { isNotificationsFeatureFile } = await import('./notifications-template');
+  const hasNotificationsFeature = all.some(isNotificationsFeatureFile);
+  if (hasNotificationsFeature && present.has('lib/managed/db.ts') && !present.has('lib/managed/notifications.ts')) {
+    const { buildNotificationsService } = await import('./notifications-template');
+    const svc = buildNotificationsService();
+    await deps.appendFiles(created.projectPath, [{ path: svc.filePath, content: svc.content }]);
+    all.push({ path: svc.filePath, content: svc.content });
+    present.add(svc.filePath);
+    logs.push('Notifications service (lib/managed/notifications.ts) injected (notifications feature present).');
+  }
+
   // 5.6. Initialize project memory. Confirmed live: .project-memory.json
   // never got created by the build pipeline at all — only the EDIT pipeline
   // created it, reactively, on the FIRST edit request (with a crude fallback
