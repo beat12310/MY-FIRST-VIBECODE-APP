@@ -82,6 +82,37 @@ export const DEFAULT_STAGE_TIMEOUTS: Record<StageName, number> = {
   preview: 240_000,  // 4 min — npm install + dev-server cold start
 };
 
+/**
+ * Adaptive repair-stage timeout, confirmed necessary by live evidence: a
+ * comprehensive 5-app stress test showed the static 240s repair budget is
+ * OFTEN too tight for large failure batches (20-35 failures needing repair
+ * in one iteration) — a single batched Bedrock call for such a batch alone
+ * routinely took 90-130+ seconds, leaving no room for the 2nd-4th
+ * iterations a full repair cycle typically needs to converge. This caused
+ * partial convergence (real, correct fixes applied, but the stage timed
+ * out before a later iteration could finish) in multiple apps even after
+ * the repairer.ts stall-guard bug was fixed separately.
+ *
+ * Policy: small batches (<=SMALL_BATCH_THRESHOLD failures) keep the exact
+ * existing behavior — same base timeout, zero change for the common case.
+ * Above that, the timeout grows linearly with failure count (more failures
+ * → bigger batches per Bedrock call and/or more iterations needed to
+ * converge), capped so a single stage can never run unboundedly long.
+ */
+const REPAIR_SMALL_BATCH_THRESHOLD = 10;
+const REPAIR_PER_EXTRA_FAILURE_MS = 8_000;
+const REPAIR_MAX_TIMEOUT_MS = 600_000; // 10 min — matches the 'build' stage's own cap
+
+export function computeRepairTimeout(
+  failureCount: number,
+  baseTimeoutMs: number = DEFAULT_STAGE_TIMEOUTS.repair,
+  maxTimeoutMs: number = REPAIR_MAX_TIMEOUT_MS,
+): number {
+  if (failureCount <= REPAIR_SMALL_BATCH_THRESHOLD) return baseTimeoutMs;
+  const extra = (failureCount - REPAIR_SMALL_BATCH_THRESHOLD) * REPAIR_PER_EXTRA_FAILURE_MS;
+  return Math.min(baseTimeoutMs + extra, maxTimeoutMs);
+}
+
 export class StageTimeoutError extends Error {
   stage: StageName;
   ms: number;
@@ -146,11 +177,15 @@ export async function runPipeline(prompt: string, deps: OrchestratorDeps, ctx?: 
   const T = (s: StageName) => deps.timeouts?.[s] ?? DEFAULT_STAGE_TIMEOUTS[s];
   // Run a stage under its timeout, logging start + duration. Throws StageTimeoutError
   // on overrun AND aborts the stage's signal so its work actually stops (see withTimeout).
-  async function stage<R>(name: StageName, label: string, work: (signal: AbortSignal) => Promise<R> | R): Promise<R> {
+  // timeoutOverride lets a call site (repair, see computeRepairTimeout below) use an
+  // adaptive value instead of the stage's static default, without changing every
+  // OTHER call to that same stage name.
+  async function stage<R>(name: StageName, label: string, work: (signal: AbortSignal) => Promise<R> | R, timeoutOverride?: number): Promise<R> {
     const t0 = Date.now();
-    log(`${name.toUpperCase()} ▶ ${label} (timeout ${T(name)}ms)`);
+    const ms = timeoutOverride ?? T(name);
+    log(`${name.toUpperCase()} ▶ ${label} (timeout ${ms}ms)`);
     deps.onProgress?.(name, label);
-    const out = await withTimeout(work, T(name), name);
+    const out = await withTimeout(work, ms, name);
     log(`${name.toUpperCase()} ✔ done in ${Date.now() - t0}ms`);
     return out;
   }
@@ -224,7 +259,11 @@ export async function runPipeline(prompt: string, deps: OrchestratorDeps, ctx?: 
     const initialInternal = verify ? internalRepairable(verify) : [];
     if (verify && !verify.passed && initialInternal.length > 0) {
       try {
-        repair = await stage('repair', `bounded repair of ${initialInternal.length} internal failure(s)`, (signal) => deps.repair(plan as AppPlan, (build as BuildResult).projectPath, verify as VerifyResult, signal));
+        const repairTimeout = computeRepairTimeout(initialInternal.length, T('repair'));
+        if (repairTimeout > T('repair')) {
+          log(`REPAIR: adaptive timeout ${repairTimeout}ms (base ${T('repair')}ms) — ${initialInternal.length} failures exceeds the ${REPAIR_SMALL_BATCH_THRESHOLD}-failure small-batch threshold`);
+        }
+        repair = await stage('repair', `bounded repair of ${initialInternal.length} internal failure(s)`, (signal) => deps.repair(plan as AppPlan, (build as BuildResult).projectPath, verify as VerifyResult, signal), repairTimeout);
         log(`REPAIR: attempts=${repair.attempts}/${repair.maxAttempts}, resolved=${repair.resolved}, changedFiles=${repair.changedFiles.length}, skippedExternal=${repair.skippedExternalIssues.length}, stopReason=${repair.stopReason ?? 'n/a'}`);
 
         try {
@@ -321,7 +360,11 @@ export async function runPipeline(prompt: string, deps: OrchestratorDeps, ctx?: 
       const runtimeInternal = verify && !verify.passed ? internalRepairable(verify) : [];
       if (runtimeInternal.length > 0) {
         try {
-          const repair2 = await stage('repair', `bounded repair of ${runtimeInternal.length} runtime-detected failure(s)`, (signal) => deps.repair(plan as AppPlan, (build as BuildResult).projectPath, verify as VerifyResult, signal));
+          const repairTimeout2 = computeRepairTimeout(runtimeInternal.length, T('repair'));
+          if (repairTimeout2 > T('repair')) {
+            log(`REPAIR (runtime): adaptive timeout ${repairTimeout2}ms (base ${T('repair')}ms) — ${runtimeInternal.length} failures exceeds the ${REPAIR_SMALL_BATCH_THRESHOLD}-failure small-batch threshold`);
+          }
+          const repair2 = await stage('repair', `bounded repair of ${runtimeInternal.length} runtime-detected failure(s)`, (signal) => deps.repair(plan as AppPlan, (build as BuildResult).projectPath, verify as VerifyResult, signal), repairTimeout2);
           log(`REPAIR (runtime): attempts=${repair2.attempts}/${repair2.maxAttempts}, resolved=${repair2.resolved}, changedFiles=${repair2.changedFiles.length}, stopReason=${repair2.stopReason ?? 'n/a'}`);
           repair = repair2;
 

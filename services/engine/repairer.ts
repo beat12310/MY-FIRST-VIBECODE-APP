@@ -40,6 +40,12 @@ export interface RepairerDeps {
 const internalRepairable = (v: VerifyResult): ClassifiedFailure[] =>
   v.classifiedFailures.filter(f => f.origin === 'internal' && f.repairable);
 
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
 function mergeExternal(into: ExternalServiceIssue[], from: ExternalServiceIssue[]): void {
   for (const e of from) {
     if (!into.some(s => s.service === e.service && s.message === e.message && s.httpStatus === e.httpStatus)) into.push(e);
@@ -85,7 +91,17 @@ export async function repair(
   }
 
   log(`START — ${initialActionable.length} internal failure(s) to repair, maxAttempts=${maxAttempts}`);
-  let prevRemaining = -1;
+  // Stall guard compares the SET of remaining failures (by detail string),
+  // not just the count. Confirmed live (stress test, Community Q&A app):
+  // iteration 2 fully resolved all 14 of iteration 1's failures (5 missing
+  // pages created, /notifications + /search registered in nav,
+  // lib/managed/notifications.ts created) but that same work surfaced 14
+  // NEW, different failures (the newly-created pages themselves now needing
+  // their own middleware/nav coverage) — real progress, at the same count.
+  // The old count-only check (`remaining >= prevRemaining`) treated this as
+  // a stall and gave up 3 iterations early. A true stall is when the exact
+  // SAME set of failures persists across an iteration with no change.
+  let prevRemainingKeys: Set<string> | null = null;
 
   outer: while (attempts < maxAttempts) {
     if (signal?.aborted) {
@@ -211,13 +227,17 @@ export async function repair(
     if (current.passed) { stopReason = 'verification passed'; break; }
     if (remaining === 0) { stopReason = 'all internal issues resolved'; break; }
 
-    // ── Task 7 (stall guard): consecutive iterations with no reduction → stop ───
-    if (prevRemaining !== -1 && remaining >= prevRemaining) {
+    // ── Task 7 (stall guard): consecutive iterations with the EXACT SAME
+    // remaining failures (not just the same count) → stop. A different set
+    // at the same size is real progress (old issues resolved, new ones
+    // surfaced by that same fix) and must be allowed to continue.
+    const remainingKeys = new Set(remainingList.map(f => `${f.area}::${f.detail}`));
+    if (prevRemainingKeys !== null && setsEqual(prevRemainingKeys, remainingKeys)) {
       stopReason = 'no progress across consecutive iterations — stopping';
-      log(`no reduction in remaining issues (${prevRemaining} → ${remaining}) — EXIT (${stopReason})`);
+      log(`identical remaining issues across iterations (${remaining} failures, unchanged) — EXIT (${stopReason})`);
       break;
     }
-    prevRemaining = remaining;
+    prevRemainingKeys = remainingKeys;
   }
 
 
