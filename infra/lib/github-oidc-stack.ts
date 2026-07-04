@@ -50,7 +50,12 @@ export class GithubOidcStack extends cdk.Stack {
 
     const role = new iam.Role(this, 'GithubActionsVerificationRole', {
       roleName: 'dwomoh-github-actions-verification',
-      description: 'Assumed by GitHub Actions (OIDC) for scheduled real-AI verification only — main branch of beat12310/MY-FIRST-VIBECODE-APP, Bedrock invoke access only.',
+      // Plain ASCII only: IAM role descriptions are validated against
+      // [\t\n\r\x20-\x7E\xA1-\xFF]*, which does NOT include U+2014 (em-dash)
+      // — confirmed live, this exact character failed CREATE_FAILED with
+      // "1 validation error detected... Member must satisfy regular
+      // expression pattern" during the first deploy attempt.
+      description: 'Assumed by GitHub Actions (OIDC) for scheduled real-AI verification only - main branch of beat12310/MY-FIRST-VIBECODE-APP, Bedrock invoke access only.',
       maxSessionDuration: cdk.Duration.hours(6), // Level 3's golden suite can run 1-3+ hours
       assumedBy: new iam.WebIdentityPrincipal(provider.openIdConnectProviderArn, {
         StringEquals: {
