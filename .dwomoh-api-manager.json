@@ -823,5 +823,73 @@
       }
     ],
     "platformPort": 3000
+  },
+  "--1782558253121": {
+    "projectId": "--1782558253121",
+    "projectPath": "",
+    "createdAt": "2026-06-27T11:04:13.139Z",
+    "updatedAt": "2026-06-27T11:04:13.142Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-27T11:04:13.140Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782560549324": {
+    "projectId": "--1782560549324",
+    "projectPath": "",
+    "createdAt": "2026-06-27T11:42:29.347Z",
+    "updatedAt": "2026-06-27T11:42:29.348Z",
+    "apis": [
+      {
+        "category": "weather",
+        "providerId": "foreca-weather.p.rapidapi.com",
+        "providerName": "Foreca Weather",
+        "rapidApiHost": "foreca-weather.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-27T11:42:29.348Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782672407000": {
+    "projectId": "--1782672407000",
+    "projectPath": "",
+    "createdAt": "2026-06-28T18:46:50.870Z",
+    "updatedAt": "2026-06-28T18:46:50.873Z",
+    "apis": [
+      {
+        "category": "video_downloader",
+        "providerId": "tiktok-downloader-no-wm",
+        "providerName": "TikTok Downloader (No Watermark)",
+        "rapidApiHost": "tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-28T18:46:50.873Z"
+      }
+    ],
+    "platformPort": 3000
+  },
+  "--1782857172106": {
+    "projectId": "--1782857172106",
+    "projectPath": "",
+    "createdAt": "2026-06-30T22:06:12.128Z",
+    "updatedAt": "2026-06-30T22:06:12.132Z",
+    "apis": [
+      {
+        "category": "maps",
+        "providerId": "google-maps-geocoding.p.rapidapi.com",
+        "providerName": "Google Maps Geocoding",
+        "rapidApiHost": "google-maps-geocoding.p.rapidapi.com",
+        "status": "working",
+        "testedAt": "2026-06-30T22:06:12.130Z"
+      }
+    ],
+    "platformPort": 3000
   }
 }

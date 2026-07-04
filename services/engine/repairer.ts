@@ -372,6 +372,36 @@ async function tryFastPathFix(
     }
   }
 
+  // lib/managed/db.ts / auth.ts corruption — see verifier.ts's
+  // detectManagedServiceCorruption for the detection side. These two files
+  // are injected deterministically at the INITIAL build (services/
+  // project-generator.ts's injectManagedServices, part of generateProject())
+  // but nothing previously re-asserted them if a later repair/edit pass
+  // overwrote either with an incompatible model-written version — confirmed
+  // live: a generated app's db.ts got rewritten to import '@prisma/client'
+  // (a package that was never installed — better-sqlite3 was the actual,
+  // intended layer), crashing every route that touched the database with
+  // "Module not found." Re-injecting the same known-correct constants the
+  // initial build already uses resolves it deterministically, with zero
+  // Bedrock cost, exactly like the AUTH_FAILURE_RE fast-path below does for
+  // the 4 auth API routes + middleware — this is the same fix, extended to
+  // cover the two foundational files those routes depend on.
+  const MANAGED_CORRUPTION_RE = /^lib\/managed\/(db|auth)\.ts (is missing expected export|imports ")/;
+  if (MANAGED_CORRUPTION_RE.test(failure.detail)) {
+    const { MANAGED_DB_TS, MANAGED_AUTH_TS } = await import('@/services/project-generator');
+    const { writeFile, mkdir } = await import('fs/promises');
+    const { join, dirname } = await import('path');
+    const changedFiles: string[] = [];
+    const isDb = failure.detail.startsWith('lib/managed/db.ts');
+    const filePath = isDb ? 'lib/managed/db.ts' : 'lib/managed/auth.ts';
+    const content = isDb ? MANAGED_DB_TS : MANAGED_AUTH_TS;
+    const abs = join(projectPath, filePath);
+    await mkdir(dirname(abs), { recursive: true });
+    await writeFile(abs, content, 'utf8');
+    changedFiles.push(filePath);
+    return { changedFiles };
+  }
+
   // Auth workflow/security failures (signup/login/protected-route) carry no
   // file path in their detail — they describe BEHAVIOR, not a specific file
   // — so the usual describeTarget() path-extraction can't act on them. But
@@ -532,11 +562,21 @@ export async function defaultRepairerDeps(opts: {
         `- Only import modules that exist in the provided inventory.\n` +
         `- Edit ONLY ${targetPath ?? 'the flagged file'} — do not touch any other file.`;
 
+      // Search the permanent bug knowledge base BEFORE asking the model for a
+      // fresh solution — if this exact failure pattern was already root-
+      // caused in a different generated app (e.g. the Prisma-hallucination
+      // db.ts, the managed_token cookie-name mismatch), fold that known root
+      // cause and fix directly into the prompt instead of hoping the model
+      // reinvents the same correct answer from scratch every time.
+      const { searchKnowledgeBase, formatKnowledgeHint } = await import('./bug-knowledge-base');
+      const knowledgeHint = formatKnowledgeHint(searchKnowledgeBase(failure.detail, 'generated-app-repair'));
+
       const prompt = [
         `App: ${plan.displayName} — ${plan.description}`,
         routeLabel ? `Route being fixed: ${routeLabel}` : '',
         purpose ? `What this route must do: ${purpose}` : '',
         `Problem to fix (${failure.area}): ${failure.detail}`,
+        knowledgeHint ? `${knowledgeHint}\nApply the same kind of fix here if it applies to this file.` : '',
         `Modules you may import:\n${inventory.join('\n') || '(none)'}`,
         current ? `Current broken/placeholder content:\n${current.content.slice(0, 4000)}` : `The file ${targetPath ?? ''} is MISSING — create it complete.`,
         `Now output the full replacement for ${targetPath ?? 'the affected file'}.`,
@@ -610,16 +650,21 @@ export async function defaultRepairerDeps(opts: {
           `  complete path including every directory segment, e.g. "app/vendor/[id]/page.tsx",\n` +
           `  never just the filename like "page.tsx".`;
 
+        // Same knowledge-base lookup as the single-failure applyFix path
+        // above, applied per-failure in the batch.
+        const { searchKnowledgeBase, formatKnowledgeHint } = await import('./bug-knowledge-base');
         const problems = chunk.map((failure, idx) => {
           const { targetPath, purpose, routeLabel } = targets[idx];
           const current = targetPath ? files.find(f => pathsMatch(f.path, targetPath)) : undefined;
           const phraseHint = forbiddenPhraseHint(failure.detail);
+          const knowledgeHint = formatKnowledgeHint(searchKnowledgeBase(failure.detail, 'generated-app-repair'));
           return [
             `${idx + 1}. File: ${targetPath ?? '(unknown)'}`,
             routeLabel ? `   Route: ${routeLabel}` : '',
             purpose ? `   Purpose: ${purpose}` : '',
             `   Problem (${failure.area}): ${failure.detail}`,
             phraseHint ? `   ${phraseHint.trim()}` : '',
+            knowledgeHint ? `   ${knowledgeHint}` : '',
             current ? `   Current content:\n${current.content.slice(0, 2000)}` : `   File is MISSING — create it complete.`,
           ].filter(Boolean).join('\n');
         }).join('\n\n');

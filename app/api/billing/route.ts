@@ -64,5 +64,64 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // ── status: credit balance + subscription + deploy access (for the UI) ────────
+  if (action === 'status') {
+    const { userId, email } = body;
+    if (!userId) return NextResponse.json({ error: 'Missing userId' }, { status: 400 });
+    try {
+      const { ensureInitialGrant, getBalance } = await import('@/services/credit-wallet');
+      const { getOrCreateSubscription, isActive, canDeploy } = await import('@/services/subscription-manager');
+      const { getPlan } = await import('@/lib/billing-config');
+      const sub = await getOrCreateSubscription(userId, email ?? '');
+      await ensureInitialGrant(userId, getPlan('free').limits.monthlyCredits);
+      const balance = await getBalance(userId);
+      const gate = await canDeploy(userId);
+      return NextResponse.json({
+        balance,
+        subscription: { planId: sub.planId, status: sub.status, currentPeriodEnd: sub.currentPeriodEnd, active: isActive(sub) },
+        deploy: { allowed: gate.allowed, reason: gate.reason },
+      });
+    } catch (e) {
+      return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
+  // ── topup: one-off Paystack charge that adds credits after verified webhook ───
+  if (action === 'topup') {
+    const { userId, email, amountUsd, currency, callbackUrl } = body as typeof body & { amountUsd?: number; currency?: string };
+    if (!userId || !email || !amountUsd || !callbackUrl) return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    try {
+      const { CREDIT_CONFIG } = await import('@/lib/billing-config');
+      if (amountUsd < CREDIT_CONFIG.minTopUpUsd) return NextResponse.json({ error: `Minimum top-up is $${CREDIT_CONFIG.minTopUpUsd}` }, { status: 400 });
+      const { initCharge, newReference } = await import('@/services/paystack');
+      const charge = await initCharge({
+        email, amountUsd, currency: currency || 'USD', reference: newReference('topup', userId),
+        callbackUrl, metadata: { userId, purpose: 'topup' },
+      });
+      return NextResponse.json({ url: charge.authorizationUrl, reference: charge.reference });
+    } catch (e) {
+      return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
+  // ── subscribe: monthly plan charge; webhook activates plan + grants credits ───
+  if (action === 'subscribe') {
+    const { userId, email, planId, currency, callbackUrl } = body as typeof body & { currency?: string };
+    if (!userId || !email || !planId || !callbackUrl) return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    try {
+      const { getPlan } = await import('@/lib/billing-config');
+      const plan = getPlan(planId as never);
+      if (!plan || plan.priceUsd <= 0) return NextResponse.json({ error: 'Invalid plan' }, { status: 400 });
+      const { initCharge, newReference } = await import('@/services/paystack');
+      const charge = await initCharge({
+        email, amountUsd: plan.priceUsd, currency: currency || 'USD', reference: newReference('sub', userId),
+        callbackUrl, metadata: { userId, purpose: 'subscription', planId },
+      });
+      return NextResponse.json({ url: charge.authorizationUrl, reference: charge.reference });
+    } catch (e) {
+      return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
   return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
 }

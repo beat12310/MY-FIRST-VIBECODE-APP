@@ -1,0 +1,23 @@
+{
+  "name": "dwomoh-worker-infra",
+  "version": "0.1.0",
+  "private": true,
+  "bin": { "dwomoh-worker-infra": "bin/app.js" },
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy --require-approval never",
+    "destroy": "cdk destroy --force",
+    "diff": "cdk diff"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "aws-cdk": "^2.150.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.2"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.150.0",
+    "constructs": "^10.3.0"
+  }
+}

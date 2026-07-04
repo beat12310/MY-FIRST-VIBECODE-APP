@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir, readdir, stat } from 'fs/promises';
 import { join } from 'path';
 import { PROJECT_CONFIG } from '@/lib/constants';
+import { GENERATED_ROOT } from '@/lib/workspace-paths';
 import { logError } from '@/lib/error-handler';
 
 export interface ProjectMeta {
@@ -16,7 +17,7 @@ export interface ProjectMeta {
   filesCount: number;
 }
 
-const PROJECTS_DIR = join(process.cwd(), PROJECT_CONFIG.GENERATED_PROJECTS_DIR);
+const PROJECTS_DIR = GENERATED_ROOT;
 const MANIFEST_PATH = join(PROJECTS_DIR, '.projects.json');
 
 async function readManifest(): Promise<ProjectMeta[]> {

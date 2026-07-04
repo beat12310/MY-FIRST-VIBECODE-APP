@@ -105,20 +105,42 @@ export async function POST(req: NextRequest) {
 
   // ── Purchase Domain ────────────────────────────────────────────────────────
   if (action === 'purchase') {
-    const { domain, autoRenew } = body as { domain: string; autoRenew?: boolean };
+    // PAYMENT GATE: we no longer call AWS RegisterDomain here. Instead we create a
+    // priced order and return a Paystack payment URL. The domain is registered ONLY
+    // after the webhook verifies payment (see services/domain-billing.fulfillDomainPayment),
+    // and never in sandbox/test mode. This prevents registering domains the platform
+    // pays for without collecting from the user.
+    const { domain, currency } = body as { domain: string; currency?: string };
     if (!domain) return NextResponse.json({ error: 'domain required' }, { status: 400 });
 
+    const { getAuthUser } = await import('@/lib/server-auth');
+    const user = await getAuthUser(req);
+    if (!user?.sub || !user.email) {
+      return NextResponse.json({ error: 'Sign in required to purchase a domain.' }, { status: 401 });
+    }
+
     try {
-      const result = await purchaseDomain(domain.toLowerCase().trim(), autoRenew ?? true);
+      const { createDomainOrder } = await import('@/services/domain-billing');
+      const origin = req.nextUrl.origin;
+      const order = await createDomainOrder({
+        userId: user.sub,
+        email: user.email,
+        domain: domain.toLowerCase().trim(),
+        currency: currency || 'USD',
+        callbackUrl: `${origin}/dashboard/billing?domain=${encodeURIComponent(domain)}`,
+      });
       return NextResponse.json({
         ok: true,
-        purchase: result,
-        message: `Registration started for ${domain}. Usually completes in 5–15 minutes.`,
+        requiresPayment: true,
+        authorizationUrl: order.authorizationUrl,
+        reference: order.reference,
+        quote: order.quote,
+        message: `Pay $${order.quote.sellingPriceUsd} to register ${domain}. Registration begins automatically once payment is verified.`,
       });
     } catch (err) {
       return NextResponse.json({
         ok: false,
-        error: err instanceof Error ? err.message : 'Purchase failed',
+        error: err instanceof Error ? err.message : 'Could not start domain purchase',
       }, { status: 500 });
     }
   }

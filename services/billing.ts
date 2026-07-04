@@ -15,6 +15,7 @@ export interface StripeCheckoutSession {
 
 export interface StripePriceMap {
   starter: string | null;
+  growth: string | null;
   pro: string | null;
   business: string | null;
 }
@@ -22,6 +23,7 @@ export interface StripePriceMap {
 function getStripePrices(): StripePriceMap {
   return {
     starter:  process.env.STRIPE_STARTER_PRICE_ID  ?? null,
+    growth:   process.env.STRIPE_GROWTH_PRICE_ID    ?? null,
     pro:      process.env.STRIPE_PRO_PRICE_ID       ?? null,
     business: process.env.STRIPE_BUSINESS_PRICE_ID  ?? null,
   };

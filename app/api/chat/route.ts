@@ -1345,7 +1345,16 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
       // New users get an initial free-plan grant. If a signed-in user has run out,
       // block with a clear top-up message. Fail-open on store errors so a billing
       // outage never bricks the builder. Disable enforcement with ENFORCE_CREDITS=0.
-      if (ownerUserId !== 'anonymous') {
+      // SUPER_ADMIN (and any future role granted BYPASS_CREDITS) skips this gate
+      // entirely, permission-checked against the database via services/rbac.ts —
+      // billing/credits remain fully enforced for every other account.
+      const createIsBypassed = ownerUserId !== 'anonymous' && await (async () => {
+        try {
+          const { hasPermission } = await import('@/services/rbac');
+          return await hasPermission(ownerUserId, 'BYPASS_CREDITS');
+        } catch { return false; }
+      })();
+      if (ownerUserId !== 'anonymous' && !createIsBypassed) {
         try {
           const { ensureInitialGrant, getBalance } = await import('@/services/credit-wallet');
           const { getOrCreateSubscription } = await import('@/services/subscription-manager');
@@ -1366,8 +1375,37 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
 
       const result = await generateProject(projectData.projectName, projectData.files);
 
+      // ── GUARD: refuse to persist a project with no real Next.js entry point ───
+      // Investigated live: several projects in the manifest turned out to be
+      // crashed/abandoned generations that wrote only a boilerplate
+      // package.json (from generateProject's initial scaffold step) before
+      // the actual page/route generation failed or was interrupted —
+      // saveProject() ran anyway, so they sat in the sidebar indefinitely as
+      // ghosts that always failed with "Could not start server" the moment
+      // anyone tried to reopen them (no app/ or pages/ directory for `next
+      // dev` to serve). Checking for a real entry point before persisting
+      // (and before charging a credit for a build that produced nothing
+      // usable) stops this from recurring; existing broken entries are
+      // cleaned up separately.
+      const hasEntryPoint = await (async () => {
+        const { access } = await import('fs/promises');
+        const candidates = ['app/page.tsx', 'app/page.js', 'pages/index.tsx', 'pages/index.js'];
+        for (const rel of candidates) {
+          if (await access(join(result.projectPath, rel)).then(() => true).catch(() => false)) return true;
+        }
+        return false;
+      })();
+      if (!hasEntryPoint) {
+        return NextResponse.json({
+          success: false,
+          error: 'Generation did not produce a usable app (no page found) — this was not saved as a project. Please try again.',
+          code: 'NO_ENTRY_POINT',
+        }, { status: 422 });
+      }
+
       // Deduct one generation credit now that the project was created successfully.
-      if (ownerUserId !== 'anonymous') {
+      // Skipped for BYPASS_CREDITS accounts so their balance is never touched.
+      if (ownerUserId !== 'anonymous' && !createIsBypassed) {
         try {
           const { deduct } = await import('@/services/credit-wallet');
           await deduct(ownerUserId, `generation: ${result.projectName}`);
@@ -1968,6 +2006,12 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         try { await recordVerification(projectPath, result); } catch { /* non-critical */ }
       }
       return NextResponse.json({ success: true, ...result, tsErrorsExist });
+    }
+
+    // ── feature-flags: server-side gates the client checks once, so rollout/
+    // rollback of the repaired-engine Send-button pipeline needs no rebuild ──
+    if (action === 'feature-flags') {
+      return NextResponse.json({ success: true, engineBuildForSend: process.env.ENGINE_BUILD_FOR_SEND === '1' });
     }
 
     // ── check-credentials: read .env.local.example, compare with .env.local ──

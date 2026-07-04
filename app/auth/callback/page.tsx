@@ -1,85 +1,157 @@
 'use client';
 
-/**
- * /auth/callback — Handles the OAuth 2.0 authorization code redirect from Cognito.
- *
- * When a user signs in via Google, Apple, or Facebook through the Cognito Hosted UI,
- * Cognito redirects here with `?code=...`. Amplify v6 intercepts this automatically
- * and exchanges the code for tokens. We just need to:
- *  1. Wait for Amplify to finish (it fires during Amplify.configure())
- *  2. Refresh auth context
- *  3. Redirect to dashboard
- *
- * If exchange fails we redirect to /auth/signin with an error.
- */
-
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { getCurrentUser } from 'aws-amplify/auth';
+import { Hub } from 'aws-amplify/utils';
+// signInWithRedirect must be imported here even though we don't call it directly.
+// Its module registers enableOAuthListener as a side effect, which calls
+// attemptCompleteOAuthFlow — the function that exchanges the ?code= for tokens.
+// Without this import the token exchange never starts and Hub events never fire.
+import { getCurrentUser, fetchAuthSession, signInWithRedirect } from 'aws-amplify/auth';
 import { useAuth } from '@/lib/auth-context';
 
+void signInWithRedirect; // prevent tree-shaking
+
+// Writes a timestamped entry to console + sessionStorage only.
+// Never displayed on screen to regular users — open DevTools to inspect.
+function debugLog(msg: string): string {
+  const ts = new Date().toISOString().slice(11, 23);
+  const entry = `[${ts}] ${msg}`;
+  console.log('[Auth Callback]', entry);
+  try {
+    const prev = sessionStorage.getItem('__auth_debug') ?? '';
+    sessionStorage.setItem('__auth_debug', prev + entry + '\n');
+  } catch { /* sessionStorage blocked */ }
+  return entry;
+}
+
 export default function AuthCallbackPage() {
-  const router = useRouter();
-  const { refresh } = useAuth();
-  const [status, setStatus] = useState<'processing' | 'error'>('processing');
-  const [errorMsg, setErrorMsg] = useState('');
+  const router       = useRouter();
+  const { refresh }  = useAuth();
+  const done         = useRef(false);
+  const [status,     setStatus]     = useState<'processing' | 'error'>('processing');
+  const [errorMsg,   setErrorMsg]   = useState('');
+  // errorLog is only surfaced in the error UI, never in the processing screen
+  const [errorLog,   setErrorLog]   = useState<string[]>([]);
 
   useEffect(() => {
-    let cancelled = false;
+    try { sessionStorage.setItem('__auth_debug', ''); } catch { /* ignore */ }
 
-    async function handleCallback() {
-      // Amplify v6 processes the authorization code automatically when the page loads
-      // (it reads ?code= from the URL). We just need to wait for it to complete by
-      // polling getCurrentUser().
-      const deadline = Date.now() + 15_000;
-      while (Date.now() < deadline) {
-        try {
-          await getCurrentUser();
-          // Session established
-          if (!cancelled) {
-            await refresh();
-            router.replace('/dashboard');
-          }
+    const log: string[] = [];
+    function capture(msg: string) {
+      log.push(debugLog(msg));
+    }
+
+    function fail(msg: string) {
+      if (done.current) return;
+      done.current = true;
+      capture('FAIL: ' + msg);
+      setErrorLog([...log]);
+      setStatus('error');
+      setErrorMsg(msg);
+    }
+
+    async function succeed() {
+      if (done.current) return;
+      done.current = true;
+      capture('OAuth success — verifying session tokens...');
+
+      try {
+        const session   = await fetchAuthSession({ forceRefresh: false });
+        const hasAccess = Boolean(session?.tokens?.accessToken);
+        const hasId     = Boolean(session?.tokens?.idToken);
+        capture(`fetchAuthSession → accessToken=${hasAccess ? 'present' : 'MISSING'} idToken=${hasId ? 'present' : 'MISSING'}`);
+
+        if (!hasAccess) {
+          fail(
+            'OAuth completed but no session tokens were stored. ' +
+            'This may be caused by a PKCE state mismatch. Please try signing in again.'
+          );
           return;
-        } catch {
-          // Not ready yet — wait 500ms and retry
-          await new Promise(r => setTimeout(r, 500));
         }
-      }
-      // Timeout — couldn't establish session
-      if (!cancelled) {
-        setStatus('error');
-        setErrorMsg('Authentication timed out. The sign-in link may have expired.');
+
+        capture('Calling refresh() to update AuthProvider...');
+        await refresh();
+        capture('refresh() complete — queuing navigation to /dashboard');
+
+        // Defer navigation by one animation frame so React commits setUser({...})
+        // from refresh() before the dashboard layout renders. React 18 schedules
+        // state commits via MessageChannel (macrotask); without this deferral the
+        // dashboard renders before the commit and its auth guard sees user=null.
+        requestAnimationFrame(() => {
+          capture('Navigating to /dashboard');
+          router.replace('/dashboard');
+        });
+      } catch (e) {
+        const err = e as { name?: string; message?: string };
+        capture(`ERROR in succeed(): ${err.name} — ${err.message}`);
+        fail(err.message ?? 'Authentication failed. Please try again.');
       }
     }
 
-    // Check if there's an error in the URL (e.g. user denied Google access)
-    const params = new URLSearchParams(window.location.search);
+    const params   = new URLSearchParams(window.location.search);
     const urlError = params.get('error_description') ?? params.get('error');
     if (urlError) {
-      setStatus('error');
-      setErrorMsg(decodeURIComponent(urlError.replace(/\+/g, ' ')));
+      fail(decodeURIComponent(urlError.replace(/\+/g, ' ')));
       return;
     }
 
-    handleCallback().catch(e => {
-      if (!cancelled) {
-        setStatus('error');
-        setErrorMsg(e?.message ?? 'Unknown error during authentication');
+    const hasCode  = Boolean(params.get('code'));
+    const hasState = Boolean(params.get('state'));
+    capture(`Callback started — code=${hasCode ? 'yes' : 'NO'} state=${hasState ? 'yes' : 'NO'}`);
+
+    const unlisten = Hub.listen('auth', ({ payload }) => {
+      capture(`Hub: ${payload.event}`);
+      if (payload.event === 'signInWithRedirect') {
+        succeed();
+      } else if (payload.event === 'signInWithRedirect_failure') {
+        const msg =
+          (payload.data as { message?: string } | undefined)?.message ??
+          'Google sign-in failed. The authorisation code may have expired — please try again.';
+        fail(msg);
       }
     });
 
-    return () => { cancelled = true; };
-  }, [router, refresh]);
+    capture('Checking for existing session (fallback)...');
+    getCurrentUser()
+      .then(() => { capture('getCurrentUser succeeded — using fallback path'); succeed(); })
+      .catch(() => { capture('getCurrentUser: no session yet — waiting for Hub event'); });
+
+    const timer = setTimeout(() => {
+      if (!done.current) {
+        const msg = hasCode
+          ? 'Authentication timed out. Amplify received the code but did not complete the token exchange. Open browser DevTools → Console for details.'
+          : 'No authorisation code was received from Google. Please go back and try again.';
+        capture('TIMEOUT — ' + msg);
+        fail(msg);
+      }
+    }, 30_000);
+
+    return () => { clearTimeout(timer); unlisten(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (status === 'error') {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0a0a0f', color: '#f8fafc' }}>
-        <div style={{ background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 12, padding: '32px 40px', textAlign: 'center', maxWidth: 420 }}>
-          <div style={{ fontSize: 40, marginBottom: 16 }}>⚠️</div>
-          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 8, color: '#fca5a5' }}>Sign-in failed</h2>
-          <p style={{ color: '#94a3b8', fontSize: 14, marginBottom: 24 }}>{errorMsg}</p>
-          <a href="/auth/signin" style={{ display: 'inline-block', background: 'linear-gradient(135deg,#8b5cf6,#6366f1)', color: '#fff', padding: '10px 24px', borderRadius: 8, textDecoration: 'none', fontWeight: 600, fontSize: 14 }}>
+      <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0a0a0f', color: '#f8fafc', padding: '0 24px' }}>
+        <div style={{ background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.30)', borderRadius: 14, padding: '36px 44px', textAlign: 'center', maxWidth: 520, width: '100%' }}>
+          <div style={{ fontSize: 38, marginBottom: 14 }}>⚠️</div>
+          <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 10, color: '#fca5a5' }}>Sign-in failed</h2>
+          <p style={{ color: '#94a3b8', fontSize: 14, marginBottom: 16, lineHeight: 1.6 }}>{errorMsg}</p>
+          {errorLog.length > 0 && (
+            <details style={{ textAlign: 'left', marginBottom: 20 }}>
+              <summary style={{ color: '#475569', fontSize: 12, cursor: 'pointer', marginBottom: 8 }}>
+                Technical details ({errorLog.length} steps)
+              </summary>
+              <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#64748b', lineHeight: 1.9, background: 'rgba(0,0,0,0.3)', borderRadius: 6, padding: '10px 12px', marginTop: 6 }}>
+                {errorLog.map((l, i) => <div key={i}>{l}</div>)}
+              </div>
+            </details>
+          )}
+          <a
+            href="/auth/signin"
+            style={{ display: 'inline-block', background: 'linear-gradient(135deg,#8b5cf6,#6366f1)', color: '#fff', padding: '11px 28px', borderRadius: 8, textDecoration: 'none', fontWeight: 600, fontSize: 14 }}
+          >
             Back to Sign In
           </a>
         </div>

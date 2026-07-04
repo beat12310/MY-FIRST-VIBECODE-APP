@@ -267,7 +267,7 @@ async function ensureNextConfig(baseDir: string, files: ProjectFile[], logs: str
 //  lib/managed/storage.ts — File storage (local disk; AWS S3 when configured)
 //  lib/managed/qr.ts      — QR code generation (pure JS, zero config)
 
-const MANAGED_DB_TS = `import Database from 'better-sqlite3';
+export const MANAGED_DB_TS = `import Database from 'better-sqlite3';
 import { join } from 'path';
 
 let _db: Database.Database | null = null;
@@ -308,7 +308,7 @@ export const db = {
 };
 `;
 
-const MANAGED_AUTH_TS = `import bcrypt from 'bcryptjs';
+export const MANAGED_AUTH_TS = `import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import { db, initTable } from '@/lib/managed/db';
 import crypto from 'crypto';

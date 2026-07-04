@@ -3,7 +3,7 @@
 import { useState, useEffect, Suspense } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { signUp, signInWithRedirect } from 'aws-amplify/auth';
+import { signUp, signOut, signInWithRedirect } from 'aws-amplify/auth';
 import { useAuth } from '@/lib/auth-context';
 import { isSocialConfigured } from '@/app/components/ConfigureAmplify';
 
@@ -61,11 +61,24 @@ function SignUpForm() {
 
   async function handleSocial(provider: 'Google' | 'Apple') {
     setSocialLoading(provider);
+    setError('');
     try {
       await signInWithRedirect({ provider });
-    } catch (e) {
-      console.error('Social sign-in error:', e);
-      setSocialLoading(null);
+    } catch (err: unknown) {
+      const e = err as { name?: string; message?: string };
+      if (e.name === 'UserAlreadyAuthenticatedException') {
+        try {
+          await signOut({ global: false });
+          await signInWithRedirect({ provider });
+        } catch (retryErr: unknown) {
+          const re = retryErr as { name?: string; message?: string };
+          setSocialLoading(null);
+          setError(re.message ?? `${provider} sign-in failed — please try again.`);
+        }
+      } else {
+        setSocialLoading(null);
+        setError(e.message ?? `${provider} sign-in failed — please try again.`);
+      }
     }
   }
 

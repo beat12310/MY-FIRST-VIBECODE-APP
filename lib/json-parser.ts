@@ -64,6 +64,53 @@ export function parseProjectFormat(text: string): ProjectData | null {
   return { projectName, description, mode, files };
 }
 
+// ─── Tolerant fallback file extractor ──────────────────────────────────────
+// When the model ignores the strict [START_PROJECT]/[FILE:] format and instead
+// returns a "FULL BUILD SPECIFICATION" with code blocks (a common failure mode),
+// recover real files so we still build a real app instead of a placeholder.
+// Recognizes: (1) <file path="...">…</file>, (2) a path label line
+// (**path**, ### path, `path`, File: path, path:) right before a fenced block,
+// (3) a path given as the first-line comment inside a fenced block.
+const PROJECT_PATH = String.raw`(?:src\/)?(?:app|components|lib|pages|services|public|styles)\/[\w./\-\[\]]+\.\w+|package\.json|next\.config\.\w+|tsconfig\.json|tailwind\.config\.\w+|postcss\.config\.\w+|middleware\.ts`;
+
+export function parseLooseProjectFiles(text: string): ProjectFileData[] {
+  const files: ProjectFileData[] = [];
+  const seen = new Set<string>();
+  const looksLikePath = new RegExp(`^(?:${PROJECT_PATH})$`);
+
+  const add = (rawPath: string, rawContent: string) => {
+    const path = rawPath.trim().replace(/^["'`]+|["'`:]+$/g, '').replace(/^\.\//, '');
+    const content = rawContent.replace(/\s+$/, '').trim();
+    if (!path || !content || seen.has(path)) return;
+    if (!looksLikePath.test(path)) return;            // only accept real project paths
+    seen.add(path);
+    files.push({ path, content });
+  };
+
+  // 1. Explicit <file path="...">...</file> blocks (edit format).
+  const fileTag = /<file\s+path=["']([^"']+)["']\s*>([\s\S]*?)<\/file>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = fileTag.exec(text))) add(m[1], m[2]);
+  if (files.length) return files;
+
+  // 2 & 3. Fenced code blocks with a nearby path label or first-line comment.
+  const fence = /```[a-zA-Z0-9]*\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  const labelRe = new RegExp(`(?:^|\\n)\\s*(?:\\*\\*|#{1,4}\\s*|File:\\s*|Path:\\s*|\`)?\\s*(${PROJECT_PATH})\\s*(?:\\*\\*|\`)?\\s*:?\\s*$`);
+  const commentRe = new RegExp(`^\\s*(?:\\/\\/|#|\\/\\*)\\s*(${PROJECT_PATH})\\s*(?:\\*\\/)?\\s*$`);
+  while ((m = fence.exec(text))) {
+    const block = m[1];
+    const before = text.slice(lastIndex, m.index);
+    lastIndex = fence.lastIndex;
+    const label = before.match(labelRe);
+    if (label) { add(label[1], block); continue; }
+    const firstLine = block.split('\n', 1)[0];
+    const cm = firstLine.match(commentRe);
+    if (cm) add(cm[1], block.split('\n').slice(1).join('\n'));
+  }
+  return files;
+}
+
 // ─── Character-by-character string fixer ──────────────────────────────────
 // Fixes unescaped newlines/tabs/carriage-returns inside JSON string values
 // WITHOUT touching structural JSON whitespace (the old repairJSON got this wrong).

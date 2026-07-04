@@ -7,7 +7,7 @@ import type { VerificationCheck } from '@/services/deployment/types';
 export const maxDuration = 300; // 5 min for packaging + upload phase
 
 export async function POST(req: NextRequest) {
-  await getAuthUser(req);
+  const authUser = await getAuthUser(req);
   const body = await req.json().catch(() => ({}));
   const { action, projectId, projectName, projectPath, envVars, provider, domain } = body as {
     action: string;
@@ -28,6 +28,19 @@ export async function POST(req: NextRequest) {
   if (action === 'deploy') {
     if (!projectId || !projectName || !projectPath) {
       return NextResponse.json({ error: 'projectId, projectName, and projectPath are required' }, { status: 400 });
+    }
+
+    // ── SERVER-SIDE DEPLOY GATE ───────────────────────────────────────────────
+    // Deployment requires an ACTIVE subscription whose plan allows deploy.
+    // Expired/free users can still build — they just can't deploy. Enforced here,
+    // not only in the UI, so it can't be bypassed.
+    if (!authUser?.sub) {
+      return NextResponse.json({ error: 'Sign in required to deploy.' }, { status: 401 });
+    }
+    const { canDeploy } = await import('@/services/subscription-manager');
+    const gate = await canDeploy(authUser.sub);
+    if (!gate.allowed) {
+      return NextResponse.json({ error: gate.reason, code: 'SUBSCRIPTION_REQUIRED', planId: gate.planId }, { status: 402 });
     }
 
     try {

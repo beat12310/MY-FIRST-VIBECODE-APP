@@ -1,11 +1,22 @@
-export type PlanId = 'free' | 'starter' | 'pro' | 'business';
+/**
+ * Backward-compatibility shim. The single source of truth is now `lib/billing-config.ts`.
+ * This file preserves the older export shape (price/priceMonthly/generationsPerMonth)
+ * so existing imports keep working while billing migrates to the credit model.
+ */
+import {
+  PLANS as CONFIG_PLANS,
+  type PlanId as ConfigPlanId,
+  type SubscriptionPlan as ConfigPlan,
+  getPlan as configGetPlan,
+} from './billing-config';
+
+export type PlanId = ConfigPlanId;
 
 export interface SubscriptionPlan {
   id: PlanId;
   name: string;
   price: number;
   priceMonthly: string;
-  stripePriceId: string | null;
   paystackPlanCode: string | null;
   generationsPerMonth: number;
   features: string[];
@@ -23,128 +34,35 @@ export interface SubscriptionPlan {
   highlighted?: boolean;
 }
 
-export const PLANS: Record<PlanId, SubscriptionPlan> = {
-  free: {
-    id: 'free',
-    name: 'Free',
-    price: 0,
-    priceMonthly: '$0',
-    stripePriceId: null,
-    paystackPlanCode: null,
-    generationsPerMonth: 3,
-    features: [
-      '3 app generations per month',
-      'Live preview',
-      'Community support',
-      'DWOMOH Vibe Code branding',
-    ],
+function toLegacy(p: ConfigPlan): SubscriptionPlan {
+  return {
+    id: p.id,
+    name: p.name,
+    price: p.priceUsd,
+    priceMonthly: `$${p.priceUsd}`,
+    paystackPlanCode: p.paystackPlanCodeEnv,
+    generationsPerMonth: p.limits.monthlyCredits, // credits are the new unit
+    features: p.features,
     limits: {
-      generationsPerMonth: 3,
-      canSaveProjects: false,
-      canExportCode: false,
-      canDeployApps: false,
-      canCustomDomain: false,
-      canRemoveBranding: false,
-      canTeamCollaborate: false,
-      priorityGeneration: false,
+      generationsPerMonth: p.limits.monthlyCredits,
+      canSaveProjects: p.limits.canSaveProjects,
+      canExportCode: p.limits.canExportCode,
+      canDeployApps: p.limits.canDeployApps,
+      canCustomDomain: p.limits.canCustomDomain,
+      canRemoveBranding: p.limits.canRemoveBranding,
+      canTeamCollaborate: p.limits.canTeamCollaborate,
+      priorityGeneration: p.limits.priorityGeneration,
     },
-  },
+    badge: p.badge,
+    highlighted: p.highlighted,
+  };
+}
 
-  starter: {
-    id: 'starter',
-    name: 'Starter',
-    price: 9,
-    priceMonthly: '$9',
-    stripePriceId: process.env.NEXT_PUBLIC_STRIPE_STARTER_PRICE_ID ?? null,
-    paystackPlanCode: process.env.NEXT_PUBLIC_PAYSTACK_STARTER_PLAN ?? null,
-    generationsPerMonth: 20,
-    features: [
-      '20 app generations per month',
-      'Save & manage projects',
-      'Export source code',
-      'Email support',
-    ],
-    limits: {
-      generationsPerMonth: 20,
-      canSaveProjects: true,
-      canExportCode: true,
-      canDeployApps: false,
-      canCustomDomain: false,
-      canRemoveBranding: false,
-      canTeamCollaborate: false,
-      priorityGeneration: false,
-    },
-  },
-
-  pro: {
-    id: 'pro',
-    name: 'Pro',
-    price: 19,
-    priceMonthly: '$19',
-    stripePriceId: process.env.NEXT_PUBLIC_STRIPE_PRO_PRICE_ID ?? null,
-    paystackPlanCode: process.env.NEXT_PUBLIC_PAYSTACK_PRO_PLAN ?? null,
-    generationsPerMonth: 80,
-    badge: 'Most Popular',
-    highlighted: true,
-    features: [
-      '80 app generations per month',
-      'One-click deployment',
-      'Custom domains',
-      'Remove DWOMOH branding',
-      'Priority support',
-    ],
-    limits: {
-      generationsPerMonth: 80,
-      canSaveProjects: true,
-      canExportCode: true,
-      canDeployApps: true,
-      canCustomDomain: true,
-      canRemoveBranding: true,
-      canTeamCollaborate: false,
-      priorityGeneration: false,
-    },
-  },
-
-  business: {
-    id: 'business',
-    name: 'Business',
-    price: 49,
-    priceMonthly: '$49',
-    stripePriceId: process.env.NEXT_PUBLIC_STRIPE_BUSINESS_PRICE_ID ?? null,
-    paystackPlanCode: process.env.NEXT_PUBLIC_PAYSTACK_BUSINESS_PLAN ?? null,
-    generationsPerMonth: 999,
-    features: [
-      'Unlimited generations',
-      'Team collaboration',
-      'Priority generation queue',
-      'Dedicated support',
-      'Advanced analytics',
-    ],
-    limits: {
-      generationsPerMonth: 999,
-      canSaveProjects: true,
-      canExportCode: true,
-      canDeployApps: true,
-      canCustomDomain: true,
-      canRemoveBranding: true,
-      canTeamCollaborate: true,
-      priorityGeneration: true,
-    },
-  },
-};
+export const PLANS: Record<PlanId, SubscriptionPlan> = Object.fromEntries(
+  Object.entries(CONFIG_PLANS).map(([k, v]) => [k, toLegacy(v)]),
+) as Record<PlanId, SubscriptionPlan>;
 
 export const PLANS_LIST = Object.values(PLANS);
-
-export function getPlan(planId: PlanId): SubscriptionPlan {
-  return PLANS[planId] ?? PLANS.free;
-}
-
-export function canGenerate(planId: PlanId, usedThisMonth: number): boolean {
-  const plan = getPlan(planId);
-  return usedThisMonth < plan.limits.generationsPerMonth;
-}
-
-export function generationsRemaining(planId: PlanId, usedThisMonth: number): number {
-  const plan = getPlan(planId);
-  return Math.max(0, plan.limits.generationsPerMonth - usedThisMonth);
-}
+export function getPlan(planId: PlanId): SubscriptionPlan { return toLegacy(configGetPlan(planId)); }
+export function canGenerate(planId: PlanId, used: number): boolean { return used < getPlan(planId).limits.generationsPerMonth; }
+export function generationsRemaining(planId: PlanId, used: number): number { return Math.max(0, getPlan(planId).limits.generationsPerMonth - used); }

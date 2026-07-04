@@ -122,7 +122,15 @@ function planPages(intent: DetectedIntent, requiresAuth: boolean): PlannedPage[]
   for (const type of [intent.appType, ...intent.secondaryTypes]) {
     APP_TYPE_PROFILES[type].typicalPages.forEach(r => routes.add(r));
   }
-  if (requiresAuth) { routes.add('/login'); routes.add('/signup'); routes.add('/dashboard'); }
+  // ROOT CAUSE fix: forgot-password was never planned here, so nothing ever
+  // told the model such a page should exist. If the model happened to write
+  // a link to it from the login page anyway, the verifier's dead-link check
+  // could catch it and the repairer had a working fast-path stub-fix — but
+  // that only fired by luck of link-syntax matching a regex, never
+  // reliably. Planning it explicitly (matching the real auth API route
+  // buildAuthRoutes already generates — see services/engine/auth-template.ts)
+  // makes it a guaranteed part of every auth-enabled app, not a maybe.
+  if (requiresAuth) { routes.add('/login'); routes.add('/signup'); routes.add('/dashboard'); routes.add('/forgot-password'); }
 
   return [...routes].map(route => ({
     route,
@@ -138,7 +146,9 @@ function planApiRoutes(pages: PlannedPage[], requiresAuth: boolean): PlannedApiR
   const resources = new Set<string>();
   for (const p of pages) {
     const r = resourceOf(p.route);
-    if (r && !['login', 'signup', 'dashboard', 'about', 'contact', 'pricing', 'settings'].includes(r)) resources.add(r);
+    // 'forgot-password' excluded same as the other auth pages — it needs a
+    // purpose-built reset-token endpoint, not a generic list/create CRUD route.
+    if (r && !['login', 'signup', 'dashboard', 'about', 'contact', 'pricing', 'settings', 'forgot-password'].includes(r)) resources.add(r);
   }
   for (const res of resources) {
     routes.push({ route: `/api/${res}`, filePath: `app/api/${res}/route.ts`, methods: ['GET', 'POST'], purpose: `List/create ${res}` });

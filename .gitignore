@@ -46,3 +46,13 @@ generated-projects/
 node_modules/
 **/node_modules/
 public/browser-screenshots/
+
+# local dev billing store (production uses DynamoDB)
+.billing-data/
+
+# tool-local state, not source — session settings, worktrees, runtime caches
+.claude/
+.dwomoh/
+
+# large installer binaries — not source, easily re-downloaded
+*.pkg

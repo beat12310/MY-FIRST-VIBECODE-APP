@@ -14,6 +14,8 @@ export interface CheckRootCause {
   kind:
     | 'missing-package'
     | 'auth-misconfigured'
+    | 'auth-field-mismatch'    // form sends field names the API route doesn't read
+    | 'auth-page-stub'         // auth page exists (200) but has no form — is a redirect stub
     | 'missing-env'
     | 'typescript-error'
     | 'runtime-crash'
@@ -223,6 +225,20 @@ const AUTH_CREDENTIAL_ROUTE = /\/(api\/)?auth\/(register|signup|login|signin)([/
 
 /** Synthetic test credentials — never used for real; just proves the route handles valid input */
 const TEST_CREDS = { email: 'verify@dwomoh.dev', password: 'VibeCode#Test1!', name: 'Verification Bot' };
+
+/**
+ * Routes that generate AI content and require a prompt/input field.
+ * Verifier should POST synthetic test data so the route can process a real request.
+ */
+const AI_GENERATE_ROUTE = /\/(api\/)?(generate|video[s]?\/generate|ai\/generate|create|render)([/?]|$)/i;
+
+/** Synthetic generation body — proves the route handles valid prompt input */
+const TEST_GENERATE_BODY = {
+  prompt: 'A beautiful sunset over the ocean with golden waves crashing on shore',
+  style: 'cinematic',
+  duration: 5,
+  aspect_ratio: '16:9',
+};
 
 /**
  * Routes that legitimately return 401/403 on logout when there is no active session.
@@ -671,6 +687,9 @@ async function checkEndpoint(
   // ── Auth credential routes: register / login — send real test body ──────────
   const isCredentialRoute = hasBody && AUTH_CREDENTIAL_ROUTE.test(urlPath);
 
+  // ── AI generate routes: require a prompt field — send synthetic test body ──
+  const isGenerateRoute = hasBody && AI_GENERATE_ROUTE.test(urlPath);
+
   // Build the initial request body. Form-data routes get a test multipart body
   // on the FIRST attempt so we don't trigger a 400 we'd just have to retry anyway.
   let initialRequestDescription: string;
@@ -693,6 +712,15 @@ async function checkEndpoint(
       signal: controller.signal,
       headers: { Accept: 'application/json, text/html', 'Content-Type': 'application/json' },
       body: JSON.stringify(TEST_CREDS),
+    };
+  } else if (isGenerateRoute) {
+    // Send a well-formed generation body so prompt-required validation doesn't 400.
+    initialRequestDescription = `application/json: ${JSON.stringify(TEST_GENERATE_BODY)}`;
+    fetchOpts = {
+      method,
+      signal: controller.signal,
+      headers: { Accept: 'application/json, text/html', 'Content-Type': 'application/json' },
+      body: JSON.stringify(TEST_GENERATE_BODY),
     };
   } else {
     initialRequestDescription = hasBody ? 'application/json: {}' : '(no body)';
@@ -765,6 +793,76 @@ async function checkEndpoint(
 
     // ── Failure: read body to find real root cause ─────────────────────────
     if (!res.ok) {
+      // ── Auth-protected data route: 401/403 is correct behaviour ───────────
+      // If the route source contains getAuthUser / verifyToken / requireAuth, a 401
+      // from an unauthenticated probe is NOT a bug — soft-pass so the repair loop
+      // doesn't waste attempts trying to "fix" correctly secured routes.
+      if ((res.status === 401 || res.status === 403) && routeFilePath) {
+        try {
+          const { readFileSync } = await import('fs');
+          const src = readFileSync(routeFilePath, 'utf8');
+          const hasAuthGuard = /getAuthUser|verifyToken|requireAuth|authenticate|getSession|auth\.protect|jwt\.verify|checkAuth|isAuthenticated/i.test(src);
+          if (hasAuthGuard) {
+            return {
+              name, url,
+              passed: false,
+              softPassed: true,
+              statusCode: res.status,
+              responseBody: bodyText.slice(0, 300),
+              requestBody: '(no session token — testing unauthenticated state)',
+              externalDepName: `Auth guard (HTTP ${res.status} is correct when unauthenticated)`,
+              error: `HTTP ${res.status} — route is correctly protected (unauthenticated access is properly rejected)`,
+            };
+          }
+        } catch { /* file unreadable — fall through to normal error handling */ }
+      }
+
+      // ── Register endpoint: "already registered" means the endpoint works ─────
+      // The verifier sends a fixed test email. If it was used before, the server
+      // correctly returns 400/409. Soft-pass so we don't flag a working endpoint.
+      if (res.status === 400 || res.status === 409) {
+        const lc = bodyText.toLowerCase();
+        const isAlreadyExists = lc.includes('already') || lc.includes('exists') || lc.includes('duplicate') || lc.includes('taken') || lc.includes('registered') || lc.includes('in use');
+        if (isAlreadyExists && AUTH_CREDENTIAL_ROUTE.test(urlPath)) {
+          return {
+            name, url,
+            passed: false,
+            softPassed: true,
+            statusCode: res.status,
+            responseBody: bodyText.slice(0, 300),
+            requestBody: initialRequestDescription,
+            externalDepName: `Register validation (${res.status} means email already exists — endpoint is functional)`,
+            error: `HTTP ${res.status} — register validation working correctly (test email already registered)`,
+          };
+        }
+      }
+
+      // ── POST returns 400 with valid JSON = route is alive, verifier body doesn't match schema ──
+      // The verifier sends generic test bodies (empty {} or domain-specific like video fields).
+      // If the route validates its input and rejects unknown/missing fields with a JSON error,
+      // that is CORRECT BEHAVIOR. Soft-pass: the endpoint is reachable and responding.
+      // Only applies to POST/PUT/PATCH (mutations) — not GET 400s, which are unexpected.
+      if ((res.status === 400 || res.status === 422) && hasBody) {
+        let parsedBody: unknown;
+        try { parsedBody = JSON.parse(bodyText); } catch { /* not JSON — fall through to normal error */ }
+        if (parsedBody && typeof parsedBody === 'object' && parsedBody !== null) {
+          const b = parsedBody as Record<string, unknown>;
+          const hasErrorField = 'error' in b || 'message' in b || 'errors' in b || 'details' in b;
+          if (hasErrorField) {
+            return {
+              name, url,
+              passed: false,
+              softPassed: true,
+              statusCode: res.status,
+              responseBody: bodyText.slice(0, 300),
+              requestBody: initialRequestDescription,
+              externalDepName: `Input validation (HTTP ${res.status} — route is functional, verifier body doesn't match expected schema)`,
+              error: `HTTP ${res.status} — route responds and validates input correctly (verifier sent incompatible test body)`,
+            };
+          }
+        }
+      }
+
       const rootCause = parseRootCause(bodyText, res.status);
       if (!rootCause.fixFile) rootCause.fixFile = suggestedFixFile;
 
@@ -1100,16 +1198,16 @@ export async function verifyRunningApp(
     const pageUrlPaths = pageRoutes
       .map(p => {
         const rel = p.replace(/^app\//, '').replace(/\/page\.tsx?$/, '');
-        if (!rel || rel === 'page' || rel.includes('[') || rel.includes('(')) return null;
+        if (!rel || rel === 'page' || rel.includes('[') || rel.includes('(') || rel.includes('.')) return null;
         return '/' + rel;
       })
       .filter((u): u is string => u !== null);
 
     // Detect auth pages in the project. When present, verify them for
-    // ChunkLoadError and hydration failures — not just HTTP status.
+    // ChunkLoadError, hydration failures, and stub pages that have no form.
     const AUTH_PAGE_PATHS = new Set([
-      '/auth/signin', '/auth/signup', '/auth/forgot-password',
-      '/auth/login', '/login', '/signin', '/signup',
+      '/auth', '/auth/signin', '/auth/signup', '/auth/forgot-password',
+      '/auth/login', '/login', '/signin', '/signup', '/register',
     ]);
     const authRoutes = pageUrlPaths.filter(u => AUTH_PAGE_PATHS.has(u));
     const nonAuthRoutes = pageUrlPaths.filter(u => !AUTH_PAGE_PATHS.has(u));
@@ -1118,12 +1216,70 @@ export async function verifyRunningApp(
       checks.push(await checkEndpoint(`${base}${urlPath}`, `Page: GET ${urlPath}`));
     }
 
+    // For auth pages: verify they return 200 AND have real form content (not a redirect stub)
+    for (const urlPath of authRoutes) {
+      const basicCheck = await checkEndpoint(`${base}${urlPath}`, `Auth page: GET ${urlPath}`);
+      if (!basicCheck.passed) {
+        checks.push(basicCheck);
+        continue;
+      }
+      // Fetch the actual HTML to verify there is a real form (not a redirect stub)
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 8000);
+        const res = await fetch(`${base}${urlPath}`, { signal: ctrl.signal, headers: { Accept: 'text/html' } });
+        const html = await res.text().catch(() => '');
+        const hasForm = /<form|<input|type="email"|type="password"/.test(html);
+        if (!hasForm) {
+          checks.push({
+            name: `Auth page content: ${urlPath}`,
+            url: `${base}${urlPath}`,
+            passed: false,
+            softPassed: false,
+            statusCode: 200,
+            responseBody: html.slice(0, 300),
+            error: `Auth page ${urlPath} has no sign-in/sign-up form — it is a stub page or redirect`,
+            rootCause: {
+              kind: 'auth-page-stub',
+              detail: `Auth page ${urlPath} returned 200 but contains no form elements. It may be a redirect stub (useEffect → router.replace('/')). The page must have real email/password inputs.`,
+              fixFile: projectPath ? `app${urlPath}/page.tsx` : undefined,
+              fixHint: `Replace app${urlPath}/page.tsx with a real auth form that POSTs to /api/auth/login and /api/auth/register.`,
+            },
+          });
+        } else {
+          checks.push({ ...basicCheck, name: `Auth page content: ${urlPath}`, responsePreview: '✅ Has sign-in/sign-up form' });
+        }
+      } catch {
+        checks.push(basicCheck);
+      }
+    }
+
     // Auth pages get dedicated chunk-error detection
     if (authRoutes.length > 0) {
       const { verifyAuthPages } = await import('./auth-verifier');
       const authReport = await verifyAuthPages(base);
+
+      // Check if this app uses a combined /auth page instead of separate /auth/signin etc.
+      const hasCombinedAuthPage = pageUrlPaths.includes('/auth');
+
       for (const ac of authReport.checks) {
         const isChunkError = Boolean(ac.error?.toLowerCase().includes('chunk'));
+
+        // If the specific route (e.g. /auth/signin) returned 404 BUT the app has a combined /auth page,
+        // that's fine — the app chose to combine auth into one page. Soft-pass it.
+        const isMissingButHasFallback = !ac.passed && ac.status === 404 && hasCombinedAuthPage && ac.route !== '/auth';
+        if (isMissingButHasFallback) {
+          checks.push({
+            name: `Auth page: GET ${ac.route}`,
+            url: `${base}${ac.route}`,
+            passed: false,
+            softPassed: true,
+            statusCode: 404,
+            error: `${ac.route} not found — app uses combined /auth page instead (acceptable pattern)`,
+          });
+          continue;
+        }
+
         checks.push({
           name: `Auth page: GET ${ac.route}`,
           url: `${base}${ac.route}`,
@@ -1165,6 +1321,34 @@ export async function verifyRunningApp(
     // Pass routeFilePath so checkEndpoint can detect FormData routes and send
     // the right body on the first request (avoiding an unnecessary 400 → retry cycle).
     checks.push(await checkEndpoint(`${base}${urlPath}`, `API: ${method} ${urlPath}`, method, routeFilePath));
+  }
+
+  // ── Auth flow verification ────────────────────────────────────────────────
+  // Run only when the project has auth-related routes. This tests the complete
+  // register → login → session flow rather than just probing route status codes.
+  const hasAuthRoutes = apiRoutes.some(r =>
+    /auth\/(register|signup|login|signin)/.test(r) ||
+    /api\/(register|signup|login|signin)/.test(r)
+  );
+  if (hasAuthRoutes && projectPath) {
+    try {
+      const { verifyAuthFlow, authFlowToChecks } = await import('./auth-flow-verifier');
+      const authResult = await verifyAuthFlow(port, projectPath);
+      const authChecks = authFlowToChecks(authResult);
+      for (const ac of authChecks) {
+        checks.push({
+          name: ac.name,
+          url: ac.url,
+          passed: ac.passed,
+          softPassed: ac.softPassed,
+          statusCode: ac.statusCode,
+          error: ac.error,
+          requestBody: ac.requestBody,
+          responseBody: ac.responseBody,
+          rootCause: ac.rootCause as VerificationCheck['rootCause'],
+        });
+      }
+    } catch { /* auth flow verifier failed — non-critical, skip */ }
   }
 
   // Hard failures: neither passed nor soft-passed

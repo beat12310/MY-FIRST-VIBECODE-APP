@@ -7,15 +7,51 @@ import { useAuth } from '@/lib/auth-context';
 import { updateUserAttributes } from 'aws-amplify/auth';
 
 function SettingsContent() {
-  const { user } = useAuth();
+  const { user, loading: authLoading, getToken } = useAuth();
   const params = useSearchParams();
   const router = useRouter();
-  const [tab, setTab] = useState<'profile' | 'security'>(
-    params.get('tab') === 'security' ? 'security' : 'profile'
+  const [tab, setTab] = useState<'profile' | 'security' | 'developer'>(
+    params.get('tab') === 'security' ? 'security' : params.get('tab') === 'developer' ? 'developer' : 'profile'
   );
   const [name, setName] = useState(user?.name ?? '');
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  // Developer Mode — visible only to accounts holding VIEW_DEVELOPER_MODE
+  // (SUPER_ADMIN and any future role granted it), checked against the
+  // database via services/rbac.ts, same as app/builder/page.tsx's header
+  // toggle. Reads/writes the SAME localStorage key so toggling here affects
+  // the Builder page (a separate React tree) on next load, and vice versa.
+  const [myPermissions, setMyPermissions] = useState<Set<string>>(new Set());
+  const [devModeOn, setDevModeOn] = useState(false);
+
+  useEffect(() => {
+    try { setDevModeOn(localStorage.getItem('dwomoh_dev_mode') === '1'); } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (!user) { setMyPermissions(new Set()); return; }
+    let cancelled = false;
+    (async () => {
+      const fetchPermissions = async () => {
+        const token = await getToken().catch(() => null);
+        const res = await fetch('/api/admin/roles', { headers: token ? { Authorization: `Bearer ${token}` } : {} }).catch(() => null);
+        if (!res || !res.ok) return null;
+        return res.json().catch(() => null);
+      };
+      let data = await fetchPermissions();
+      if (!data) { await new Promise(r => setTimeout(r, 400)); data = await fetchPermissions(); }
+      if (!cancelled && Array.isArray(data?.permissions)) setMyPermissions(new Set(data.permissions));
+    })();
+    return () => { cancelled = true; };
+  }, [authLoading, user, getToken]);
+
+  const toggleDevMode = () => {
+    const next = !devModeOn;
+    setDevModeOn(next);
+    try { localStorage.setItem('dwomoh_dev_mode', next ? '1' : '0'); } catch { /* ignore */ }
+  };
 
   useEffect(() => {
     if (user?.name) setName(user.name);
@@ -51,7 +87,10 @@ function SettingsContent() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 36, background: 'rgba(255,255,255,0.04)', borderRadius: 10, padding: 4, width: 'fit-content' }}>
-        {(['profile', 'security'] as const).map(t => (
+        {([
+          'profile', 'security',
+          ...(myPermissions.has('VIEW_DEVELOPER_MODE') ? ['developer'] as const : []),
+        ] as const).map(t => (
           <button key={t} onClick={() => setTab(t)} style={{
             padding: '8px 20px', borderRadius: 8, border: 'none', cursor: 'pointer',
             background: tab === t ? 'rgba(139,92,246,0.2)' : 'transparent',
@@ -68,17 +107,30 @@ function SettingsContent() {
         <div style={{ background: 'rgba(15,15,25,0.6)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 16, padding: 32 }}>
           {/* Avatar */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 18, marginBottom: 32 }}>
-            <div style={{
-              width: 60, height: 60, borderRadius: '50%',
-              background: 'linear-gradient(135deg,#8b5cf6,#6366f1)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 22, fontWeight: 800, color: '#fff', flexShrink: 0,
-            }}>
-              {(user?.name ?? user?.email ?? 'U').slice(0, 1).toUpperCase()}
-            </div>
+            {user?.picture ? (
+              <img
+                src={user.picture}
+                alt={user.name ?? user.email}
+                referrerPolicy="no-referrer"
+                style={{ width: 60, height: 60, borderRadius: '50%', objectFit: 'cover', flexShrink: 0, border: '2px solid rgba(139,92,246,0.35)' }}
+              />
+            ) : (
+              <div style={{
+                width: 60, height: 60, borderRadius: '50%',
+                background: 'linear-gradient(135deg,#8b5cf6,#6366f1)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 22, fontWeight: 800, color: '#fff', flexShrink: 0,
+              }}>
+                {(user?.name ?? (user?.email?.includes('@') ? user.email.split('@')[0] : null) ?? 'U').slice(0, 1).toUpperCase()}
+              </div>
+            )}
             <div>
-              <div style={{ fontSize: 16, fontWeight: 700, color: '#f8fafc' }}>{user?.name ?? 'Your name'}</div>
-              <div style={{ fontSize: 13, color: '#64748b' }}>{user?.email}</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: '#f8fafc' }}>
+                {user?.name ?? (user?.email?.includes('@') ? user.email.split('@')[0] : 'Your name')}
+              </div>
+              <div style={{ fontSize: 13, color: '#64748b' }}>
+                {user?.email?.includes('@') ? user.email : 'Google account'}
+              </div>
             </div>
           </div>
 
@@ -96,8 +148,18 @@ function SettingsContent() {
               </div>
               <div>
                 <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#94a3b8', marginBottom: 6 }}>Email address</label>
-                <input type="email" value={user?.email ?? ''} disabled style={{ ...inputStyle, opacity: 0.45, cursor: 'not-allowed' }} />
-                <p style={{ fontSize: 12, color: '#475569', marginTop: 6 }}>Email is managed through your Cognito account and cannot be changed here.</p>
+                <input
+                  type="text"
+                  value={user?.email?.includes('@') ? user.email : ''}
+                  placeholder={user?.email?.includes('@') ? undefined : 'Managed by Google'}
+                  disabled
+                  style={{ ...inputStyle, opacity: 0.45, cursor: 'not-allowed' }}
+                />
+                <p style={{ fontSize: 12, color: '#475569', marginTop: 6 }}>
+                  {user?.picture
+                    ? 'Email is linked to your Google account and cannot be changed here.'
+                    : 'Email is managed through your account and cannot be changed here.'}
+                </p>
               </div>
             </div>
 
@@ -166,6 +228,30 @@ function SettingsContent() {
               Delete account
             </button>
           </div>
+        </div>
+      )}
+
+      {tab === 'developer' && myPermissions.has('VIEW_DEVELOPER_MODE') && (
+        <div style={{ background: 'rgba(15,15,25,0.6)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 16, padding: 32 }}>
+          <h2 style={{ fontSize: 16, fontWeight: 700, color: '#f8fafc', marginBottom: 6 }}>Developer Mode</h2>
+          <p style={{ fontSize: 14, color: '#64748b', marginBottom: 20 }}>
+            Reveals Bridge Test, Engine Build/Test, and internal build/repair
+            diagnostics (root cause, files changed, routes affected,
+            verification results) in the Builder. Off by default so customers
+            never see internal engine internals. This setting is shared with
+            the same toggle in the Builder&apos;s top header bar.
+          </p>
+          <button
+            onClick={toggleDevMode}
+            style={{
+              padding: '10px 22px', borderRadius: 9, cursor: 'pointer', fontSize: 14, fontWeight: 700,
+              border: `1px solid ${devModeOn ? '#3b82f6' : 'rgba(255,255,255,0.1)'}`,
+              background: devModeOn ? 'linear-gradient(135deg,#3b82f6,#2563eb)' : 'rgba(255,255,255,0.05)',
+              color: devModeOn ? '#fff' : '#f8fafc',
+            }}
+          >
+            {devModeOn ? '● Developer Mode: ON' : '○ Enable Developer Mode'}
+          </button>
         </div>
       )}
     </div>

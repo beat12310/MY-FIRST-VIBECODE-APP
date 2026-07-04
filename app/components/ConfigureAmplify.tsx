@@ -7,9 +7,20 @@ const userPoolClientId = process.env.NEXT_PUBLIC_USER_POOL_CLIENT_ID;
 const cognitoDomain    = process.env.NEXT_PUBLIC_COGNITO_DOMAIN;
 const region           = process.env.NEXT_PUBLIC_AWS_REGION ?? 'us-east-1';
 
-// Determine the origin at runtime (handles localhost vs production).
-// Social sign-in redirects only happen in the browser, so server-side this is fine as a fallback.
-const origin = typeof window !== 'undefined' ? window.location.origin : 'https://dwomohvibe.com';
+// ALL valid redirect origins listed explicitly.
+// Amplify v6 picks the entry matching window.location.origin at sign-in time,
+// so both dwomohvibe.com and www.dwomohvibe.com resolve to their own callback URL.
+// This prevents PKCE state mismatches when the user navigates between subdomains.
+const REDIRECT_SIGN_IN  = [
+  'http://localhost:3000/auth/callback',
+  'https://dwomohvibe.com/auth/callback',
+  'https://www.dwomohvibe.com/auth/callback',
+];
+const REDIRECT_SIGN_OUT = [
+  'http://localhost:3000/auth/signin',
+  'https://dwomohvibe.com/auth/signin',
+  'https://www.dwomohvibe.com/auth/signin',
+];
 
 if (userPoolId && userPoolClientId) {
   Amplify.configure({
@@ -19,13 +30,12 @@ if (userPoolId && userPoolClientId) {
         userPoolClientId,
         loginWith: {
           email: true,
-          // Hosted UI / OAuth — required for Google, Apple, Facebook social sign-in
           oauth: cognitoDomain
             ? {
                 domain:          cognitoDomain,
                 scopes:          ['email', 'openid', 'profile'],
-                redirectSignIn:  [`${origin}/auth/callback`],
-                redirectSignOut: [origin],
+                redirectSignIn:  REDIRECT_SIGN_IN,
+                redirectSignOut: REDIRECT_SIGN_OUT,
                 responseType:    'code',
               }
             : undefined,

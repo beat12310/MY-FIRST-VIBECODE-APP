@@ -1,0 +1,83 @@
+name: Scheduled Real AI Verification
+
+# Level 2 (real-ai-verification) and Level 3 (golden-project-suite) of the
+# testing architecture — see scripts/real-build-runner.ts's module doc.
+# Deliberately SEPARATE from ci.yml: both jobs here make real Bedrock calls
+# (real cost, real latency, non-deterministic output), which is the opposite
+# of what the fast, every-commit gate (ci.yml) needs. Runs on a schedule and
+# can also be triggered manually before a release.
+on:
+  schedule:
+    # Level 2 (fast sanity prompts): every day at 03:00 UTC.
+    - cron: '0 3 * * *'
+    # Level 3 (full Golden Project Suite, ~1-3+ hours): weekly, Sunday 04:00 UTC.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Which suite to run'
+        required: true
+        default: 'real-ai-verification'
+        type: choice
+        options: ['real-ai-verification', 'golden-project-suite']
+
+jobs:
+  real-ai-verification:
+    if: github.event.schedule == '0 3 * * *' || github.event.inputs.suite == 'real-ai-verification'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC — no long-lived AWS keys are stored in GitHub
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      # Short-lived credentials via OIDC only — infra/lib/github-oidc-stack.ts's
+      # trust policy restricts this to repo:beat12310/MY-FIRST-VIBECODE-APP,
+      # branch main, so this step fails closed on any fork/PR/other branch.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: Run Level 2 — representative real-prompt verification
+        run: npm run verify:real-ai
+      - name: Commit updated baseline (only on success)
+        if: success()
+        run: |
+          git config user.name "dwomoh-ci"
+          git config user.email "ci@dwomoh.local"
+          git add scripts/.baselines/real-ai-verification.json
+          git diff --staged --quiet || git commit -m "chore: update Level 2 real-AI verification baseline [skip ci]"
+          git push
+
+  golden-project-suite:
+    if: github.event.schedule == '0 4 * * 0' || github.event.inputs.suite == 'golden-project-suite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      id-token: write   # required for OIDC — no long-lived AWS keys are stored in GitHub
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: Run Level 3 — Golden Project Suite (8 real-world apps, ~1-3+ hours)
+        run: npm run verify:golden-suite
+      - name: Commit updated baseline (only on success)
+        if: success()
+        run: |
+          git config user.name "dwomoh-ci"
+          git config user.email "ci@dwomoh.local"
+          git add scripts/.baselines/golden-project-suite.json
+          git diff --staged --quiet || git commit -m "chore: update Golden Project Suite baseline [skip ci]"
+          git push

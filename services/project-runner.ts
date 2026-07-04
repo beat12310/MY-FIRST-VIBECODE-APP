@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir, rm } from 'fs/promises';
 import { createWriteStream, writeFileSync } from 'fs';
 import { createConnection } from 'net';
 import { PROJECT_CONFIG } from '@/lib/constants';
+import { GENERATED_ROOT } from '@/lib/workspace-paths';
 import { logError } from '@/lib/error-handler';
 import { findAvailablePort, waitForPort } from './port-detector';
 
@@ -32,7 +33,7 @@ export interface ServerResult extends RunResult {
 // Tracks the PID and port of the currently running generated-project server
 // so we can kill it before launching a new one.
 
-const STATE_DIR = join(process.cwd(), 'generated-projects');
+const STATE_DIR = GENERATED_ROOT;
 const SERVER_STATE_FILE = join(STATE_DIR, '.server-state.json');
 
 interface ServerState {
@@ -112,8 +113,9 @@ async function killPreviousServer(logs: string[]): Promise<void> {
 
 // ── Install dependencies ───────────────────────────────────────────────────
 
-export async function installDependencies(projectPath: string, extraFlags: string[] = []): Promise<RunResult> {
+export async function installDependencies(projectPath: string, extraFlags: string[] = [], signal?: AbortSignal): Promise<RunResult> {
   const logs: string[] = [];
+  if (signal?.aborted) return { success: false, logs, error: 'Cancelled before npm install started' };
 
   return new Promise((resolve) => {
     // Always use a writable cache dir — the default ~/.npm cache may be root-owned
@@ -122,9 +124,12 @@ export async function installDependencies(projectPath: string, extraFlags: strin
     logs.push(`📦 Running npm ${flags.join(' ')}...`);
 
     const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    // `signal` makes Node kill this child process the instant the caller aborts
+    // (e.g. the orchestrator's preview-stage timeout) — not just stop waiting on it.
     const proc = spawn(npmCmd, flags, {
       cwd: projectPath,
       timeout: PROJECT_CONFIG.INSTALL_TIMEOUT,
+      signal,
     });
 
     proc.stdout?.on('data', (data: Buffer) => {
@@ -148,6 +153,11 @@ export async function installDependencies(projectPath: string, extraFlags: strin
     });
 
     proc.on('error', (err: Error) => {
+      if (err.name === 'AbortError') {
+        logs.push('🛑 npm install cancelled — orchestrator stage was aborted');
+        resolve({ success: false, logs, error: 'Cancelled — orchestrator stage was aborted' });
+        return;
+      }
       logError('npm install error', err);
       resolve({ success: false, logs, error: err.message });
     });

@@ -1,0 +1,29 @@
+name: CI
+
+# Merge-blocking quality gate: a change is rejected until the entire permanent
+# regression suite passes and the codebase typechecks cleanly. This is the
+# server-side enforcement of the same "verify" script the local pre-commit
+# hook (.husky/pre-commit) already runs — CI is authoritative since a local
+# hook can be bypassed with --no-verify, this cannot.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Regression suite
+        run: npm test
+      - name: Platform dependency check
+        run: npm run check-deps

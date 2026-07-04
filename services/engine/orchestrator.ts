@@ -464,11 +464,45 @@ export async function defaultOrchestratorDeps(readProjectFiles: (projectPath: st
     needsClarification: (plan) => needsClarification(plan.intent),
     clarificationQuestion,
     build: (plan, signal) => buildApp(plan, builderDeps, signal),
-    verify: (plan, projectPath, previewUrl, signal) => verifyApp(
-      plan, projectPath,
-      previewUrl ? { readProjectFiles, probe: makeHttpProbe(previewUrl), previewUrl } : { readProjectFiles },
-      signal,
-    ),
+    // ROOT CAUSE fixes, confirmed live: (1) this pipeline never ran a real
+    // TypeScript compile against the generated project at all — only
+    // verifier.ts's much weaker string-based import/export heuristics — so
+    // real TS errors could survive an entire build+repair cycle unreported;
+    // (2) this pipeline had zero real-browser verification — only HTTP
+    // probing — so a Playwright-based click-through journey (register/
+    // login/navigate/logout) that the OLD build pipeline ran was completely
+    // absent here. Both wired in now via VerifierDeps' optional typecheck/
+    // browserJourney hooks, reusing the exact same production functions the
+    // old pipeline already used (services/project-runner.ts's
+    // validateProject, services/browser-journey-runner.ts's
+    // runBrowserJourney) — not reimplemented. browserJourney only runs when
+    // a live previewUrl exists (it needs a real running server); typecheck
+    // runs on every verify call — bounded to at most 4 per build (2 static,
+    // 2 runtime; confirmed by grepping every deps.verify() call site in this
+    // file), an acceptable, predictable cost for catching real compile errors.
+    verify: async (plan, projectPath, previewUrl, signal) => {
+      const { validateProject } = await import('@/services/project-runner');
+      const typecheck = async (path: string) => {
+        const r = await validateProject(path);
+        return { valid: r.valid, errors: r.errors };
+      };
+      const browserJourney = previewUrl ? async (url: string) => {
+        const { runBrowserJourney } = await import('@/services/browser-journey-runner');
+        const journeyType = plan.intent.appType === 'marketplace' || plan.intent.appType === 'ecommerce' ? 'marketplace'
+          : plan.intent.appType === 'booking' ? 'booking'
+          : plan.intent.appType === 'social' ? 'social'
+          : 'generic';
+        const r = await runBrowserJourney(url, journeyType as 'marketplace' | 'booking' | 'social' | 'generic');
+        return { passed: r.passed, verdict: r.verdict, summary: r.summary, failureDetail: r.failureDetail };
+      } : undefined;
+      return verifyApp(
+        plan, projectPath,
+        previewUrl
+          ? { readProjectFiles, probe: makeHttpProbe(previewUrl), previewUrl, typecheck, browserJourney }
+          : { readProjectFiles, typecheck },
+        signal,
+      );
+    },
     repair: (plan, projectPath, v, signal) => repair(plan, projectPath, v, repairerDeps, signal),
     learn: (input) => learnFromBuild(input, store), // persistence is fast/local — not worth cancelling mid-write
     // Safe preview: reuse the low-level dev-server runner (NOT the old build UI flow).

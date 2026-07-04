@@ -16,6 +16,7 @@ import type {
   PerfMeasurement, PerfMetricName, PerformanceThresholds, SecurityCheck,
   VerifyResult, WorkflowKind, WorkflowStatus, WorkflowStep, WorkflowTest,
 } from './types';
+import { z } from 'zod';
 // The non-type imports in this otherwise standalone module: the Integration
 // Registry (services/engine/integration-registry.ts) is the single source
 // of truth for "does this generated feature have every wiring guarantee it
@@ -40,6 +41,31 @@ export interface VerifierDeps {
   probe?: (req: ProbeRequest) => Promise<ProbeResponse>;
   previewUrl?: string | null;
   thresholds?: PerformanceThresholds;
+  /**
+   * Real TypeScript compile check (`tsc --noEmit`) against the generated
+   * project — NOT the same as the string-based import-resolution heuristics
+   * analyzeStatic already does above. Optional so this module stays
+   * standalone/unit-testable without spawning a real process; the
+   * production orchestrator always supplies it (services/project-runner.ts's
+   * validateProject). ROOT CAUSE this exists for: confirmed live that the
+   * engine pipeline never ran any real typecheck at all, so a TS error only
+   * surfaced if it happened to also break the (much weaker) string-based
+   * import/export checks — anything else silently shipped as "verified".
+   */
+  typecheck?: (projectPath: string) => Promise<{ valid: boolean; errors: string[] }>;
+  /**
+   * Real headless-browser click-through journey (register/login/navigate/
+   * logout) — NOT the same as runWorkflows above, which only ever does
+   * plain HTTP probing and can't see a client-side crash, a form that
+   * renders but doesn't submit, or a button with no handler. Optional for
+   * the same standalone-testability reason as typecheck; only called when
+   * a live previewUrl exists, since it needs a real running server.
+   * services/browser-journey-runner.ts's runBrowserJourney is the production
+   * implementation. ROOT CAUSE this exists for: this was wired ONLY into
+   * the OLD build pipeline (app/builder/page.tsx's "Browser Journey Gate"),
+   * completely absent from the new engine pipeline this verifier serves.
+   */
+  browserJourney?: (previewUrl: string) => Promise<{ passed: boolean; verdict: string; summary: string; failureDetail?: string }>;
 }
 
 const DEFAULT_THRESHOLDS: Required<PerformanceThresholds> = {
@@ -181,11 +207,102 @@ interface StaticAnalysis {
   searchIndexGaps: string[];
   /** A notifications feature present with no lib/managed/notifications.ts service. Integration Registry rule "notifications". */
   notificationsGaps: string[];
+  /**
+   * lib/managed/db.ts or lib/managed/auth.ts present but not matching the
+   * deterministic contract (services/project-generator.ts's MANAGED_DB_TS/
+   * MANAGED_AUTH_TS) — e.g. missing an expected export, or importing a
+   * package that was never installed (confirmed live: a model-rewritten
+   * db.ts imported '@prisma/client', crashing every route that touched the
+   * database with "Module not found," even though better-sqlite3 was the
+   * actual, installed, intended layer). These two files are injected
+   * deterministically at the initial build, but nothing previously
+   * re-asserted them if a later repair/edit pass overwrote either with an
+   * incompatible model-written version — this is that backstop.
+   */
+  managedServiceCorruption: string[];
+  /**
+   * ANY generated file (not just the two managed-service files above)
+   * importing an npm package that isn't listed in package.json — the same
+   * root failure mode (a model hallucinating a dependency that was never
+   * installed), generalized. resolveImport() already treats every bare
+   * (non-relative, non-@/) import as "external — assume installed"; this is
+   * the check that actually verifies that assumption. Classified internal/
+   * repairable so the model-based repair path (not a deterministic fast-
+   * path — the right fix genuinely varies: add the package, or rewrite the
+   * import to use something already available) can resolve it with full
+   * context, the same way it resolves any other structural failure.
+   */
+  uninstalledImports: string[];
+}
+
+const REQUIRED_DB_EXPORTS = [/export\s+function\s+initTable/, /export\s+const\s+db\s*=/];
+const REQUIRED_AUTH_EXPORTS = [/export\s+(async\s+)?function\s+registerUser/, /export\s+(async\s+)?function\s+loginUser/, /export\s+(async\s+)?function\s+getAuthUser/, /export\s+function\s+getUserById/];
+// Node.js builtins are always available and never listed in package.json —
+// excluded so a plain `import { join } from 'path'` doesn't get misflagged
+// as an uninstalled package the same way a real hallucinated import would be.
+const NODE_BUILTINS = new Set(['path', 'fs', 'crypto', 'util', 'stream', 'events', 'os', 'url', 'http', 'https', 'net', 'buffer', 'child_process', 'assert', 'querystring', 'zlib']);
+
+// A generated app's package.json is content the model wrote — malformed JSON
+// is already handled, but a validly-parsed object with a wrong SHAPE (e.g.
+// "dependencies" as an array or a string instead of a name→version record)
+// previously still passed through silently, since every consumer only ever
+// read pkg.dependencies with `?? {}` and never checked what came back.
+// Validating the shape explicitly means a corrupt-but-parseable package.json
+// is treated the same conservative way a parse failure already is (falls
+// back to an empty dependency set), rather than crashing later when
+// Object.keys() is called on something that isn't actually an object.
+const PackageJsonSchema = z.object({
+  dependencies: z.record(z.string(), z.string()).optional(),
+  devDependencies: z.record(z.string(), z.string()).optional(),
+}).passthrough();
+
+/**
+ * Detects when lib/managed/db.ts or lib/managed/auth.ts has been overwritten
+ * with something that no longer matches the deterministic contract every
+ * other generated file (routes, middleware) assumes it exports. Not a full
+ * equality check against the template — a model-written replacement that
+ * legitimately implements the same exports is fine; what's NOT fine is one
+ * missing the exports entirely, or one that imports a package that was
+ * never installed (the concrete failure mode confirmed live).
+ */
+export function detectManagedServiceCorruption(files: { path: string; content: string }[], installedDeps: Set<string>): string[] {
+  const issues: string[] = [];
+  const dbFile = files.find(f => f.path === 'lib/managed/db.ts');
+  if (dbFile) {
+    const missing = REQUIRED_DB_EXPORTS.filter(re => !re.test(dbFile.content));
+    if (missing.length > 0) issues.push(`lib/managed/db.ts is missing expected export(s) (initTable/db) — likely overwritten with an incompatible implementation: lib/managed/db.ts`);
+    const importRe = /import\s+(?:[^'"]+\s+from\s+)?["']([^"'./][^"']*)["']/g;
+    let m;
+    while ((m = importRe.exec(dbFile.content))) {
+      const pkg = m[1].split('/').slice(0, m[1].startsWith('@') ? 2 : 1).join('/');
+      if (!NODE_BUILTINS.has(pkg) && !installedDeps.has(pkg)) issues.push(`lib/managed/db.ts imports "${pkg}", which is not in package.json dependencies (likely hallucinated — better-sqlite3 is the platform's intended database layer): lib/managed/db.ts`);
+    }
+  }
+  const authFile = files.find(f => f.path === 'lib/managed/auth.ts');
+  if (authFile) {
+    const missing = REQUIRED_AUTH_EXPORTS.filter(re => !re.test(authFile.content));
+    if (missing.length > 0) issues.push(`lib/managed/auth.ts is missing expected export(s) (registerUser/loginUser/getAuthUser/getUserById) — likely overwritten with an incompatible implementation: lib/managed/auth.ts`);
+  }
+  return issues;
 }
 
 export function analyzeStatic(plan: AppPlan, files: { path: string; content: string }[]): StaticAnalysis {
   const fileSet = new Set(files.map(f => f.path));
   const code = files.filter(f => /\.(tsx?|jsx?)$/.test(f.path));
+
+  const pkgFile = files.find(f => f.path === 'package.json');
+  const installedDeps = new Set<string>();
+  if (pkgFile) {
+    try {
+      const parsed = PackageJsonSchema.safeParse(JSON.parse(pkgFile.content));
+      if (parsed.success) {
+        for (const dep of [...Object.keys(parsed.data.dependencies ?? {}), ...Object.keys(parsed.data.devDependencies ?? {})]) installedDeps.add(dep);
+      }
+      // parsed.success === false (valid JSON, wrong shape) falls through the
+      // same as a JSON.parse failure below — conservative-empty, never a crash.
+    } catch { /* malformed package.json — treated as no known deps, checks below become conservative-empty */ }
+  }
+
   const routes: string[] = [], apiRoutes: string[] = [];
   const pageSet = new Set<string>();
   for (const f of files) {
@@ -204,9 +321,21 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
   const brokenImports: string[] = [], missingExports: string[] = [], placeholders: string[] = [];
   const placeholderMatches: { path: string; matched: string }[] = [];
   const truncatedFiles: string[] = [];
+  const uninstalledImports: string[] = [];
   const importRe = /import\s+(?:[^'"]+\s+from\s+)?["']([^"']+)["']/g;
   for (const f of code) {
-    let m; while ((m = importRe.exec(f.content))) { if (!resolveImport(m[1], f.path, fileSet)) brokenImports.push(`${f.path} → ${m[1]}`); }
+    let m; while ((m = importRe.exec(f.content))) {
+      const spec = m[1];
+      if (!resolveImport(spec, f.path, fileSet)) brokenImports.push(`${f.path} → ${spec}`);
+      // A bare package import (not @/, ./, ../) that resolveImport() treats
+      // as "external — assume installed" — this is the check that verifies
+      // that assumption, catching any hallucinated dependency, not just the
+      // db.ts/auth.ts-specific case detectManagedServiceCorruption covers.
+      else if (!spec.startsWith('@/') && !spec.startsWith('.')) {
+        const pkg = spec.split('/').slice(0, spec.startsWith('@') ? 2 : 1).join('/');
+        if (!NODE_BUILTINS.has(pkg) && !installedDeps.has(pkg)) uninstalledImports.push(`${f.path} imports "${pkg}", which is not in package.json dependencies: ${f.path}`);
+      }
+    }
     if (/\/page\.[jt]sx?$/.test(f.path) && !/export\s+default/.test(f.content)) missingExports.push(f.path);
     if (/\/route\.[jt]sx?$/.test(f.path) && !/export\s+(async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH)/.test(f.content)) missingExports.push(f.path);
     const placeholderHit = f.content.match(PLACEHOLDER_RE);
@@ -249,10 +378,13 @@ export function analyzeStatic(plan: AppPlan, files: { path: string; content: str
   // will throw. These MUST surface (the old pass reported "0 build errors" for them).
   truncatedFiles.forEach(fp => buildErrors.push(`Truncated/unbalanced file (incomplete generation): ${fp}`));
 
+  const managedServiceCorruption = detectManagedServiceCorruption(files, installedDeps);
+
   return {
     fileCount: files.length, routes: [...new Set(routes)].sort(), apiRoutes: [...new Set(apiRoutes)].sort(),
     pagesGenerated: pageSet.size, deadLinks, brokenImports, missingExports, placeholders, placeholderMatches, missingPlanned, buildErrors, orphanedApiCalls, unprotectedRoutes,
     navigationGaps, dashboardWidgetGaps, breadcrumbGaps, permissionGaps, databaseSchemaGaps, searchIndexGaps, notificationsGaps,
+    managedServiceCorruption, uninstalledImports,
   };
 }
 
@@ -404,6 +536,11 @@ export async function verifyApp(plan: AppPlan, projectPath: string, deps: Verifi
   s.databaseSchemaGaps.forEach(d => addInternal('structural', d, 'database-schema'));
   s.searchIndexGaps.forEach(d => addInternal('runtime', d, 'search-indexing'));
   s.notificationsGaps.forEach(d => addInternal('runtime', d, 'notifications'));
+  // Not tagged with an integrationId — repairer.ts's fast-path for this
+  // matches on the detail text itself (MANAGED_SERVICE_CORRUPTION_RE), the
+  // same convention the existing AUTH_FAILURE_RE fast-path already uses.
+  s.managedServiceCorruption.forEach(d => addInternal('structural', d));
+  s.uninstalledImports.forEach(d => addInternal('structural', d));
   // The file path MUST stay at the end of the detail string — repairer.ts's
   // describeTarget() extracts the target file via a regex anchored on `$`,
   // matching the convention every other failure-detail message in this file uses.
@@ -441,6 +578,26 @@ export async function verifyApp(plan: AppPlan, projectPath: string, deps: Verifi
   const workflowTests = await runWorkflows(plan, deps, externalIssues, signal);
   const performance = await runPerformance(plan, deps, signal);
   const securityChecks = await runSecurity(plan, deps, signal);
+
+  // Real TypeScript compile check — see VerifierDeps.typecheck's doc comment
+  // for why this is separate from analyzeStatic's import-resolution heuristics.
+  if (deps.typecheck && !signal?.aborted) {
+    const ts = await deps.typecheck(projectPath).catch((): { valid: boolean; errors: string[] } | null => null);
+    if (ts && !ts.valid) {
+      for (const err of ts.errors) addInternal('structural', `TypeScript error: ${err}`);
+    }
+  }
+
+  // Real headless-browser click-through journey — see VerifierDeps.browserJourney's
+  // doc comment for why this is separate from runWorkflows' HTTP-only probing.
+  let browserJourney: VerifyResult['browserJourney'] = null;
+  if (deps.browserJourney && deps.previewUrl && !signal?.aborted) {
+    const bj = await deps.browserJourney(deps.previewUrl).catch((): typeof browserJourney => null);
+    if (bj) {
+      browserJourney = bj;
+      if (!bj.passed) addInternal('functional', `Browser journey failed: ${bj.summary}${bj.failureDetail ? ` — ${bj.failureDetail}` : ''}`);
+    }
+  }
 
   // record internal workflow failures as classified failures
   for (const w of workflowTests) if (w.status === 'failed' && w.failureOrigin !== 'external') addInternal('functional', `Workflow failed: ${w.label}`);
@@ -481,6 +638,7 @@ export async function verifyApp(plan: AppPlan, projectPath: string, deps: Verifi
     externalIssues, classifiedFailures,
     performance, performanceWithinBudget,
     securityChecks, securityPassed,
+    browserJourney,
     passed,
   };
 }

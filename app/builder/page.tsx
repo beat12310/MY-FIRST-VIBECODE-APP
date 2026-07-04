@@ -1,11 +1,14 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Suspense } from 'react';
 import { useAuth } from '@/lib/auth-context';
 import { PROJECT_TEMPLATES } from '@/lib/project-templates';
 import { interpretCommand, getActionLabel } from '@/lib/nl-command-interpreter';
+import { detectIntent, type MessageIntent } from '@/lib/intent-classifier';
+import { decideProjectOpenRouting, reportsRoutingProblem } from '@/lib/repair-routing';
+import { saveOpenProject, clearOpenProject, loadOpenProject } from '@/lib/project-session-storage';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -29,7 +32,7 @@ interface DisplayMessage {
     title: string;
     explanation: string;
     whatNext: string;
-    recoveryActions?: Array<{ label: string; action: 'retry-logo' | 'retry-research' | 'open-logs' | 'focus-input'; prompt?: string }>;
+    recoveryActions?: Array<{ label: string; action: 'retry-logo' | 'retry-research' | 'open-logs' | 'focus-input' | 'claude-bridge'; prompt?: string }>;
   };
 }
 
@@ -164,18 +167,86 @@ function BuildStylePickerInline({ value, onChange }: { value: BuildStyle; onChan
   );
 }
 
+// ─── Hard-error patterns (module scope so async callbacks can use them) ───────
+// These errors cannot be fixed by AI code generation — they require direct file
+// inspection and editing (SQLite migrations, module resolution, runtime crashes).
+
+const HARD_ERROR_PATTERNS_MODULE: Array<{ label: string; patterns: RegExp[] }> = [
+  { label: 'SQLite schema mismatch',     patterns: [/no such column/i, /has no column named/i, /table.*has no column/i, /SQLITE_ERROR.*column/i] },
+  { label: 'SQLite missing table',       patterns: [/no such table/i, /SQLITE_ERROR.*table/i] },
+  { label: 'PostgreSQL schema mismatch', patterns: [/relation .* does not exist/i, /column .* of relation/i, /column .* does not exist/i] },
+  { label: 'Module import failure',      patterns: [/Cannot find module/i, /Module not found: Error/i, /Cannot resolve module/i] },
+  { label: 'Missing source file',        patterns: [/ENOENT.*no such file or directory/i, /failed to read file/i] },
+  { label: 'Runtime crash',             patterns: [/UnhandledPromiseRejection/i, /ReferenceError.*is not defined/i, /TypeError.*is not a function/i] },
+  { label: 'Build compilation failure',  patterns: [/Build optimization failed/i, /Export encountered errors/i, /Failed to compile/i] },
+  { label: 'Auth route returning 500',   patterns: [/500.*\/api\/auth/i, /api\/auth.*500/i] },
+];
+
+function getHardErrorLabelModule(check: { error?: string; rootCause?: unknown }): string | null {
+  const errText = [(check.error ?? ''), ((check.rootCause as Record<string, string>)?.detail ?? '')].join(' ');
+  for (const { label, patterns } of HARD_ERROR_PATTERNS_MODULE) {
+    if (patterns.some(p => p.test(errText))) return label;
+  }
+  return null;
+}
+
 // ─── Component ─────────────────────────────────────────────────────────────────
 
 function BuilderInner() {
-  const { user, getToken } = useAuth();
+  const { user, loading: authLoading, getToken } = useAuth();
   const searchParams = useSearchParams();
   // Conversation
   const [phase, setPhase] = useState<BuildPhase>('idle');
   const [history, setHistory] = useState<ConversationTurn[]>([]);
   const [displayed, setDisplayed] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState('');
+
+  // ── Engine Build (Step 9) — TEST ONLY. Self-contained; does not affect the main
+  //    build flow, the old build button, billing, auth, or deploy. ──────────────
+  const [engineOpen, setEngineOpen] = useState(false);
+  const [enginePrompt, setEnginePrompt] = useState('');
+  const [engineBusy, setEngineBusy] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [engineReport, setEngineReport] = useState<any>(null);
+  const [engineError, setEngineError] = useState('');
+  const [engineStage, setEngineStage] = useState('');
+  const engineEsRef = useRef<EventSource | null>(null);
   const [loading, setLoading] = useState(false);
   const [readyToBuild, setReadyToBuild] = useState(false);
+
+  // ── Repaired-engine Send-button migration flag ────────────────────────────
+  // Server-side gate (see action:'feature-flags' in app/api/chat/route.ts) so
+  // rollout/rollback needs no rebuild.
+  //
+  // ROOT CAUSE fixed here: this was originally read from a useState populated
+  // by a fire-and-forget useEffect fetch — confirmed live (server logs showed
+  // zero requests to /api/engine-build-stream-prod, and the OLD pipeline's own
+  // Playwright "browser analysis" gate ran instead) that runBuildPipeline's
+  // `if (useEngineBuildForSend)` check was reading the state BEFORE the async
+  // fetch had resolved: a race between the mount-time fetch and the user's
+  // Send click, not a caching problem — the value was simply still the
+  // useState default (false) at the moment it was read. A React state
+  // variable can only ever reflect its value AT THE LAST RENDER, so no amount
+  // of re-fetching removes the window where it's stale; the fix is to make
+  // the flag consumer explicitly AWAIT resolution instead of reading a
+  // snapshot. engineFlagRef holds the in-flight/resolved promise; every read
+  // (see runBuildPipeline) awaits it directly, so the value used to route the
+  // Send button is always the server's actual current answer, never a stale
+  // default, regardless of how quickly the user clicks after page load.
+  const engineFlagRef = useRef<Promise<boolean> | null>(null);
+  if (!engineFlagRef.current) {
+    engineFlagRef.current = fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'feature-flags' }) })
+      .then(r => r.json())
+      .then(d => {
+        const flag = d?.success ? !!d.engineBuildForSend : false;
+        console.log(`[send-routing] feature-flags fetch resolved: engineBuildForSend=${flag}`);
+        return flag;
+      })
+      .catch((e) => {
+        console.log(`[send-routing] feature-flags fetch FAILED, defaulting to false (old pipeline): ${e instanceof Error ? e.message : e}`);
+        return false; // fail closed — keep the old pipeline
+      });
+  }
 
   // Build target: 'web' = existing Next.js pipeline, 'flutter' = new Flutter pipeline
   const [buildTarget, setBuildTarget] = useState<'web' | 'flutter'>('web');
@@ -219,9 +290,111 @@ function BuilderInner() {
   const [credentialSaving, setCredentialSaving] = useState<string | null>(null);
   const [makeSearchWorking, setMakeSearchWorking] = useState(false);
 
+  // ── Claude Code Bridge ────────────────────────────────────────────────────
+  // Forwards prompts from DWOMOH VIBE CODE to the local Claude Code CLI, which
+  // edits the generated project files directly and streams progress back here.
+  const [bridgeSession, setBridgeSession] = useState<{
+    status: 'connecting' | 'running' | 'complete' | 'error';
+    sessionId: string;
+    logs: string[];
+    changedFiles: string[];
+    verifyResult: { verified: boolean; summary: string; passedCount: number; totalCount: number } | null;
+  } | null>(null);
+  const bridgeEsRef = useRef<EventSource | null>(null);
+  // Tracks the intent classification of the PREVIOUS message (fresh-session
+  // path only). ROOT CAUSE fix: canned responses (clarification/planning
+  // prompts) never get added to `history` — only respondWithAI's answers do
+  // — so `inActiveSession = history.length >= 4` never reflects "we just
+  // asked a clarifying question" until at least 4 REAL exchanges have
+  // happened, which a simple "detailed request → clarification → build it"
+  // 2-3 turn interaction never reaches. This ref is a much more direct
+  // signal: "was the immediately preceding turn itself a request for more
+  // info," used alongside (not instead of) inActiveSession so a short
+  // build-confirmation message is recognized regardless of raw history length.
+  const lastIntentRef = useRef<string | null>(null);
+
   // Debug Mode — when enabled, surfaces raw engineering reports in the chat.
   // Off by default so normal users don't see technical repair output.
-  const [debugMode, setDebugMode] = useState(false);
+  // Initialized from localStorage so toggling Developer Mode from the
+  // Settings page (a separate React tree) is reflected here on next load,
+  // and vice versa — see the matching read/write in
+  // app/dashboard/settings/page.tsx.
+  const [debugMode, setDebugModeState] = useState(() => {
+    try { return localStorage.getItem('dwomoh_dev_mode') === '1'; } catch { return false; }
+  });
+  const setDebugMode = (updater: boolean | ((prev: boolean) => boolean)) => {
+    setDebugModeState(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      try { localStorage.setItem('dwomoh_dev_mode', next ? '1' : '0'); } catch { /* ignore */ }
+      return next;
+    });
+  };
+  // Permission set for the signed-in account, fetched once from the database
+  // via /api/admin/roles (services/rbac.ts) — gates whether Developer Mode
+  // (the Debug toggle + Worker Panel below) is even reachable. Defaults to
+  // an empty set (no permissions) until resolved, so nothing elevated is
+  // ever shown before the check completes.
+  const [myPermissions, setMyPermissions] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    // ROOT CAUSE fix: this previously depended on [getToken] only — getToken
+    // is a referentially-stable useCallback (empty deps in auth-context.tsx),
+    // so this effect fired exactly once on mount, before Amplify had
+    // necessarily finished resolving the signed-in user. If that one fetch
+    // raced the session hydration and got a 401, myPermissions stayed an
+    // empty Set for the entire session with no retry — hiding the Debug
+    // toggle even for a real SUPER_ADMIN account. Fixed by depending on
+    // [authLoading, user, getToken] (so this re-runs once auth actually
+    // resolves) and adding one short retry for a signed-in user whose first
+    // token fetch still comes back empty (same hydration race documented at
+    // runBuildPipelineViaEngine's token fetch).
+    if (authLoading) return;
+    if (!user) { setMyPermissions(new Set()); return; }
+    let cancelled = false;
+    (async () => {
+      const fetchPermissions = async (): Promise<{ ok: boolean; permissions?: unknown }> => {
+        const token = await getToken().catch(() => null);
+        const res = await fetch('/api/admin/roles', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        }).catch(() => null);
+        if (!res || !res.ok) return { ok: false };
+        const data = await res.json().catch(() => null);
+        return { ok: true, permissions: data?.permissions };
+      };
+      let result = await fetchPermissions();
+      if (!result.ok) {
+        console.warn('[dev-mode] first /api/admin/roles fetch failed — retrying once');
+        await new Promise(r => setTimeout(r, 400));
+        result = await fetchPermissions();
+      }
+      console.log(`[dev-mode] permissions fetch result: ok=${result.ok}, permissions=${JSON.stringify(result.permissions)}, cancelled=${cancelled}`);
+      if (!cancelled && result.ok && Array.isArray(result.permissions)) {
+        setMyPermissions(new Set(result.permissions));
+        console.log(`[dev-mode] myPermissions set — has VIEW_DEVELOPER_MODE: ${result.permissions.includes('VIEW_DEVELOPER_MODE')}`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authLoading, user, getToken]);
+  // Bridge Test Mode — routes the entire build through the Claude Bridge instead of
+  // the normal Bedrock generation pipeline. DWOMOH Vibe Code acts as pure orchestration;
+  // Claude Code CLI does all generation, build, verification, and repair.
+  const [bridgeTestMode, setBridgeTestMode] = useState(false);
+  // Live telemetry stages shown during a bridge test run
+  const [bridgeTelemetry, setBridgeTelemetry] = useState<Array<{
+    id: string; label: string; status: 'waiting' | 'active' | 'done' | 'error'; detail: string; ts?: string;
+  }>>([]);
+
+  // ── Claude Bridge auto-escalation tracking ──────────────────────────────────
+  // These refs (not state) prevent re-render loops inside the repair loop.
+  const bridgeEscalationCountRef  = useRef(0);  // times bridge has auto-triggered this session
+  const bridgeEscalatingRef       = useRef(false); // mutex: only one bridge run at a time
+  const bridgeEscalationReasonRef = useRef('');
+  const MAX_AUTO_BRIDGE_ESCALATIONS = 2;
+  // Reset when a new project starts (called from build entry-point)
+  const resetBridgeEscalation = useCallback(() => {
+    bridgeEscalationCountRef.current  = 0;
+    bridgeEscalatingRef.current       = false;
+    bridgeEscalationReasonRef.current = '';
+  }, []);
 
   // VS Code escalation — set when all repair tiers are exhausted.
   // Polls for resolution written by Claude Code into .dwomoh/escalation-resolved.json.
@@ -292,6 +465,31 @@ function BuilderInner() {
   const [focusMode, setFocusMode] = useState(false);
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>('projects');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // ── Mobile workspace state ─────────────────────────────────────────────────
+  const [isMobile, setIsMobile] = useState(false);
+  const [mobileTab, setMobileTab] = useState<'library' | 'chat' | 'preview' | 'tools'>('library');
+  const [mobileSearchQuery, setMobileSearchQuery] = useState('');
+  const [mobileToolsSection, setMobileToolsSection] = useState<'terminal' | 'logs' | 'deploy' | 'files' | 'database'>('terminal');
+  const [mobileFocused, setMobileFocused] = useState(false);
+  const [mobileKbOffset, setMobileKbOffset] = useState(0);
+
+  // ── Goal-first build flow (spec points 1-5) ───────────────────────────────
+  type GoalStep = 'idle' | 'type' | 'mobile-tech' | 'recommend';
+  type GoalPlatform = 'website' | 'mobile' | null;
+  type MobileTech = 'flutter' | 'android' | 'ios' | null;
+  const [goalStep, setGoalStep] = useState<GoalStep>('idle');
+  const [goalPlatform, setGoalPlatform] = useState<GoalPlatform>(null);
+  const [mobileTech, setMobileTech] = useState<MobileTech>(null);
+  const [pendingBuildPrompt, setPendingBuildPrompt] = useState<string | null>(null);
+  const [buildRecommendation, setBuildRecommendation] = useState<{
+    platform: 'website' | 'flutter' | 'android' | 'ios';
+    reason: string;
+    icon: string;
+  } | null>(null);
+  // Build timeout heartbeat state
+  const [buildHeartbeatMsg, setBuildHeartbeatMsg] = useState<string | null>(null);
+  const buildHeartbeatRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   // File manager
   const [fileManagerOpen, setFileManagerOpen] = useState(false);
@@ -445,6 +643,25 @@ function BuilderInner() {
   useEffect(() => { scrollBottom(); }, [displayed, buildProgress, scrollBottom]);
   useEffect(() => { voiceEnabledRef.current = voiceEnabled; }, [voiceEnabled]);
   useEffect(() => { voiceAutoSendRef.current = voiceAutoSend; }, [voiceAutoSend]);
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
+  }, []);
+  useEffect(() => {
+    if (!isMobile) return;
+    type VV = { height: number; offsetTop?: number; addEventListener(e: string, h: () => void): void; removeEventListener(e: string, h: () => void): void };
+    const vv = (window as unknown as { visualViewport?: VV }).visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const kb = Math.max(0, window.innerHeight - vv.height - (vv.offsetTop ?? 0));
+      setMobileKbOffset(kb > 50 ? kb : 0);
+    };
+    vv.addEventListener('resize', update);
+    vv.addEventListener('scroll', update);
+    return () => { vv.removeEventListener('resize', update); vv.removeEventListener('scroll', update); };
+  }, [isMobile]);
 
   // NOTE: The escalation polling useEffect is placed after api/addMsg are defined (see below).
 
@@ -457,7 +674,17 @@ function BuilderInner() {
   }, []);
 
   const api = useCallback(async (body: Record<string, unknown>) => {
-    const token = await getToken();
+    let token = await getToken();
+    // Same Amplify session-hydration race as runBuildPipelineViaEngine's
+    // token fetch: a signed-in user can get an empty token on the very first
+    // request after a page load, silently dropping every server-side call
+    // (billing, RBAC permission checks, project ownership) to 'anonymous'.
+    // One short retry closes the race for genuinely signed-in users, while
+    // signed-out visitors (user === null) skip it entirely.
+    if (!token && user) {
+      await new Promise(r => setTimeout(r, 400));
+      token = await getToken().catch(() => null);
+    }
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: {
@@ -467,7 +694,356 @@ function BuilderInner() {
       body: JSON.stringify(body),
     });
     return res.json();
-  }, [getToken]);
+  }, [getToken, user]);
+
+  // ── Claude Code Bridge ────────────────────────────────────────────────────
+
+  // Telemetry hook: bridge-only pipeline registers a callback here so the SSE
+  // event handlers below can advance stage indicators without tight coupling.
+  const bridgeTelemetryHookRef = useRef<((eventType: string, msg: string) => void) | null>(null);
+
+  // launchBridge — opens the Claude Code SSE stream.
+  // autoMode = true: shows user-friendly progress messages ("Inspecting project…") instead of
+  //   raw dev messages. Used by the automatic escalation system.
+  // autoMode = false (default): shows raw technical messages. Triggered by debug-mode button.
+  const launchBridge = useCallback(async (
+    prompt: string,
+    options: {
+      autoMode?: boolean;
+      escalationReason?: string;
+      onComplete?: (verified: boolean, changedFiles: string[]) => void;
+      /** Explicit overrides — used by bridge test mode to bypass async state timing */
+      projectPathOverride?: string;
+      projectIdOverride?: string;
+    } = {},
+  ) => {
+    const { autoMode = false, escalationReason = '', onComplete, projectPathOverride, projectIdOverride } = options;
+    const projectPath = projectPathOverride ?? currentProject?.projectPath ?? buildProgress?.projectPath ?? '';
+    const projectId   = projectIdOverride   ?? currentProject?.id ?? '';
+    const port        = buildProgress?.port ?? currentProject?.port ?? 0;
+    if (!projectPath) {
+      if (!autoMode) addStatus('No project open — open a project first', 'error');
+      onComplete?.(false, []);
+      return;
+    }
+
+    // Close any existing bridge session
+    if (bridgeEsRef.current) { bridgeEsRef.current.close(); bridgeEsRef.current = null; }
+
+    const localSessionId = `bridge-${Date.now()}-pending`;
+    setBridgeSession({ status: 'connecting', sessionId: localSessionId, logs: [], changedFiles: [], verifyResult: null });
+
+    if (autoMode) {
+      addStatus('Advanced repair started — inspecting project files…', 'checking');
+    } else {
+      addStatus('Connecting to Claude Code worker…', 'checking');
+    }
+
+    // Get Cognito token — EventSource cannot set custom headers, so token goes in the URL.
+    // Same Amplify session-hydration race documented at runBuildPipelineViaEngine's
+    // token fetch — one short retry for a signed-in user whose first token
+    // fetch came back empty.
+    let token = '';
+    try { token = (await getToken()) ?? ''; } catch { /* no auth configured */ }
+    if (!token && user) {
+      await new Promise(r => setTimeout(r, 400));
+      try { token = (await getToken()) ?? ''; } catch { /* still no token */ }
+    }
+
+    const params = new URLSearchParams({
+      prompt,
+      projectPath,
+      projectId,
+      ...(port            ? { port:              String(port)  } : {}),
+      ...(token           ? { token }                              : {}),
+      ...(escalationReason ? { escalationReason }                 : {}),
+    });
+    const es = new EventSource(`/api/claude-bridge?${params}`);
+    bridgeEsRef.current = es;
+
+    // Map verbose dev messages → simple user-facing labels in autoMode
+    const AUTO_STATUS_MAP: Record<string, string> = {
+      'Checking Claude Code connection': 'Connecting to advanced repair engine…',
+      'Creating pre-edit checkpoint':    'Saving project state…',
+      'Checkpoint saved':                'Project checkpoint created',
+      'Forwarding to Claude Code worker': 'Inspecting project…',
+      'Detecting file changes':           'Repairing root cause…',
+      'Running build verification':       'Verifying preview…',
+    };
+    const mapAutoMsg = (raw: string): string => {
+      for (const [key, label] of Object.entries(AUTO_STATUS_MAP)) {
+        if (raw.startsWith(key)) return label;
+      }
+      if (raw.startsWith('Verified:')) return `Repair complete — ${raw}`;
+      if (raw.startsWith('SESSION_ID:')) return '';
+      return autoMode ? '' : raw; // suppress unknown dev messages in auto mode
+    };
+
+    es.onmessage = (e: MessageEvent) => {
+      let event: { type: string; message?: string; changedFiles?: string[]; verifyResult?: { verified: boolean; summary: string; passedCount: number; totalCount: number }; result?: string };
+      try { event = JSON.parse(e.data as string); } catch { return; }
+
+      // Fire telemetry hook for bridge-test-mode stage tracking
+      const telHook = bridgeTelemetryHookRef.current;
+      if (telHook) telHook(event.type, event.message ?? '');
+
+      if (event.type === 'status') {
+        const raw = event.message ?? '';
+        if (raw.startsWith('SESSION_ID:')) {
+          const sid = raw.replace('SESSION_ID:', '');
+          setBridgeSession(prev => prev ? { ...prev, status: 'running', sessionId: sid } : prev);
+          return;
+        }
+        const display = autoMode ? mapAutoMsg(raw) : raw;
+        if (display) {
+          addStatus(display, 'checking');
+          setBridgeSession(prev => prev ? { ...prev, status: 'running', logs: [...prev.logs, `ℹ️ ${display}`] } : prev);
+        } else {
+          // Still update status (for spinner) even if we don't show the message
+          setBridgeSession(prev => prev ? { ...prev, status: 'running' } : prev);
+        }
+      } else if (event.type === 'log' || event.type === 'thinking') {
+        const msg = event.message ?? '';
+        // Tool-use lines (file edits/reads) are shown even in autoMode — they are
+        // the only visible proof that repair is making progress.
+        const isFileOp = /^[✏️📝📖⚡🔧]/u.test(msg);
+        const isRepairAction = autoMode && /edit|write|fix|creat|delet|migrat|alter table|recreat/i.test(msg);
+        if (!autoMode || isFileOp || isRepairAction) {
+          setBridgeSession(prev => prev ? { ...prev, status: 'running', logs: [...prev.logs, msg] } : prev);
+          // In autoMode, surface file operations into the main status log so users
+          // can see what the repair engine is actually doing without debug mode.
+          if (autoMode && (isFileOp || isRepairAction)) {
+            addStatus(`🔧 ${msg.slice(0, 90)}`, 'checking');
+          }
+        }
+      } else if (event.type === 'tool') {
+        setBridgeSession(prev => prev ? { ...prev, status: 'running', logs: [...prev.logs, `🔧 ${event.message ?? ''}`] } : prev);
+      } else if (event.type === 'warning') {
+        // Show warnings prominently — includes auto-recovery headers from the bridge retry loop
+        const warnMsg = event.message ?? '';
+        addStatus(`⚠️ ${warnMsg}`, 'applying');
+        setBridgeSession(prev => prev ? { ...prev, logs: [...prev.logs, `⚠️ ${warnMsg}`] } : prev);
+      } else if (event.type === 'error') {
+        const errMsg = event.message ?? '';
+        // Bridge-side errors are now specific: "Interruption detected — process exited code 1", etc.
+        // Surface the full message — the server already classified the failure.
+        addStatus(`❌ ${errMsg}`, 'error');
+        setBridgeSession(prev => prev ? { ...prev, status: 'error', logs: [...prev.logs, `❌ ${errMsg}`] } : prev);
+        es.close(); bridgeEsRef.current = null;
+        onComplete?.(false, []);
+        bridgeEscalatingRef.current = false;
+      } else if (event.type === 'complete') {
+        const vr    = event.verifyResult;
+        const changed = event.changedFiles ?? [];
+        const bridgePort = (event as { port?: number }).port ?? 0;
+        const totalFiles = (event as { totalProjectFiles?: number }).totalProjectFiles ?? changed.length;
+        // Use totalProjectFiles for display when project already existed (changedFiles is diff only)
+        const displayFileCount = totalFiles > changed.length ? totalFiles : changed.length;
+
+        const label = vr?.verified
+          ? `✅ ${autoMode ? 'Repair' : 'Bridge'} complete — ${vr.passedCount}/${vr.totalCount} checks, ${displayFileCount} file(s)`
+          : `⚠️ ${autoMode ? 'Repair' : 'Bridge'} done — ${displayFileCount} file(s), verification partial (${vr?.passedCount ?? 0}/${vr?.totalCount ?? 0})`;
+        addStatus(label, vr?.verified ? 'done' : 'applying');
+
+        // If the bridge started the dev server, wire up the preview immediately
+        if (bridgePort > 0) {
+          setPreviewUrl(`http://localhost:${bridgePort}`);
+          setPreviewKey(k => k + 1);
+          setPreviewLoading(true);
+          setPhase('previewing');
+          setBuildProgress(p => p ? { ...p, step: 'done', port: bridgePort, message: vr?.verified ? `✅ Preview verified — port ${bridgePort}` : `⚠️ Preview on port ${bridgePort} (verification partial)` } : p);
+          if (vr?.verified) addStatus(`🖥️  Preview: http://localhost:${bridgePort}`, 'done');
+        } else if (changed.length > 0) {
+          // No port from bridge (auto-escalation mode) — just refresh if files changed
+          setTimeout(() => setPreviewKey(k => k + 1), 2000);
+        }
+
+        setBridgeSession(prev => prev ? { ...prev, status: 'complete', changedFiles: changed, verifyResult: vr ?? null } : prev);
+        if (vr) setLastVerification({ verified: vr.verified, summary: vr.summary, checks: [] });
+        es.close(); bridgeEsRef.current = null;
+        onComplete?.(vr?.verified ?? false, changed);
+        bridgeEscalatingRef.current = false;
+      }
+    };
+
+    // SSE-level reconnect — fires when the HTTP connection drops (network blip,
+    // Next.js route restart, server restart). The bridge retries internally for
+    // process-level failures; this handles transport-level disconnects.
+    let sseReconnectCount = 0;
+    const MAX_SSE_RECONNECTS = 3;
+
+    es.onerror = () => {
+      if (sseReconnectCount < MAX_SSE_RECONNECTS) {
+        sseReconnectCount++;
+        const delay = sseReconnectCount * 3000; // 3s, 6s, 9s back-off
+        addStatus(`🔄 Bridge connection interrupted — reconnecting in ${delay / 1000}s (attempt ${sseReconnectCount}/${MAX_SSE_RECONNECTS})…`, 'checking');
+        setBridgeSession(prev => prev ? { ...prev, status: 'running', logs: [...prev.logs, `🔄 SSE reconnect ${sseReconnectCount}/${MAX_SSE_RECONNECTS}`] } : prev);
+        es.close(); bridgeEsRef.current = null;
+
+        setTimeout(() => {
+          // Re-open the same SSE URL — the bridge session on the server is still alive
+          const esNew = new EventSource(`/api/claude-bridge?${params}`);
+          bridgeEsRef.current = esNew;
+          // Transfer handlers (the closure captures the outer scope cleanly)
+          esNew.onmessage = es.onmessage;
+          esNew.onerror   = es.onerror;
+          addStatus(`🔌 Reconnected to bridge session`, 'checking');
+          setBridgeSession(prev => prev ? { ...prev, status: 'running' } : prev);
+        }, delay);
+      } else {
+        // Exhausted SSE reconnects — surface a clear error, no "Retry Build" prompt
+        const reason = 'Bridge connection dropped and could not reconnect. The bridge may still be running server-side — check logs.';
+        addStatus(`❌ ${reason}`, 'error');
+        setBridgeSession(prev => prev ? { ...prev, status: 'error', logs: [...prev.logs, `❌ ${reason}`] } : prev);
+        es.close(); bridgeEsRef.current = null;
+        onComplete?.(false, []);
+        bridgeEscalatingRef.current = false;
+      }
+    };
+  }, [currentProject, buildProgress, addStatus, setLastVerification, getToken]);
+
+  // ── autoEscalateToBridge ──────────────────────────────────────────────────
+  // Called automatically by the repair loop when it exhausts normal strategies.
+  // All 9 security guards on the bridge route still apply — this just removes the
+  // manual button click as the trigger.
+  //
+  // postVerify: if provided, after the bridge completes we run a fresh verify-app
+  // and show the result to the user. This is the "proof" step.
+  const autoEscalateToBridge = useCallback((
+    reason: string,
+    prompt: string,
+    postVerify?: { port: number; projectPath: string },
+  ) => {
+    if (bridgeEscalatingRef.current) return; // already running
+
+    if (bridgeEscalationCountRef.current >= MAX_AUTO_BRIDGE_ESCALATIONS) {
+      addStatus(`Advanced repair limit reached (${MAX_AUTO_BRIDGE_ESCALATIONS} attempts) — manual review required`, 'error');
+      setDisplayed(prev => [...prev, {
+        role: 'assistant' as const,
+        content: `⛔ The automated repair system has made ${MAX_AUTO_BRIDGE_ESCALATIONS} attempts and cannot resolve the remaining issues automatically.\n\n**Remaining problem:** ${reason}\n\nPlease describe what specific page or feature should work and I'll try a targeted fix, or use the **Debug** toggle to inspect the engineering report.`,
+      }]);
+      return;
+    }
+
+    bridgeEscalatingRef.current = true;
+    bridgeEscalationCountRef.current++;
+    bridgeEscalationReasonRef.current = reason;
+
+    const attempt = bridgeEscalationCountRef.current;
+
+    // ── Structured repair attempt telemetry ──────────────────────────────────
+    // Visible in the status log regardless of debug mode so the user always sees
+    // exactly what the repair engine is doing and why.
+    addStatus(`━━━ REPAIR ATTEMPT ${attempt}/${MAX_AUTO_BRIDGE_ESCALATIONS} ━━━`, 'checking');
+    addStatus(`Root cause: ${reason.slice(0, 120)}`, 'error');
+    addStatus(`Action: Inspecting project files, fixing root cause, restarting preview…`, 'checking');
+    setBuildProgress(p => p ? ({
+      ...p,
+      step: 'verifying',
+      message: `⚡ Repair attempt ${attempt}/${MAX_AUTO_BRIDGE_ESCALATIONS} — fixing root cause…`,
+    }) : p);
+
+    // Chat panel message — non-technical, user-facing
+    setDisplayed(prev => [...prev, {
+      role: 'assistant' as const,
+      content: `⚡ **Repair Attempt ${attempt}/${MAX_AUTO_BRIDGE_ESCALATIONS}**\n\n**Detected:** ${reason.slice(0, 120)}\n\n**Action:** Reading project files directly, identifying the root cause, and applying a targeted fix. Estimated time: 1–3 minutes.\n\nThe preview will reload automatically when repair completes.`,
+    }]);
+
+    // Fire bridge (autoMode — user-friendly messages only)
+    launchBridge(prompt, {
+      autoMode: true,
+      escalationReason: reason,
+      onComplete: async (verified, changedFiles) => {
+        // ── Post-bridge re-verification ─────────────────────────────────────
+        // The bridge already runs its own internal verify, but we run a fresh one here
+        // so the builder's verification display updates with individual check results.
+        if (postVerify && postVerify.port > 0) {
+          addStatus('Re-verifying after advanced repair…', 'checking');
+          try {
+            // Brief wait for HMR / server restart to settle
+            await new Promise(r => setTimeout(r, 3000));
+            const reVerifyData = await api({
+              action: 'verify-app',
+              port: postVerify.port,
+              projectPath: postVerify.projectPath,
+            });
+            setLastVerification(reVerifyData);
+            type RCheck = { passed: boolean; softPassed?: boolean; name: string; error?: string };
+            const rePassed  = (reVerifyData.checks ?? []).filter((c: RCheck) => c.passed || c.softPassed).length;
+            const reTotal   = (reVerifyData.checks ?? []).length;
+            const reVerified = reVerifyData.verified;
+
+            if (reVerified) {
+              addStatus(`━━━ REPAIR ATTEMPT ${attempt} PASSED ━━━`, 'done');
+              addStatus(`Files modified: ${changedFiles.slice(0, 5).join(', ') || 'none'}`, 'done');
+              addStatus(`Verification: ${rePassed}/${reTotal} checks passing`, 'done');
+              setDisplayed(prev => [...prev, {
+                role: 'assistant' as const,
+                content: `✅ **Repair Attempt ${attempt} — Complete**\n\n${changedFiles.length > 0 ? `**Files modified:** ${changedFiles.slice(0, 5).join(', ')}\n\n` : ''}**Verification: ${rePassed}/${reTotal} checks passing** — your app is live and working.\n\nRefreshing preview…`,
+              }]);
+              setPreviewKey(k => k + 1);
+            } else {
+              const stillFailing = (reVerifyData.checks ?? []).filter((c: RCheck) => !c.passed && !c.softPassed);
+              const failSummary = stillFailing.slice(0, 4).map((c: RCheck) => `• ${c.name}: ${(c.error ?? '').slice(0, 60)}`).join('\n');
+              addStatus(`━━━ REPAIR ATTEMPT ${attempt} — PARTIAL ━━━`, 'applying');
+              addStatus(`Files modified: ${changedFiles.slice(0, 5).join(', ') || 'none'}`, 'applying');
+              addStatus(`Verification: ${rePassed}/${reTotal} checks passing`, 'applying');
+              if (stillFailing.length > 0) {
+                addStatus(`Still failing: ${stillFailing.slice(0, 3).map((c: RCheck) => c.name).join(', ')}`, 'error');
+              }
+
+              // If hard errors remain and budget allows, escalate again automatically
+              const remainingHardErrors = stillFailing.filter((c: RCheck) => getHardErrorLabelModule(c) !== null);
+              if (remainingHardErrors.length > 0 && bridgeEscalationCountRef.current < MAX_AUTO_BRIDGE_ESCALATIONS) {
+                const secondPrompt = buildBridgePromptRef.current(postVerify.projectPath, stillFailing);
+                autoEscalateToBridge(
+                  `${remainingHardErrors[0].name} — ${getHardErrorLabelModule(remainingHardErrors[0])}`,
+                  secondPrompt,
+                  postVerify,
+                );
+              } else {
+                addStatus(`Max repair attempts reached — manual review required`, 'error');
+                setDisplayed(prev => [...prev, {
+                  role: 'assistant' as const,
+                  content: `⚠️ **Repair Attempt ${attempt} — Could Not Fully Resolve**\n\n${changedFiles.length > 0 ? `**Files modified:** ${changedFiles.slice(0, 5).join(', ')}\n\n` : ''}**Verification: ${rePassed}/${reTotal} checks passing**\n\n**Still failing:**\n${failSummary}\n\n${bridgeEscalationCountRef.current >= MAX_AUTO_BRIDGE_ESCALATIONS ? '**Maximum repair attempts reached.** Enable **Debug Mode** to see the full engineering report, or describe which specific feature should work and I\'ll try a targeted fix.' : 'Ask me to investigate a specific failing check for more detail.'}`,
+                }]);
+              }
+            }
+          } catch (e) {
+            addStatus('Re-verification failed — check the preview manually', 'error');
+            if (verified) {
+              setDisplayed(prev => [...prev, {
+                role: 'assistant' as const,
+                content: `✅ **Advanced repair complete** — ${changedFiles.length} file(s) changed. Bridge verified internally. Check the preview to confirm.`,
+              }]);
+            }
+          }
+        } else {
+          // No port — just report what the bridge found
+          if (verified) {
+            setDisplayed(prev => [...prev, {
+              role: 'assistant' as const,
+              content: `✅ **Advanced repair complete.** ${changedFiles.length} file(s) updated. All checks passing.`,
+            }]);
+          } else {
+            setDisplayed(prev => [...prev, {
+              role: 'assistant' as const,
+              content: `⚠️ Advanced repair finished — ${changedFiles.length} file(s) changed, but some checks may still be failing.\n\nEnable **Debug Mode** for the full report.`,
+            }]);
+          }
+        }
+      },
+    });
+  }, [launchBridge, addStatus, api]);
+
+  // Stable ref to buildBridgePrompt so the async onComplete callback above can call it
+  // without it being a stale closure (it's defined inside runBuildPipeline which is async).
+  // We populate this ref the first time the loop runs.
+  type LooseCheck = { name: string; error?: string; passed: boolean; softPassed?: boolean; rootCause?: unknown };
+  const buildBridgePromptRef = useRef<(projectPath: string, failing: LooseCheck[]) => string>(
+    (projectPath2, failing) =>
+      `Fix these failing checks in the project at ${projectPath2}:\n${failing.slice(0, 6).map(c => `• ${c.name}: ${(c.error ?? 'failing').slice(0, 120)}`).join('\n')}\n\nInspect source files, fix root causes, ensure all checks pass.`,
+  );
 
   // ── Error handling ────────────────────────────────────────────────────────
 
@@ -651,19 +1227,38 @@ function BuilderInner() {
     return () => clearInterval(interval);
   }, [escalationState, api, addMsg]);
 
-  // welcome message + optional template pre-fill
+  // Persist which project is "currently open" so a page refresh doesn't
+  // lose it — see lib/project-session-storage.ts's module doc for the full
+  // root-cause explanation (a developer comment previously flagged this
+  // exact risk before it was fixed: currentProject going null on refresh,
+  // with no restoration mechanism, meant the entire "project open → edit"
+  // routing branch never ran again for that session).
   useEffect(() => {
-    setDisplayed([{
-      role: 'assistant',
-      content: "Hi! I'm DWOMOH Vibe Code — your autonomous AI software engineer.\n\nJust tell me what you want to build and I'll start immediately. No setup questions, no waiting — I use production-ready defaults and build the complete app for you.\n\n✓ Generate code  ✓ Install dependencies  ✓ Fix TypeScript errors  ✓ Start server  ✓ Verify it works\n\nOr click any project in the sidebar to resume where you left off.",
-    }]);
+    if (currentProject) saveOpenProject(currentProject);
+    else clearOpenProject();
+  }, [currentProject]);
+
+  // Initial goal-first flow — no welcome wall of text, just the goal picker.
+  // A restored project (from BEFORE this page load) takes priority over
+  // both the template/prompt URL params and the cold-start goal picker —
+  // the user had a project open; a refresh should return them to it, not
+  // discard it and start over.
+  useEffect(() => {
     const templateId = searchParams?.get('template');
+    const promptParam = searchParams?.get('prompt');
     if (templateId) {
       const tmpl = PROJECT_TEMPLATES.find(t => t.id === templateId);
-      if (tmpl) setInput(tmpl.prompt);
+      if (tmpl) { setInput(tmpl.prompt); setGoalStep('idle'); return; }
     }
-    const promptParam = searchParams?.get('prompt');
-    if (promptParam) setInput(promptParam);
+    if (promptParam) { setInput(promptParam); setGoalStep('idle'); return; }
+    const restored = loadOpenProject();
+    if (restored && !currentProject) {
+      setGoalStep('idle');
+      handleOpenProject(restored);
+      return;
+    }
+    // Show goal picker on fresh load
+    setGoalStep('type');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -849,7 +1444,7 @@ function BuilderInner() {
   const handleNewProject = () => {
     setPhase('idle');
     setHistory([]);
-    setDisplayed([{ role: 'assistant', content: "Ready for a new project! What would you like to build?" }]);
+    setDisplayed([]);
     setBuildProgress(null);
     setPreviewUrl(null);
     setPreviewLoading(false);
@@ -859,7 +1454,52 @@ function BuilderInner() {
     setCurrentMemory(null);
     setBuilderContext(null);
     setDebugActivity(null);
-    inputRef.current?.focus();
+    setBuildRecommendation(null);
+    setPendingBuildPrompt(null);
+    setGoalStep('type');
+    setGoalPlatform(null);
+    setMobileTech(null);
+  };
+
+  const handleGoalSelect = (platform: 'website' | 'mobile') => {
+    setGoalPlatform(platform);
+    if (platform === 'website') {
+      setBuildTarget('web');
+      setGoalStep('idle');
+      setTimeout(() => inputRef.current?.focus(), 100);
+    } else {
+      setGoalStep('mobile-tech');
+    }
+  };
+
+  const handleMobileTechSelect = (tech: 'flutter' | 'android' | 'ios') => {
+    setMobileTech(tech);
+    setBuildTarget('flutter'); // android/ios both use the flutter pipeline for now
+    setGoalStep('idle');
+    setTimeout(() => inputRef.current?.focus(), 100);
+  };
+
+  const analyzePromptForPlatform = (prompt: string): { platform: 'website' | 'flutter' | null; reason: string; icon: string } => {
+    const lower = prompt.toLowerCase();
+    const mobileSignals = [
+      'mobile app', 'android', 'iphone', 'ios app', 'flutter', 'apk', 'play store', 'app store',
+      'uber', 'like lyft', 'ride hailing', 'ride sharing', 'food delivery', 'mobile game',
+      'native app', 'smartphone', 'phone app', 'on my phone', 'whatsapp', 'tiktok like',
+    ];
+    const webSignals = [
+      'website', 'web app', 'landing page', 'marketplace', 'saas', 'dashboard', 'admin',
+      'blog', 'portfolio', 'ecommerce', 'e-commerce', 'online store', 'booking website',
+      'web platform', 'next.js', 'react', 'booking site', 'directory',
+    ];
+    const mobileScore = mobileSignals.filter(s => lower.includes(s)).length;
+    const webScore = webSignals.filter(s => lower.includes(s)).length;
+    if (mobileScore > webScore && mobileScore > 0) {
+      return { platform: 'flutter', reason: 'Flutter lets you launch on both Android and iPhone from a single codebase.', icon: '📱' };
+    }
+    if (webScore > mobileScore && webScore > 0) {
+      return { platform: 'website', reason: 'This is best built as a full-stack web application with Next.js.', icon: '🌐' };
+    }
+    return { platform: null, reason: '', icon: '' };
   };
 
   // ── Open existing project ─────────────────────────────────────────────────
@@ -878,6 +1518,9 @@ function BuilderInner() {
     setHistory([]);
     loadDeployRecord(project.id);
     setDisplayed([]);
+    setGoalStep('idle');
+    setBuildRecommendation(null);
+    setPendingBuildPrompt(null);
 
     addStatus('DWOMOH Vibe Code is checking the selected project…', 'checking');
 
@@ -940,7 +1583,7 @@ function BuilderInner() {
         addStatus(`Could not start server: ${openResult.error || 'unknown error'}`, 'error');
         setPhase('conversing');
       } else {
-        const url = `http://localhost:${openResult.port}`;
+        const url = openResult.previewUrl || `http://localhost:${openResult.port}`;
         setPreviewUrl(url);
         setPreviewKey(k => k + 1);
         setPreviewLoading(true);
@@ -957,6 +1600,9 @@ function BuilderInner() {
 
         setBuildProgress({ step: hpVerified === false ? 'error' : 'done', message: statusMsg, logs: [`✅ Port ${openResult.port}`], port: openResult.port });
         addStatus(statusKind === 'error' ? statusMsg : `DWOMOH Vibe Code has loaded ${project.name}. Preview is ready.`, statusKind);
+
+        // Save design baseline for re-opened projects (idempotent — already exists for new builds)
+        api({ action: 'save-design-baseline', projectPath: project.projectPath }).catch(() => {});
 
         const disc = openResult.discovery || {};
         const mem = openResult.memory || {};
@@ -2000,7 +2646,7 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
                     escalationJourneyPassed = true;
                     addStatus('✅ Browser journey PASSED', 'done');
                   } else if (bjrEsc?.journey) {
-                    escalationJourneyStep = bjrEsc.journey.failedAt ?? 'unknown step';
+                    escalationJourneyStep = bjrEsc.journey.failedAt || bjrEsc.journey.summary?.split('\n')[0] || bjrEsc.journey.verdict || 'step failed';
                     // Try one auto-repair before giving up on this escalation round
                     const { buildRepairPackage } = await import('@/services/repair-package').catch(() => ({ buildRepairPackage: null }));
                     if (buildRepairPackage) {
@@ -2774,7 +3420,11 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
             ? journeyBlockedByRequests
               ? `User Journey: ⚠️ PASSED but ${journeyHasFailedRequests} API request(s) failed during flow`
               : `User Journey: ✅ PASSED — ${(journeyResult as {summary?: string}).summary ?? ''}`
-            : `User Journey: ❌ ${journeyVerdict ?? 'FAILED VERIFICATION'} — failed at "${(journeyResult as {failedAt?: string}).failedAt ?? 'unknown step'}"`
+            : (() => {
+                const jr3 = journeyResult as { failedAt?: string; summary?: string } | null;
+                const loc = jr3?.failedAt ? `failed at "${jr3.failedAt}"` : jr3?.summary ?? 'step failed';
+                return `User Journey: ❌ ${journeyVerdict ?? 'FAILED VERIFICATION'} — ${loc}`;
+              })()
           : runPort
             ? 'User Journey: ⏭ Not run (Playwright unavailable)'
             : '';
@@ -2782,8 +3432,21 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
         if (fullyVerified) {
           addStatus('✅ Verified Working — routes, preview, and user journey all confirmed.', 'done');
         } else if (!journeyPassed || journeyBlockedByRequests) {
-          const failedStep = (journeyResult as {failedAt?: string} | null)?.failedAt ?? 'unknown step';
-          addStatus(`❌ FAILED VERIFICATION — user journey failed at "${failedStep}". Repair engine active.`, 'error');
+          // Build the most specific failure description available
+          const jr = journeyResult as { failedAt?: string; failureDetail?: string; summary?: string; verdict?: string } | null;
+          let failDesc: string;
+          if (journeyBlockedByRequests) {
+            failDesc = `${journeyHasFailedRequests} API request(s) failed during the user flow`;
+          } else if (jr?.failedAt) {
+            failDesc = `failed at "${jr.failedAt}"${jr.failureDetail ? ` — ${jr.failureDetail.split('\n')[0].slice(0, 80)}` : ''}`;
+          } else if (jr?.summary) {
+            failDesc = jr.summary.slice(0, 120);
+          } else if (!jr) {
+            failDesc = 'browser journey did not run (Playwright may be unavailable)';
+          } else {
+            failDesc = jr.verdict ?? 'step failed';
+          }
+          addStatus(`❌ Verification: ${failDesc}`, 'error');
         } else if (!previewIsVerified) {
           addStatus(`Applied — preview needs attention: ${previewIssues[0] ?? previewVerdict}`, 'error');
         } else if (verifyData && !verifyData.verified) {
@@ -2802,7 +3465,13 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
           (verifyData?.failures?.length ? `\n\nFailed route checks:\n${verifyData.failures.map((f: string) => `• ${f}`).join('\n')}` : '') +
           (!previewIsVerified && previewIssues.length > 0 ? `\n\nPreview issues:\n${previewIssues.slice(0, 3).map(i => `• ${i}`).join('\n')}` : '') +
           ((!journeyPassed || journeyBlockedByRequests) && journeyResult
-            ? `\n\n**FAILED VERIFICATION**\nStep: "${(journeyResult as {failedAt?: string}).failedAt}"\n${(journeyResult as {failureDetail?: string}).failureDetail ?? ''}\n\nRepair engine has been notified — root cause identified, attempting fix.`
+            ? (() => {
+                const jr2 = journeyResult as { failedAt?: string; failureDetail?: string; summary?: string };
+                const step = jr2.failedAt ? `\n\n**Failed at:** "${jr2.failedAt}"` : '';
+                const detail = jr2.failureDetail ? `\n${jr2.failureDetail.split('\n')[0].slice(0, 120)}` : '';
+                const fallback = (!jr2.failedAt && jr2.summary) ? `\n\n**Issue:** ${jr2.summary.slice(0, 120)}` : '';
+                return `${step}${detail}${fallback}\n\nDescribe what you'd like to fix and I'll apply a targeted repair.`;
+              })()
             : '')
         );
 
@@ -3640,9 +4309,555 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     setGeneratingLogo(false);
   };
 
-  // ── Build pipeline ────────────────────────────────────────────────────────
+  // ── Bridge-Only Pipeline ──────────────────────────────────────────────────
+  // Used for bridge integration tests. DWOMOH Vibe Code acts purely as
+  // orchestration: it creates the project directory, builds a comprehensive
+  // Claude Code generation prompt, and forwards everything to the bridge.
+  // Claude Code CLI does ALL generation, build, verification, and repair.
+  //
+  // Telemetry stages (shown in the Bridge Telemetry panel):
+  //   bridge-activated → cli-started → files-generated → files-modified →
+  //   build-running → verification-running → repair-attempts → preview-ready → bridge-complete
+
+  const BRIDGE_STAGES = [
+    { id: 'bridge-activated',     label: '⚡ Bridge Activated' },
+    { id: 'session-id',           label: '🔑 Bridge Session ID' },
+    { id: 'cli-started',          label: '🤖 Claude Code CLI Started' },
+    { id: 'files-generated',      label: '📄 Files Being Generated' },
+    { id: 'files-modified',       label: '✏️  Files Being Modified' },
+    { id: 'build-running',        label: '🔨 Build Running' },
+    { id: 'verification-running', label: '🔍 Verification Running' },
+    { id: 'repair-attempts',      label: '🔧 Repair Attempts' },
+    { id: 'preview-ready',        label: '🖥️  Preview Ready' },
+    { id: 'bridge-complete',      label: '✅ Bridge Complete' },
+  ] as const;
+
+  const initBridgeTelemetry = () => setBridgeTelemetry(
+    BRIDGE_STAGES.map(s => ({ id: s.id, label: s.label, status: 'waiting' as const, detail: '' }))
+  );
+
+  const advanceTelemetry = (id: string, status: 'active' | 'done' | 'error', detail = '') =>
+    setBridgeTelemetry(prev => prev.map(s => s.id === id
+      ? { ...s, status, detail, ts: new Date().toLocaleTimeString() }
+      : s.status === 'waiting' && status === 'active' ? s // don't auto-advance waiting stages
+      : s
+    ));
+
+  const runBridgeOnlyPipeline = async (originalPrompt: string) => {
+    if (loading || phase === 'building') {
+      addStatus('Bridge pipeline already running', 'error');
+      return;
+    }
+
+    initBridgeTelemetry();
+    setPhase('building');
+    setFocusMode(true);
+    setBuilderMode('build');
+    setPreviewUrl(null);
+    setPreviewLoading(false);
+    resetBridgeEscalation();
+
+    if (buildHeartbeatRef.current) { clearInterval(buildHeartbeatRef.current); buildHeartbeatRef.current = null; }
+    setBuildHeartbeatMsg(null);
+
+    const narrate = (msg: string) => addMsg('assistant', msg);
+
+    setBuildProgress({
+      step: 'generating',
+      message: '⚡ Bridge Test Mode — forwarding to Claude Code CLI…',
+      logs: ['⚡ Bridge-only pipeline started', `Prompt: ${originalPrompt.slice(0, 80)}…`],
+    });
+
+    // Step 1: Create the empty project directory and register it in the manifest
+    addStatus('Bridge Test Mode — creating project directory…', 'checking');
+    const projectNameGuess = originalPrompt.trim().split(/\s+/).slice(0, 4).join('-');
+    let projectPath = '';
+    let slug = '';
+    let manifestId = '';
+    try {
+      const created = await api({ action: 'create-bridge-project', projectName: projectNameGuess, prompt: originalPrompt });
+      if (!created.success || !created.projectPath) throw new Error('Failed to create project directory');
+      projectPath = created.projectPath;
+      slug = created.slug;
+      manifestId = created.id ?? '';
+      addStatus(`✅ Project directory: ${projectPath}`, 'done');
+    } catch (err) {
+      addStatus(`❌ Could not create project directory: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      setPhase('idle');
+      setBuildProgress(p => ({ ...p!, step: 'error', message: '❌ Bridge project setup failed' }));
+      return;
+    }
+
+    // Step 2: Build comprehensive generation prompt for Claude Code CLI
+    const bridgeGenPrompt = [
+      `You are a code-generation engine. Your ONLY valid actions are Write, Edit, and Bash tools.`,
+      `DO NOT write any text response. DO NOT say "I'll create" or "Here are the files".`,
+      `BEGIN WRITING FILES IMMEDIATELY using the Write tool. First tool call must be Write.`,
+      ``,
+      `PROJECT DIRECTORY (write all files here): ${projectPath}`,
+      `PROJECT NAME: ${slug}`,
+      ``,
+      `WHAT TO BUILD:`,
+      originalPrompt,
+      ``,
+      `REQUIRED FILES — write every one using the Write tool, in this order:`,
+      `1.  package.json          — next, react, react-dom, typescript, tailwindcss, better-sqlite3, @types/better-sqlite3`,
+      `2.  next.config.js        — minimal: module.exports = {}`,
+      `3.  tsconfig.json         — Next.js 14 standard with paths: { "@/*": ["./*"] }`,
+      `4.  tailwind.config.ts    — content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"]`,
+      `5.  postcss.config.js     — tailwindcss + autoprefixer`,
+      `6.  app/globals.css       — @tailwind base/components/utilities`,
+      `7.  app/layout.tsx        — imports globals.css, sets metadata, renders {children}`,
+      `8.  app/page.tsx          — homepage matching the requirements above`,
+      `9.  lib/db.ts             — better-sqlite3 database, schema CREATE TABLE, seed data`,
+      `10. All feature pages     — one app/[feature]/page.tsx per feature in the requirements`,
+      `11. All API routes        — app/api/[resource]/route.ts with GET/POST/PUT/DELETE exports`,
+      `12. components/           — reusable UI components used by the pages`,
+      ``,
+      `AFTER writing all files, run these commands with Bash tool:`,
+      `  npm install --legacy-peer-deps`,
+      `  npx tsc --noEmit 2>&1 | head -40`,
+      `Fix every TypeScript error shown. Re-run tsc until output is empty.`,
+      ``,
+      `RULES:`,
+      `- Use Tailwind CSS classes for all styling — never inline styles`,
+      `- Every API route must export named async functions: export async function GET(...) {}`,
+      `- Database schema columns must exactly match what API routes read and write`,
+      `- Every page import must point to a file that actually exists`,
+      `- DO NOT stop after one file — write ALL files listed above before running npm install`,
+    ].join('\n');
+
+    // Use the manifest ID from create-bridge-project so the bridge ownership guard
+    // (Guard 5 in /api/claude-bridge) can verify this path is owned by the current user.
+    const projectId = manifestId || `bridge-${Date.now()}`;
+    const projectMeta = {
+      id: projectId,
+      name: slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      description: originalPrompt.slice(0, 120),
+      projectPath,
+      port: 0,
+      createdAt: new Date().toISOString(),
+      filesCount: 0,
+    };
+    setCurrentProject(projectMeta);
+    setBuilderContext({ projectName: projectMeta.name, stage: 'building', active: true });
+    setLastBuildArgs({ history: [], prompt: originalPrompt });
+
+    narrate(
+      `## ⚡ CLAUDE BRIDGE — ACTIVE\n\n` +
+      `**DWOMOH Vibe Code is NOT writing any code.**\n\n` +
+      `This request has been handed to **Claude Code CLI** running inside the Bridge. Claude Code CLI will:\n` +
+      `1. Create all project files from scratch\n` +
+      `2. Run \`npm install\` to install dependencies\n` +
+      `3. Run \`npx tsc --noEmit\` to check TypeScript\n` +
+      `4. Fix any errors it finds\n` +
+      `5. Start the preview server\n\n` +
+      `**Project:** \`${slug}\`\n` +
+      `**Path:** \`${projectPath}\`\n\n` +
+      `Watch the **Bridge Telemetry** panel below for live stage-by-stage progress.\n` +
+      `Estimated time: 3–8 minutes.`
+    );
+
+    advanceTelemetry('bridge-activated', 'done', `Project: ${slug} at ${projectPath}`);
+    addStatus(`⚡ Bridge activated — project: ${slug}`, 'checking');
+
+    // Step 3: Wire telemetry hook so SSE events advance the stage panel in real time
+    bridgeTelemetryHookRef.current = (eventType: string, msg: string) => {
+      const lower = msg.toLowerCase();
+      // Stage: cli-started — first real message from Claude Code CLI
+      if (eventType === 'status' && msg.startsWith('Checking Claude Code connection')) {
+        advanceTelemetry('cli-started', 'active', 'Claude Code CLI connecting…');
+      } else if (eventType === 'status' && msg.startsWith('SESSION_ID:')) {
+        const sid = msg.replace('SESSION_ID:', '');
+        advanceTelemetry('session-id', 'done', sid);
+        advanceTelemetry('cli-started', 'done', 'Claude Code CLI running');
+      } else if (eventType === 'status' && msg.startsWith('Forwarding to Claude Code worker')) {
+        advanceTelemetry('cli-started', 'done', 'CLI running — generating files…');
+        advanceTelemetry('files-generated', 'active', 'Writing project files…');
+      } else if ((eventType === 'log' || eventType === 'tool') && /creat|write|generat/i.test(lower) && /\.(ts|tsx|js|jsx|json|css|md)/i.test(msg)) {
+        advanceTelemetry('files-generated', 'active', msg.slice(0, 70));
+      } else if ((eventType === 'log' || eventType === 'tool') && /edit|modif|updat|fix|patch/i.test(lower) && /\.(ts|tsx|js|jsx|json|css)/i.test(msg)) {
+        advanceTelemetry('files-generated', 'done', 'Generation complete');
+        advanceTelemetry('files-modified', 'active', msg.slice(0, 70));
+      } else if ((eventType === 'log' || eventType === 'status') && /npm install|installing|node_modules/i.test(lower)) {
+        advanceTelemetry('files-modified', 'done', 'File modifications complete');
+        advanceTelemetry('build-running', 'active', 'npm install running…');
+      } else if ((eventType === 'log' || eventType === 'status') && /tsc|typescript|compil/i.test(lower)) {
+        advanceTelemetry('build-running', 'done', 'Dependencies installed');
+        advanceTelemetry('verification-running', 'active', 'TypeScript check running…');
+      } else if ((eventType === 'status') && /starting development server/i.test(msg)) {
+        advanceTelemetry('build-running', 'done', 'Files complete');
+        advanceTelemetry('preview-ready', 'active', 'Starting dev server…');
+      } else if ((eventType === 'status') && /development server running on port/i.test(msg)) {
+        advanceTelemetry('preview-ready', 'active', msg.slice(0, 70));
+      } else if ((eventType === 'status') && /waiting for http ready/i.test(msg)) {
+        advanceTelemetry('preview-ready', 'active', 'Waiting for HTTP response…');
+      } else if ((eventType === 'status') && /running verification suite/i.test(msg)) {
+        advanceTelemetry('preview-ready', 'done', 'Server responding');
+        advanceTelemetry('verification-running', 'active', 'Running checks…');
+      } else if ((eventType === 'status') && /verification passed/i.test(msg)) {
+        advanceTelemetry('verification-running', 'done', msg.slice(0, 70));
+      } else if ((eventType === 'warning') && /verification:.*checks passing/i.test(msg)) {
+        advanceTelemetry('verification-running', 'active', 'Some checks failing — repairing…');
+        advanceTelemetry('repair-attempts', 'active', 'Fixing verification failures…');
+      } else if ((eventType === 'status') && /auto-repair.*fixing/i.test(msg)) {
+        advanceTelemetry('repair-attempts', 'active', msg.slice(0, 70));
+      } else if (eventType === 'complete') {
+        advanceTelemetry('repair-attempts', 'done', 'All repairs complete');
+        advanceTelemetry('verification-running', 'done', 'Verification done');
+        advanceTelemetry('build-running', 'done', 'Build complete');
+        advanceTelemetry('files-modified', 'done', 'Files finalised');
+        advanceTelemetry('files-generated', 'done', 'Generation complete');
+      }
+    };
+
+    // Step 4: Launch the bridge with the generation prompt.
+    // Pass projectPath/projectId explicitly — setCurrentProject() is async so
+    // state may not have updated before launchBridge reads currentProject.
+    await new Promise<void>((resolve) => {
+      launchBridge(bridgeGenPrompt, {
+        autoMode: false, // show ALL messages — this is an integration test run
+        escalationReason: '',
+        projectPathOverride: projectPath,
+        projectIdOverride: projectId,
+        onComplete: async (verified, changedFiles) => {
+          // The bridge now owns server start + verification.
+          // The complete event in launchBridge already wires up previewUrl/port/phase.
+          // Here we only need to update telemetry, build progress, and the chat narration.
+
+          // changedFiles is the DIFF from beforeSnapshot — 0 when project existed before this run.
+          // currentProject may have totalProjectFiles from the bridge's complete event (set in launchBridge handler).
+          const bridgeFileLabel = changedFiles.length > 0
+            ? `${changedFiles.length} file(s)`
+            : 'project files (pre-existing)';
+
+          if (verified) {
+            advanceTelemetry('preview-ready', 'done', 'Server started and verified by bridge');
+            advanceTelemetry('bridge-complete', 'done', `${bridgeFileLabel} — verified ✅`);
+            addStatus(`✅ Bridge Test Complete — ${bridgeFileLabel}, verified`, 'done');
+            narrate(
+              `## ✅ CLAUDE BRIDGE — COMPLETE\n\n` +
+              `**Every file was created and verified by Claude Code CLI. DWOMOH Vibe Code wrote zero lines of code.**\n\n` +
+              `**Files:** ${bridgeFileLabel}\n` +
+              `**Verified:** ✅ All checks passed\n\n` +
+              `The preview is open in the panel on the right.`
+            );
+          } else {
+            advanceTelemetry('preview-ready', 'error', 'Verification incomplete after max repair attempts');
+            advanceTelemetry('bridge-complete', 'done', `${bridgeFileLabel} — partial ⚠️`);
+            addStatus(`⚠️ Bridge complete — ${bridgeFileLabel}, verification partial`, 'applying');
+            narrate(
+              `## ⚠️ CLAUDE BRIDGE — PARTIAL\n\n` +
+              `Claude Code CLI processed ${bridgeFileLabel} but verification did not fully pass after all repair attempts.\n\n` +
+              `The preview server is running — describe what specific feature is broken and I'll apply a targeted fix.`
+            );
+          }
+          resolve();
+        },
+      });
+
+    });
+
+    // Clear telemetry hook when pipeline exits
+    bridgeTelemetryHookRef.current = null;
+    setLoading(false);
+    setPhase(p => p === 'building' ? 'idle' : p);
+  };
+
+  // ── Build pipeline (repaired engine) ──────────────────────────────────────
+  // Routes the Send button through services/engine-adapter.ts's
+  // runProductionEngineBuild() — the SAME orchestrator, verifier, repairer,
+  // and integration rules (navigation/permissions/schema/search/
+  // notifications) the "Engine Build/Test" debug panel already uses, now
+  // wrapped with billing/persistence so it can be the real build path.
+  // Behind useEngineBuildForSend (see the feature-flag fetch above) — the
+  // OLD runBuildPipeline below is completely untouched and still the
+  // default until the flag is enabled server-side.
+
+  const ENGINE_STAGE_LABELS: Record<string, string> = {
+    plan: '🧠 Designing your application…',
+    build: '⚙️ Writing your project files (navigation, permissions, database schema, search & notifications included)…',
+    verify: '🔍 Testing the app now…',
+    repair: '🔧 Fixing any issues found…',
+    preview: '🖥️ Starting the preview server…',
+    learn: '💾 Saving learnings…',
+  };
+
+  // Mirrors the OLD buildBridgePrompt's shape (page.tsx's Bridge-escalation
+  // helper) but reads from the repaired engine's report shape
+  // (VerifyResult.classifiedFailures / RepairResult.remainingIssues)
+  // instead of the old VerifyData.checks shape.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function buildBridgePromptFromEngineReport(report: any, projectPath: string): string {
+    const failures: string[] = [];
+    const cf = report.verify?.classifiedFailures ?? [];
+    for (const f of cf.slice(0, 6)) failures.push(`${f.area}: ${f.detail}`);
+    const remaining = report.repair?.remainingIssues ?? [];
+    for (const r of remaining.slice(0, 3)) if (!failures.includes(r)) failures.push(r);
+    const list = failures.length > 0
+      ? failures.map(f => `• ${f}`).join('\n')
+      : `Build status: ${report.buildStatus}, preview: ${report.previewStatus}, verify: ${report.verifyStatus}.`;
+    return [
+      `Fix these issues in the project at ${projectPath}:`,
+      list,
+      '',
+      'Inspect and fix the actual source files. Make every check pass, then confirm the app compiles and starts correctly.',
+    ].join('\n');
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleEngineReport = async (report: any) => {
+    const projectPath: string | undefined = report.build?.projectPath;
+    const port: number | null = report.port ?? null;
+    const projectId: string | null = report.projectId ?? null;
+
+    if (buildHeartbeatRef.current) { clearInterval(buildHeartbeatRef.current); buildHeartbeatRef.current = null; }
+    setBuildHeartbeatMsg(null);
+
+    if (!projectPath) {
+      addMsg('assistant', `❌ Build failed — ${report.summary || 'no project was created'}. Click Retry Build to try again.`);
+      setBuildProgress(p => p ? { ...p, step: 'error', message: '❌ Build failed' } : p);
+      setPhase('idle');
+      return;
+    }
+
+    const projectName = projectPath.split('/').pop() || 'your application';
+    setBuildingProjectName(projectName);
+
+    const newProject: ProjectMeta = {
+      id: projectId || '', name: projectName, description: '', projectPath,
+      port: port ?? 0, createdAt: new Date().toISOString(), filesCount: report.build?.filesCreated?.length ?? 0,
+    };
+    setCurrentProject(newProject);
+    setBuilderContext({ projectName, stage: 'editing', active: true });
+    await refreshProjects();
+
+    if (port) {
+      setPreviewUrl(report.previewUrl || `http://localhost:${port}`);
+      setPreviewKey(k => k + 1);
+      setPreviewLoading(true);
+      setPhase('previewing');
+      addMsg('assistant', `🖥️ Server started on port **${port}**! The preview is loading…`);
+    } else {
+      setPhase('idle');
+    }
+
+    // ── Discovery — unchanged, file-system based, independent of which
+    // engine built the app (services/project-discovery.ts). ─────────────────
+    try {
+      const disc = await api({ action: 'discover', projectPath });
+      if (disc?.success) setCurrentDiscovery(disc.discovery ?? null);
+    } catch { /* non-critical */ }
+
+    // ── Health gate — additive post-build credentials check, preserved
+    // exactly as the old pipeline's final gate (never inferred from engine
+    // data, which has no first-class "missing credentials" classification). ─
+    let healthBlockers: string[] = [];
+    try {
+      const healthData = await api({ action: 'investigate', projectPath, port: port ?? undefined });
+      if (healthData?.success && healthData.findings) {
+        healthBlockers = (healthData.findings as Array<{ layer: string; severity: string; title: string }>)
+          .filter(f => f.layer === 'credentials' && f.severity === 'critical')
+          .map(f => f.title);
+      }
+    } catch { /* non-critical */ }
+
+    const buildOk = report.buildStatus === 'success';
+    const previewOk = report.previewStatus === 'available';
+    const verifyOk = report.verifyStatus === 'passed';
+    const isFullyVerified = buildOk && previewOk && verifyOk && healthBlockers.length === 0;
+
+    if (isFullyVerified) {
+      addMsg('assistant', `✅ **${projectName}** is built and verified — every check passed. The preview is live.`);
+      setBuildProgress(p => p ? { ...p, step: 'done', message: '✅ Verified working' } : p);
+    } else if (healthBlockers.length > 0) {
+      addMsg('assistant', `⚠️ **${projectName}** is built, but needs credentials before it's fully working:\n\n${healthBlockers.map(b => `• ${b}`).join('\n')}\n\nAdd these in the Credentials panel to finish setup.`);
+      setBuildProgress(p => p ? { ...p, step: 'done', message: '⚠️ Needs credentials' } : p);
+    } else if (!buildOk || !previewOk || !verifyOk) {
+      // ── Bridge escalation — retargets the old 7-trigger design onto the
+      // repaired engine's own report fields, since its bounded (≤5-attempt,
+      // now stall-guard-fixed + adaptive-timeout) repair loop already
+      // collapsed those triggers into these 3 clean, terminal signals. ──────
+      const reason = !buildOk ? `Build did not succeed: ${report.summary}`
+        : !previewOk ? `Preview server did not start: ${report.previewError ?? 'unknown error'}`
+        : `Verification did not pass: ${report.repair?.stopReason ?? report.summary}`;
+      addMsg('assistant', `⚠️ **${projectName}** needs additional repair — escalating to advanced repair…`);
+      autoEscalateToBridge(reason, buildBridgePromptFromEngineReport(report, projectPath), port ? { port, projectPath } : undefined);
+    }
+  };
+
+  const runBuildPipelineViaEngine = async (conversationHistory: ConversationTurn[], originalPrompt: string) => {
+    resetBridgeEscalation();
+    setPhase('building');
+    setFocusMode(true);
+    setBuilderMode('build');
+    setReadyToBuild(false);
+    setLoading(false);
+    setPreviewTab('preview');
+    setPreviewUrl(null);
+    setPreviewLoading(false);
+    setScaffoldDetected(false);
+    setBuildingProjectName('');
+    setResearchActivity(null);
+    setLastBuildArgs({ history: conversationHistory, prompt: originalPrompt });
+
+    const appendLog = (log: string) => setBuildProgress(p => p ? { ...p, logs: [...p.logs.slice(-20), log] } : p);
+
+    setBuildDetailStep('understanding');
+    setBuildProgress({ step: 'generating', message: ENGINE_STAGE_LABELS.plan, logs: ['🚀 Starting autonomous build…'] });
+    addMsg('assistant', "DWOMOH Vibe Code is reading your request — understanding what you need and choosing the right pages, API routes, and data model…");
+
+    let token = '';
+    try { token = (await getToken()) ?? ''; } catch { /* no auth configured */ }
+    // ROOT CAUSE fix: a signed-in user (per useAuth()'s `user`) can still get
+    // an empty token here on the very first request after a page load/refresh
+    // — Amplify's session hydration hasn't finished yet, fetchAuthSession()
+    // throws or returns null transiently, and the old code silently proceeded
+    // with no token at all. The server then resolves ownerUserId as
+    // 'anonymous', which silently skips both billing AND every RBAC
+    // permission check (a SUPER_ADMIN account would be treated as an
+    // anonymous visitor, not persisted under their own account). Confirmed
+    // live: a build reached /api/engine-build-stream-prod as 'anonymous'
+    // immediately after a fresh page load. One short retry closes this
+    // specific race without adding a retry loop for genuinely signed-out
+    // visitors (for whom `user` is null and this block is skipped).
+    if (!token && user) {
+      console.warn('[send-routing] getToken() returned empty for a signed-in user — retrying once after a short delay (likely Amplify session-hydration race)');
+      await new Promise(r => setTimeout(r, 400));
+      try { token = (await getToken()) ?? ''; } catch { /* still no token */ }
+      if (!token) console.warn('[send-routing] retry also returned empty — proceeding as anonymous (billing/RBAC will not apply to this request)');
+    }
+    const params = new URLSearchParams({ prompt: originalPrompt, originalPrompt });
+    if (token) params.set('token', token);
+    const requestUrl = `/api/engine-build-stream-prod?${params}`;
+    console.log(`[send-routing] endpoint=/api/engine-build-stream-prod, exact request URL before fetch: ${requestUrl}`);
+
+    await new Promise<void>((resolve) => {
+      const es = new EventSource(requestUrl);
+
+      // ROOT CAUSE fix for "Connection to the build engine was lost":
+      // EventSource NATIVELY auto-reconnects to the same URL after a
+      // transient connection drop, UNLESS the client calls es.close() —
+      // which the old code did on the very FIRST 'error' event, disabling
+      // that native resilience entirely. Confirmed live: a real ~14-minute
+      // build completed successfully server-side (logged HTTP 200), but the
+      // client showed this exact failure message partway through — the
+      // browser's native reconnect attempt hit a server-side dead end (a
+      // duplicate-build rejection with no way to resume), which is now
+      // fixed separately in build-registry.ts's publish/subscribe. On this
+      // side: a bare connection-level 'error' (no payload — a real drop,
+      // not a deliberate server-sent error like out-of-credits) no longer
+      // immediately declares failure. It lets the native reconnect proceed
+      // and only gives up if no further event arrives within a generous
+      // window — long builds can legitimately go many minutes between
+      // stage updates during a single long Bedrock call or npm install.
+      // Investigated live: measured 30-40 SECOND response times for a
+      // trivial API lookup on this machine during testing, traced to severe
+      // OS-level memory pressure (153MB free RAM, ~3GB in the memory
+      // compressor) from running multiple heavy desktop apps and dev
+      // servers simultaneously for an extended session — this starves
+      // Node's event loop, delaying the 15s SSE heartbeat well beyond what
+      // a 90s window tolerates, even though the build is still genuinely
+      // progressing server-side. 5 minutes is generous enough to absorb
+      // that class of real-world slowness while still bounded well under
+      // build-registry.ts's own 15-minute stale-lock threshold.
+      let settled = false;
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
+      const RECOVERY_WINDOW_MS = 5 * 60_000;
+      const armWatchdog = () => {
+        if (watchdog) clearTimeout(watchdog);
+        watchdog = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          addMsg('assistant', '❌ Connection to the build engine was lost and did not recover. Please try again.');
+          setBuildProgress(p => p ? { ...p, step: 'error', message: '❌ Connection to the build engine was lost and did not recover.' } : p);
+          setPhase('idle');
+          es.close();
+          resolve();
+        }, RECOVERY_WINDOW_MS);
+      };
+      armWatchdog();
+
+      es.addEventListener('stage', (e) => {
+        armWatchdog();
+        try {
+          const d = JSON.parse((e as MessageEvent).data);
+          const label = ENGINE_STAGE_LABELS[d.stage as string] ?? d.message ?? d.stage;
+          appendLog(label);
+          setBuildProgress(p => p ? { ...p, message: label } : p);
+        } catch { /* ignore */ }
+      });
+
+      es.addEventListener('ping', () => armWatchdog());
+
+      es.addEventListener('busy', (e) => {
+        armWatchdog();
+        // With build-registry.ts's subscribe() fix, a 'busy' event now means
+        // "reconnected to the already-running build" — not a dead end — so
+        // this is informational, not a reason to give up.
+        let msg = 'Reconnected to the build already running for this project.';
+        try { const d = JSON.parse((e as MessageEvent).data); if (d?.message) msg = d.message; } catch { /* ignore */ }
+        console.log(`[send-routing] ${msg}`);
+      });
+
+      es.addEventListener('report', (e) => {
+        armWatchdog();
+        (async () => {
+          try { await handleEngineReport(JSON.parse((e as MessageEvent).data)); }
+          catch (err) { console.error('Failed to process engine report', err); }
+        })();
+      });
+
+      es.addEventListener('error', (e) => {
+        const raw = (e as MessageEvent).data;
+        if (raw) {
+          // A deliberate, informative server-sent error (e.g. out-of-credits)
+          // — this is terminal immediately, not a connection drop to recover from.
+          let msg = 'Connection to the build engine was lost.';
+          try { const d = JSON.parse(raw); if (d?.error) msg = d.error; } catch { /* ignore */ }
+          if (settled) return;
+          settled = true;
+          if (watchdog) clearTimeout(watchdog);
+          addMsg('assistant', `❌ ${msg}`);
+          setBuildProgress(p => p ? { ...p, step: 'error', message: `❌ ${msg}` } : p);
+          setPhase('idle');
+          es.close();
+          resolve();
+          return;
+        }
+        // Bare connection-level error — likely transient (network blip, tab
+        // backgrounding, proxy idle timeout). Do NOT close the EventSource;
+        // let its native reconnect logic retry the same URL, which will now
+        // resume the still-running build server-side. The watchdog above is
+        // the only thing that gives up, and only after a real recovery window.
+        console.warn('[send-routing] transient connection drop — waiting for native EventSource reconnect (build continues server-side)');
+      });
+
+      es.addEventListener('done', () => {
+        if (settled) return;
+        settled = true;
+        if (watchdog) clearTimeout(watchdog);
+        es.close();
+        resolve();
+      });
+    });
+
+    setLoading(false);
+  };
+
+  // ── Build pipeline (old) ───────────────────────────────────────────────────
 
   const runBuildPipeline = async (conversationHistory: ConversationTurn[], originalPrompt: string) => {
+    // Instrumented per explicit request: every Send click logs the flag value
+    // actually used to route, which pipeline was chosen, and (for the new
+    // path) the exact request URL — before any fetch executes, so a routing
+    // mismatch is visible in the console immediately rather than inferred
+    // later from server logs.
+    const engineFlag = await (engineFlagRef.current ?? Promise.resolve(false));
+    console.log(`[send-routing] flag=engineBuildForSend:${engineFlag} → pipeline=${engineFlag ? 'NEW (services/engine via runBuildPipelineViaEngine)' : 'OLD (runBuildPipeline legacy body)'}`);
+    if (engineFlag) return runBuildPipelineViaEngine(conversationHistory, originalPrompt);
+
+    resetBridgeEscalation(); // fresh slate — escalation counter reset for every new build
     setPhase('building');
     setFocusMode(true);     // Enter focus mode — hide marketing, maximise workspace
     setBuilderMode('build');
@@ -3672,6 +4887,28 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
     let installTicker: ReturnType<typeof setInterval> | null = null;
 
+    // ── Build timeout heartbeat (spec point 21) ──────────────────────────────
+    const heartbeatMessages = [
+      'Still generating — planning your architecture…',
+      'Installing dependencies — this can take up to 2 minutes…',
+      'Writing files — creating pages, API routes, and components…',
+      'Almost there — running verification checks…',
+      'Finalising — starting your preview server…',
+    ];
+    let heartbeatIdx = 0;
+    if (buildHeartbeatRef.current) clearInterval(buildHeartbeatRef.current);
+    buildHeartbeatRef.current = setInterval(() => {
+      const msg = heartbeatMessages[Math.min(heartbeatIdx, heartbeatMessages.length - 1)];
+      setBuildHeartbeatMsg(msg);
+      // Update the progress panel message only — never addStatus. The heartbeat fires
+      // on a 30-second clock that is unrelated to actual pipeline progress, so adding
+      // it to the status log creates confusing out-of-order messages (e.g., "Finalising
+      // — starting your preview server…" appears in the log BEFORE the server starts,
+      // then again after the bridge escalates, making it look like the pipeline looped).
+      setBuildProgress(p => p ? { ...p, message: msg } : p);
+      heartbeatIdx++;
+    }, 30000);
+
     try {
       // ── 1. Generate ────────────────────────────────────────────────────────
       setBuildDetailStep('understanding');
@@ -3679,6 +4916,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       await new Promise(r => setTimeout(r, 600)); // brief pause so user sees the message
       setBuildDetailStep('researching');
       const findApisTimer = setTimeout(() => setBuildDetailStep('finding_apis'), 4000);
+      console.log(`[send-routing] endpoint=/api/chat (action:'generate'), exact request URL before fetch: /api/chat`);
       const genData = await api({ action: 'generate', messages: conversationHistory, designStyle: buildStyle });
       clearTimeout(findApisTimer);
       // The generate action retries 3 times with escalating strategies and always
@@ -3972,7 +5210,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       narrate("Starting the preview server — opening your app now. Next.js compiles on first load (~30 seconds)…");
 
       // 90-second safety net — never stay on "Starting Server" indefinitely.
-      // If the server hasn't responded by then, fetch captured logs and show the exact error.
+      // If the server hasn't responded, auto-escalate to the bridge instead of just showing an error.
       let _serverStartTimer: ReturnType<typeof setTimeout> | null = setTimeout(async () => {
         _serverStartTimer = null;
         const logData = await api({ action: 'get-server-logs', projectPath: path }).catch(() => ({ logs: '' }));
@@ -3984,14 +5222,23 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         setBuildProgress(p => ({
           ...p!,
           step: 'error',
-          message: '⏱ Server startup timed out (90s)',
+          message: '⏱ Server startup timed out — escalating to advanced repair…',
           logs: [...(p?.logs ?? []), '⏱ Startup exceeded 90 seconds', errorLines || 'No error detail captured'],
         }));
-        narrate(
-          `⏱ Server startup exceeded 90 seconds. Your **project files are saved**.` +
-          (errorLines ? `\n\nError captured:\n\`\`\`\n${errorLines}\n\`\`\`` : '') +
-          `\n\nAsk me to **"fix the startup issue"** and I'll diagnose and repair it automatically.`
+        // Auto-escalate: let Claude Code inspect the project and fix the startup failure
+        const serverEscPrompt = `The Next.js dev server for the project at ${path} failed to start within 90 seconds.\n\nServer error output:\n${errorLines || 'No error captured'}\n\nInspect the project:\n1. Check for TypeScript errors or missing dependencies\n2. Fix any syntax or import errors in source files\n3. Ensure next.config.js is valid\n4. Run the dev server and confirm it starts successfully\n5. Verify / returns 200\n\nFix all issues so the server starts and the app loads.`;
+        autoEscalateToBridge(
+          `Server startup timeout — ${errorLines ? errorLines.slice(0, 100) : 'no error detail'}`,
+          serverEscPrompt,
         );
+        if (!debugMode) {
+          narrate(`⏱ Preview server didn't start in time. **Advanced repair has started automatically** — it will inspect and fix the issue.`);
+        } else {
+          narrate(
+            `⏱ Server startup exceeded 90 seconds. Auto-escalating to advanced repair.\n\n` +
+            (errorLines ? `Error captured:\n\`\`\`\n${errorLines}\n\`\`\`` : '')
+          );
+        }
       }, 90000);
       const _clearServerTimer = () => {
         if (_serverStartTimer) { clearTimeout(_serverStartTimer); _serverStartTimer = null; }
@@ -4040,21 +5287,15 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
       if (!serverData.port) {
         _clearServerTimer();
-        // Strategy 3: give up on live preview but NEVER stop — save the project anyway
         const crashDetail: string = serverData.error || '';
-        appendLog(`⚠️ Server could not start — ${crashDetail || 'project files saved to sidebar'}`);
-        narrate(
-          `⚠️ The server didn't start after three attempts. **The app files are saved** — you'll see this project in the sidebar.\n\n` +
-          (crashDetail ? `Error: **${crashDetail.slice(0, 200)}**\n\n` : '') +
-          `Ask me to **"fix the startup issue"** and I'll investigate and repair it automatically.`
-        );
+        appendLog(`⚠️ Server could not start after 3 strategies — escalating to advanced repair`);
         setBuildProgress(p => ({
           ...p!,
           step: 'error',
-          message: `⚠️ ${projectName} — server start failed, files saved`,
-          logs: [...(p?.logs ?? []), `⚠️ ${crashDetail || 'Server start failed after 3 strategies'}`, '📁 Project files saved — open from sidebar to fix'],
+          message: `⚠️ ${projectName} — escalating to advanced repair…`,
+          logs: [...(p?.logs ?? []), `⚠️ ${crashDetail || 'Server start failed after 3 strategies'}`, '🔧 Advanced repair starting…'],
         }));
-        // Save the project record so it shows in the sidebar even without a running port
+        // Save project record first so the sidebar shows it
         const savedProject: ProjectMeta = {
           id: pid || '',
           name: projectName,
@@ -4067,16 +5308,26 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         setCurrentProject(savedProject);
         setBuilderContext({ projectName: savedProject.name, stage: 'complete', active: true });
         await refreshProjects();
-        return; // exit gracefully — build pipeline complete, just no live preview
+        // Auto-escalate: bridge inspects source, fixes errors, restarts server
+        const crashEscPrompt = `The Next.js dev server for the project at ${path} failed to start after 3 strategies.\n\nError: ${crashDetail || 'unknown'}\n\nInspect the project:\n1. Fix all TypeScript errors (run npx tsc --noEmit)\n2. Fix missing imports or incorrect package names\n3. Fix next.config.js if it references non-existent files\n4. Fix any syntax errors in source files\n5. Ensure all dependencies in package.json are installed\n\nAfter fixing, confirm the project compiles cleanly.`;
+        autoEscalateToBridge(
+          `Server start failed after 3 strategies: ${crashDetail.slice(0, 100)}`,
+          crashEscPrompt,
+        );
+        return; // exit build pipeline — bridge takes over from here
       }
 
       _clearServerTimer(); // server confirmed — cancel the 90s safety net
+      // Stop the 30-second heartbeat immediately now that the server is up.
+      // Without this the UI stays stuck on "Finalising — starting your preview server…".
+      if (buildHeartbeatRef.current) { clearInterval(buildHeartbeatRef.current); buildHeartbeatRef.current = null; }
+      setBuildHeartbeatMsg(null);
       let port: number = serverData.port;
       appendLog(`✅ Server live on port ${port}`);
 
       narrate(`🖥️ Server started on port **${port}**! The preview is loading… Next.js does a first-compile which takes ~30 seconds. I'll run verification checks while you wait.`);
 
-      setPreviewUrl(`http://localhost:${port}`);
+      setPreviewUrl(serverData.previewUrl || `http://localhost:${port}`);
       setPreviewKey(k => k + 1);
       setPreviewLoading(true);  // iframe shows loading overlay until first paint
       setPhase('previewing');
@@ -4102,6 +5353,149 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         }
       } catch { /* non-critical */ }
 
+      // ── 6b. Save design baseline ───────────────────────────────────────────
+      // Snapshot all UI files (pages, layouts, components, CSS) immediately after
+      // first generation succeeds. The repair loop uses this baseline to avoid
+      // overwriting visual code when fixing backend/API errors.
+      try {
+        const baselineResult = await api({ action: 'save-design-baseline', projectPath: path });
+        if (baselineResult.success && baselineResult.count > 0) {
+          appendLog(`🎨 Design baseline saved — ${baselineResult.count} UI file(s) protected from repair overwrites`);
+        }
+      } catch { /* non-critical — repair still works without baseline */ }
+
+      // ── 6b. Pre-loop deterministic repairs ────────────────────────────────────
+      // Run before the engineering loop so the verifier starts from the best possible state.
+      // These are deterministic (no AI) — fast, reliable, and idempotent.
+      try {
+        // 1. Fix any auth page stubs (redirect-only pages with no form)
+        const preAuthFix = await api({ action: 'repair-auth-pages', projectPath: path });
+        if (preAuthFix.total > 0) appendLog(`🔐 Pre-loop: replaced ${preAuthFix.total} stub auth page(s)`);
+
+        // 2. Create missing pages for every nav link found in source code
+        const preRouteFix = await api({ action: 'repair-missing-routes', projectPath: path });
+        if (preRouteFix.total > 0) appendLog(`🗺️ Pre-loop: created ${preRouteFix.total} missing page(s): ${preRouteFix.created.join(', ')}`);
+
+        // 3. Create [id] detail pages for every dynamic href pattern found
+        const preDynFix = await api({ action: 'repair-dynamic-routes', projectPath: path });
+        if (preDynFix.total > 0) appendLog(`🔗 Pre-loop: created ${preDynFix.total} dynamic [id] page(s): ${preDynFix.created.join(', ')}`);
+
+        // 4. Guarantee /dashboard exists when the app has auth — login/signup must land somewhere real
+        const preDashFix = await api({ action: 'repair-dashboard', projectPath: path });
+        if (preDashFix.repaired) appendLog(`🏠 Pre-loop: created /dashboard (resources: ${(preDashFix.apiRoutes ?? []).join(', ') || 'none detected'})`);
+
+        // If any repairs were made, restart the server so Next.js picks up new files
+        if ((preAuthFix.total + preRouteFix.total + preDynFix.total + (preDashFix.repaired ? 1 : 0)) > 0) {
+          appendLog('🔄 Restarting server after pre-loop repairs…');
+          const restPre = await api({ action: 'start-server', projectPath: path, force: false });
+          if (restPre.port) { port = restPre.port; setPreviewUrl(restPre.previewUrl || `http://localhost:${port}`); }
+          await new Promise(r => setTimeout(r, 4000));
+        }
+      } catch { /* pre-loop repairs are best-effort */ }
+
+      // ── Preview Health Watchdog ────────────────────────────────────────────────
+      // The dev server process is running, but Next.js may still be compiling.
+      // Poll for an HTTP response before entering the verification loop —
+      // a loop full of "timeout" errors from a compiling/crashing server wastes
+      // repair iterations on a problem that hasn't surfaced as a real error yet.
+      //
+      // If the app never serves HTTP within PREVIEW_HEALTH_MS:
+      //   1. Collect actual server logs (they contain the real compile error)
+      //   2. Build a targeted bridge prompt from those logs
+      //   3. Auto-escalate to Claude Bridge — which can read files, fix the crash, restart
+      //   4. Return early (bridge continues from here; verification runs again after repair)
+      {
+        const PREVIEW_HEALTH_MS  = 60_000; // 60 seconds — enough for first Next.js compile
+        const POLL_INTERVAL_MS   = 5_000;
+        const healthStart        = Date.now();
+        let   appHealthy         = false;
+
+        setBuildProgress(p => ({ ...p!, step: 'verifying', message: '⏳ App compiling… (0s / 60s)' }));
+        appendLog('⏳ Preview health watchdog started — waiting for app to serve HTTP…');
+
+        while (!appHealthy) {
+          const elapsed = Math.round((Date.now() - healthStart) / 1000);
+          if ((Date.now() - healthStart) >= PREVIEW_HEALTH_MS) break;
+
+          try {
+            const h = await api({ action: 'check-preview-health', port });
+            if (h.healthy) {
+              appHealthy = true;
+              appendLog(`✅ Preview healthy (HTTP ${h.status ?? '?'}) after ${elapsed}s`);
+              setBuildProgress(p => ({ ...p!, message: '🔍 App healthy — starting verification…' }));
+              break;
+            }
+          } catch { /* API call failed — keep polling */ }
+
+          setBuildProgress(p => ({
+            ...p!,
+            message: `⏳ App compiling… (${Math.round((Date.now() - healthStart) / 1000)}s / ${PREVIEW_HEALTH_MS / 1000}s)`,
+          }));
+          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        }
+
+        if (!appHealthy) {
+          // App never responded — collect server logs and hand off to Claude Bridge.
+          // Server logs contain the real error (schema mismatch, syntax error, missing module, etc.)
+          // that HTTP timeouts from the verification loop would obscure.
+          const logData = await api({ action: 'get-server-logs', projectPath: path }).catch(() => ({ logs: '' }));
+          const rawLog: string = logData.logs ?? '';
+
+          // Extract error lines — most specific first
+          const hardLines = rawLog.split('\n')
+            .filter((l: string) => /no such column|has no column|no such table|cannot find module|module not found|enoent|syntaxerror|typeerror.*is not/i.test(l))
+            .slice(0, 4).join('\n');
+          const errorLines = rawLog.split('\n')
+            .filter((l: string) => /error|failed|cannot|crashed|exception/i.test(l))
+            .slice(0, 6).join('\n');
+          const diagLines = hardLines || errorLines;
+
+          appendLog(`⚡ Preview watchdog: app did not respond in ${PREVIEW_HEALTH_MS / 1000}s — escalating to advanced repair`);
+          addStatus(`⚡ Preview not loading after ${PREVIEW_HEALTH_MS / 1000}s — advanced repair starting automatically…`, 'checking');
+          setBuildProgress(p => ({
+            ...p!,
+            step: 'error',
+            message: '⚡ Preview not loading — advanced repair starting…',
+            logs: [
+              ...(p?.logs ?? []),
+              `⚡ Preview health timeout after ${PREVIEW_HEALTH_MS / 1000}s`,
+              ...(diagLines ? [diagLines] : ['No error detail captured from server logs']),
+            ],
+          }));
+
+          // Build a targeted bridge prompt that includes the actual server-log errors
+          const watchdogBridgePrompt = [
+            `The Next.js preview for the project at ${path} started on port ${port} but never served an HTTP response within ${PREVIEW_HEALTH_MS / 1000} seconds.`,
+            '',
+            diagLines
+              ? `Server log errors:\n${diagLines}`
+              : 'No error lines captured — the server process may have crashed silently.',
+            '',
+            `Diagnose and fix the startup failure:`,
+            `1. Read the server logs at ${path}/.next-dev.log (if it exists) for the real compile or runtime error`,
+            `2. Run: cd ${path} && npx tsc --noEmit  — fix every TypeScript error`,
+            `3. For SQLite "no such column" or "has no column": read lib/db.ts, compare column names to every API route that touches that table, fix mismatches (ALTER TABLE or recreate .db), ensure all routes use the correct column names`,
+            `4. For "Cannot find module" or "ENOENT": fix the import path or create the missing file`,
+            `5. For "SyntaxError": find and fix the syntax error in the relevant source file`,
+            `6. After fixing, confirm the app serves a response: curl http://localhost:${port}/`,
+          ].join('\n');
+
+          autoEscalateToBridge(
+            `Preview health timeout (${PREVIEW_HEALTH_MS / 1000}s) — ${(diagLines || 'no HTTP response').slice(0, 120)}`,
+            watchdogBridgePrompt,
+            { port, projectPath: path },
+          );
+
+          narrate(
+            `⚡ The preview server started but the app didn't load within ${PREVIEW_HEALTH_MS / 1000} seconds.\n\n` +
+            (diagLines ? `**Server error detected:**\n\`\`\`\n${diagLines.slice(0, 300)}\n\`\`\`\n\n` : '') +
+            `**Advanced repair is running automatically** — it's inspecting the startup logs, fixing the root cause, and will restart the preview.`
+          );
+          return; // bridge takes over; exit pipeline here
+        }
+      }
+      // ── End Preview Health Watchdog ───────────────────────────────────────────
+
       // ── 7. Autonomous Engineering Loop ────────────────────────────────────────
       // ═══════════════════════════════════════════════════════════════════════
       // BUILD → TEST → DETECT → CLASSIFY → FIX → RESTART → RE-VERIFY → ROLLBACK
@@ -4115,7 +5509,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       setBuildProgress(p => ({ ...p!, step: 'verifying', message: '🔍 Verification running…', logs: [...(p?.logs ?? []), '🤖 Agent loop starting…'] }));
 
       type RootCause = { kind: string; detail: string; packages?: string[]; envVars?: string[]; errorText?: string; fixFile?: string; fixHint?: string };
-      type VerifyCheck = { name: string; passed: boolean; recordCount?: number; error?: string; responsePreview?: string; rootCause?: RootCause; fixFile?: string; fixHint?: string };
+      type VerifyCheck = { name: string; passed: boolean; softPassed?: boolean; recordCount?: number; error?: string; responsePreview?: string; rootCause?: RootCause; fixFile?: string; fixHint?: string };
       type VerifyData = { verified: boolean; summary: string; checks: VerifyCheck[]; failures?: string[] };
 
       // ── Strategy sequences per error kind ─────────────────────────────────
@@ -4124,10 +5518,15 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       const ERROR_STRATEGIES: Record<string, ReadonlyArray<string>> = {
         'missing-package':       ['auto-install'],
         'auth-misconfigured':    ['add-secret', 'targeted'],
+        // auth-field-mismatch: form sends field names the API route doesn't read.
+        // fix-auth-fields → reads both form and API source, patches the mismatch.
+        // If that fails, targeted/broader AI fix as fallback.
+        'auth-field-mismatch':   ['fix-auth-fields', 'targeted', 'broader'],
+        'auth-page-stub':        ['repair-auth-pages', 'targeted', 'broader'],
         'missing-env':           ['add-placeholder'],
         'wrong-http-method':     ['targeted', 'broader', 'rewrite'],
 
-        'not-found':             ['targeted', 'broader'],
+        'not-found':             ['repair-auth-pages', 'repair-dashboard', 'repair-missing-routes', 'repair-dynamic-routes', 'targeted', 'broader'],
         'timeout':               ['targeted', 'broader', 'rewrite'],
         'database-error':        ['targeted', 'broader', 'rewrite'],
         'typescript-error':      ['targeted', 'broader'],
@@ -4165,18 +5564,48 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       const allStrategiesExhausted = (failed: VerifyCheck[]): boolean =>
         failed.filter(c => !c.passed).every(c => peekStrategy(c.rootCause?.kind ?? 'unknown') === null);
 
+      // Delegates to module-level function (defined above component) so async callbacks work
+      const getHardErrorLabel = (check: VerifyCheck): string | null => getHardErrorLabelModule(check);
+
+      // Builds a targeted bridge prompt from a set of failing checks
+      const buildBridgePrompt = (projectPath2: string, failing: VerifyCheck[], extraContext?: string): string => {
+        const lines = failing.slice(0, 8).map(c => {
+          const err = (c.error ?? 'failing').slice(0, 120);
+          const label = getHardErrorLabel(c);
+          return `• ${c.name}: ${err}${label ? ` [${label}]` : ''}`;
+        });
+        return [
+          `Fix these failing verification checks in the project at ${projectPath2}:`,
+          ...lines,
+          '',
+          'Instructions:',
+          '1. Read the relevant source files to understand the current state.',
+          '2. For database/schema errors: check the schema file (lib/db.ts or similar), compare it to the API routes, and fix the mismatch — update column names, add missing columns via ALTER TABLE or by recreating the database, and make sure every route uses the correct column names.',
+          '3. For auth errors: check /api/auth/login, /api/auth/register, /api/auth/me and ensure they use the correct column names from the actual database schema.',
+          '4. For import/module errors: fix the import path or add the missing file.',
+          '5. After fixing, confirm the app compiles and all fixed routes return correct status codes.',
+          ...(extraContext ? ['', 'Additional context:', extraContext] : []),
+        ].join('\n');
+      };
+
+      // Expose buildBridgePrompt to the async onComplete callbacks in autoEscalateToBridge
+      buildBridgePromptRef.current = buildBridgePrompt as (projectPath: string, failing: LooseCheck[]) => string;
+
       let verifyData: VerifyData = { verified: false, summary: 'Not verified', checks: [] };
 
-      const MAX_ITERATIONS = 12;
-      // Hard time limit: verification loop must complete within 8 minutes.
-      // This prevents the 15-20 minute stuck-verification issue where the loop
-      // keeps restarting the server and re-running checks indefinitely.
-      const MAX_VERIFY_MS = 8 * 60 * 1000;
+      const MAX_ITERATIONS = 7; // 7 × ~45s avg = ~5min max.
+      const MAX_VERIFY_MS = 5 * 60 * 1000;
       const loopStartTime = Date.now();
       let lastPassedCount = -1;
       let consecutiveRollbacks = 0;
+      let stagnationCount = 0; // consecutive iters with zero improvement
       let triedCacheClear = false;
-      let browserContextCache = ''; // browser console/network errors, collected lazily
+      let browserContextCache = '';
+      // Set to true whenever bridge escalation fires inside the loop.
+      // After the loop we check this flag and early-return so the bridge has sole
+      // ownership of the project rather than racing with the pipeline's health gate,
+      // browser journey, and final result set.
+      let escalatedToBridge = false;
       // Set to true whenever we restart the dev server so the first-compile watchdog
       // also fires after FIX X or other mid-loop restarts (not just on iter 1).
       let serverJustRestarted = true; // treat the initial start as a restart
@@ -4185,10 +5614,41 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         // ── Timeout protection ─────────────────────────────────────────────────
         const elapsedMs = Date.now() - loopStartTime;
         if (elapsedMs > MAX_VERIFY_MS) {
-          appendLog(`⚠️ Verification timeout — ${Math.round(elapsedMs / 1000)}s elapsed (limit: ${MAX_VERIFY_MS / 1000}s)`);
-          narrate(`⚠️ Verification timed out after ${Math.round(elapsedMs / 60000)} minutes. The app is running but not all checks passed within the time limit. Ask me to "continue fixing" and I'll resume from where I left off.`);
+          appendLog(`⚠️ Verification timeout — ${Math.round(elapsedMs / 1000)}s elapsed`);
+          const stillFailing = verifyData.checks?.filter(c => !c.passed && !c.softPassed) ?? [];
+          const bridgeEscPrompt = stillFailing.length > 0
+            ? `Fix these failing checks in the project at ${path}:\n${stillFailing.slice(0, 6).map(c => `• ${c.name}: ${c.error ?? 'failing'}`).join('\n')}\n\nInspect and fix the actual source files. Make every check pass.`
+            : `The app at ${path} has verification failures. Inspect the source files and fix all failing routes and API endpoints.`;
+          const timeoutReason = `Verification timeout after ${Math.round(elapsedMs / 1000)}s — still failing: ${stillFailing.slice(0, 3).map(c => c.name).join(', ')}`;
+          // Auto-escalate instead of requiring the user to click a button
+          autoEscalateToBridge(timeoutReason, bridgeEscPrompt, { port, projectPath: path });
+          escalatedToBridge = true;
+          // Manual fallback shown only in debug mode
+          if (debugMode) {
+            setDisplayed(prev => [...prev, {
+              role: 'assistant' as const,
+              content: `⏱️ Verification timeout — advanced repair auto-triggered.\n\n**Failing:** ${stillFailing.slice(0, 4).map(c => `${c.name}`).join(', ')}`,
+              recoveryActions: [
+                { label: '⚡ Fix with Claude Code', action: 'claude-bridge' as const, prompt: bridgeEscPrompt },
+                { label: 'Continue fixing', action: 'focus-input' as const, prompt: 'continue fixing' },
+              ],
+            }]);
+          }
           break;
         }
+
+        // ── Live progress indicator — updated every iteration ───────────────
+        const passedSoFar = verifyData.checks?.filter(c => c.passed || c.softPassed).length ?? 0;
+        const totalSoFar = verifyData.checks?.length ?? 0;
+        const currentFailures = verifyData.checks?.filter(c => !c.passed && !c.softPassed) ?? [];
+        const firstFail = currentFailures[0];
+        const progressMsg = totalSoFar === 0
+          ? `🔍 Verification running… (iteration ${iter}/${MAX_ITERATIONS})`
+          : firstFail
+            ? `🔧 Fixing: ${firstFail.name.slice(0, 50)} — ${passedSoFar}/${totalSoFar} checks passing (iteration ${iter}/${MAX_ITERATIONS})`
+            : `✅ ${passedSoFar}/${totalSoFar} checks passing — finalising…`;
+        setBuildProgress(p => ({ ...p!, step: 'verifying', message: progressMsg, logs: p?.logs ?? [] }));
+
         appendLog(`🤖 Engineering loop — iteration ${iter}/${MAX_ITERATIONS} (${Math.round(elapsedMs / 1000)}s elapsed)`);
 
         // ── STEP 1: Full verification (with live server log) ─────────────
@@ -4221,22 +5681,102 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           serverJustRestarted = false; // clear even if no timeout (server already compiled)
         }
 
-        if (verifyData.verified) {
-          appendLog('✅ All checks pass');
-          break;
+        // ── STEP 1b: Live link scan — "real user" click-every-link check ────
+        // Run on every iteration but only act when verify-app passes (or on first pass).
+        // This catches broken links in the live HTML that code scanning missed.
+        if (iter === 1 || verifyData.verified) {
+          try {
+            const linkScan = await api({ action: 'scan-live-links', port, projectPath: path });
+            if (linkScan.broken?.length > 0) {
+              appendLog(`🔗 Live link scan: ${linkScan.broken.length} broken link(s) — ${linkScan.broken.map((b: { href: string }) => b.href).join(', ')}`);
+              // Auto-repair: create missing pages for each broken link
+              const routeFix = await api({ action: 'repair-missing-routes', projectPath: path });
+              if (routeFix.total > 0) {
+                appendLog(`✅ Auto-created ${routeFix.total} missing page(s): ${routeFix.created.join(', ')}`);
+                await new Promise(r => setTimeout(r, 2000)); // HMR picks up new pages automatically
+              }
+            } else if (linkScan.allClear) {
+              appendLog(`✅ Live link scan: all ${linkScan.scanned} links return 200`);
+            }
+          } catch { /* non-critical — skip if scan fails */ }
         }
 
-        if (iter >= MAX_ITERATIONS) {
-          appendLog('⚠️ Reached iteration limit — stopping loop');
+        if (verifyData.verified) {
+          appendLog('✅ All checks pass');
           break;
         }
 
         const failedChecks = verifyData.checks.filter(c => !c.passed);
         if (failedChecks.length === 0) break;
 
-        // ── STEP 2: Check if we can continue ────────────────────────────────
-        if (allStrategiesExhausted(failedChecks) && consecutiveRollbacks >= 2) {
-          narrate(`⚠️ All repair strategies have been tried for the remaining issues. The app is running at ${passedNow}/${totalChecks} checks. Ask me to investigate a specific failing check.`);
+        // ── STEP 1c: Hard-error early escalation ─────────────────────────────
+        // Detect errors the normal AI repair loop structurally cannot fix (schema
+        // mismatches, missing DB columns, module resolution failures, 500s on auth
+        // routes that imply a server crash). These require direct file inspection
+        // and edits — exactly what the Claude Code CLI bridge does.
+        //
+        // On iter 1 we give the normal loop ONE attempt (it may install a package
+        // or make a quick fix). From iter 2+ if hard errors are still present, escalate.
+        if (iter >= 2) {
+          const hardFailures = failedChecks
+            .map(c => ({ check: c, label: getHardErrorLabel(c) }))
+            .filter(({ label }) => label !== null);
+
+          if (hardFailures.length > 0) {
+            const firstLabel = hardFailures[0].label!;
+            const errorSummary = hardFailures.slice(0, 3).map(({ check, label }) =>
+              `${check.name} [${label}]: ${(check.error ?? '').slice(0, 80)}`
+            ).join('; ');
+            appendLog(`⚡ Hard error detected: ${firstLabel} — cannot be fixed by AI code generation, escalating to advanced repair`);
+            addStatus(`Hard error: ${firstLabel} — escalating to Claude Bridge`, 'checking');
+            const hardPrompt = buildBridgePrompt(path, hardFailures.map(({ check }) => check));
+            const hardReason = `Hard error on iter ${iter}: ${errorSummary}`;
+            autoEscalateToBridge(hardReason, hardPrompt, { port, projectPath: path });
+            escalatedToBridge = true;
+            break;
+          }
+        }
+
+        // ── STEP 1d: Stagnation escalation ────────────────────────────────────
+        // If the passed count hasn't improved for 3 consecutive iterations AND
+        // the normal loop has had at least 3 chances, escalate.
+        if (passedNow <= lastPassedCount && lastPassedCount !== -1) {
+          stagnationCount++;
+        } else {
+          stagnationCount = 0;
+        }
+        if (stagnationCount >= 3 && iter >= 3) {
+          appendLog(`⚡ No improvement after ${stagnationCount} iterations — escalating to advanced repair`);
+          const stagnantPrompt = buildBridgePrompt(path, failedChecks);
+          const stagnantReason = `Stagnation: ${stagnationCount} iters with no improvement, still failing: ${failedChecks.slice(0,3).map(c=>c.name).join(', ')}`;
+          autoEscalateToBridge(stagnantReason, stagnantPrompt, { port, projectPath: path });
+          escalatedToBridge = true;
+          break;
+        }
+
+        // ── STEP 2: Escalate when normal strategies are exhausted ─────────────
+        // Condition A: hit the iteration cap
+        const hitIterationCap = iter >= MAX_ITERATIONS;
+        // Condition B: all error-kind strategies consumed + stagnating for 2 rounds
+        const strategiesGone = allStrategiesExhausted(failedChecks) && consecutiveRollbacks >= 2;
+
+        if (hitIterationCap || strategiesGone) {
+          const reasonLabel = hitIterationCap ? `iteration limit (${MAX_ITERATIONS})` : 'all strategies exhausted';
+          appendLog(`⚠️ ${reasonLabel} — escalating to advanced repair`);
+          const escPrompt = `Fix these failing checks in the project at ${path}:\n${failedChecks.slice(0, 6).map(c => `• ${c.name}: ${(c.error ?? '').slice(0, 80)}`).join('\n')}\n\nInspect the actual source files directly. Check routing, database schema, auth middleware, and API responses. Fix every failing check until all pass.`;
+          const escReason = `${reasonLabel} — failing: ${failedChecks.slice(0, 3).map(c => c.name).join(', ')} (${passedNow}/${totalChecks} passing)`;
+          autoEscalateToBridge(escReason, escPrompt, { port, projectPath: path });
+          escalatedToBridge = true;
+          if (debugMode) {
+            setDisplayed(prev => [...prev, {
+              role: 'assistant' as const,
+              content: `⚙️ **[Debug]** ${reasonLabel.charAt(0).toUpperCase() + reasonLabel.slice(1)}. Advanced repair auto-triggered.\n\nFailing: ${failedChecks.slice(0, 4).map(c => `\`${c.name}\``).join(', ')}`,
+              recoveryActions: [
+                { label: '⚡ Fix with Claude Code', action: 'claude-bridge' as const, prompt: escPrompt },
+                { label: 'Investigate', action: 'focus-input' as const, prompt: 'investigate the failing checks' },
+              ],
+            }]);
+          }
           break;
         }
 
@@ -4360,7 +5900,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           if (recov.packagesInstalled?.length > 0) allInstalledPkgs.push(...recov.packagesInstalled);
           await api({ action: 'clear-cache', projectPath: path });
           const rA = await api({ action: 'start-server', projectPath: path, force: true });
-          if (rA.port) { port = rA.port; setPreviewUrl(`http://localhost:${port}`); }
+          if (rA.port) { port = rA.port; setPreviewUrl(rA.previewUrl || `http://localhost:${port}`); }
           const wA = await api({ action: 'wait-for-server', port, timeout: 90000 });
           if (wA.crashed) {
             const logA = (await api({ action: 'get-server-logs', projectPath: path }).catch(() => ({ logs: '' }))).logs as string;
@@ -4543,6 +6083,91 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             continue;
           }
 
+          // ── fix-auth-fields: deterministic form↔API field name repair ────────
+          if (strategy === 'fix-auth-fields') {
+            narrate(`🔑 Auth field mismatch detected — reading form and API source to align field names…`);
+            try {
+              const authFixResult = await api({ action: 'fix-auth-fields', projectPath: path });
+              appendLog(authFixResult.fixed > 0
+                ? `✅ Auth fields fixed: ${authFixResult.details ?? `${authFixResult.fixed} file(s) patched`}`
+                : `⚠️ Auth field fixer: no mismatches found to fix`);
+              if (authFixResult.fixed > 0) {
+                await new Promise(r => setTimeout(r, 2000)); // HMR settle
+              }
+            } catch (e) {
+              appendLog(`⚠️ fix-auth-fields failed: ${e instanceof Error ? e.message : 'unknown'}`);
+            }
+            continue;
+          }
+
+          // ── repair-auth-pages: detect and replace stub auth pages with real forms ────
+          if (strategy === 'repair-auth-pages') {
+            narrate(`🔐 Auth page stub detected — replacing with real sign-in/sign-up form…`);
+            try {
+              const authRepairResult = await api({ action: 'repair-auth-pages', projectPath: path });
+              if (authRepairResult.total > 0) {
+                appendLog(`✅ Auth pages repaired: ${authRepairResult.repaired.join(', ')}`);
+                await new Promise(r => setTimeout(r, 2000)); // HMR picks up new files automatically
+              } else {
+                appendLog(`ℹ️ repair-auth-pages: no stub auth pages found`);
+              }
+            } catch (e) {
+              appendLog(`⚠️ repair-auth-pages failed: ${e instanceof Error ? e.message : 'unknown'}`);
+            }
+            continue;
+          }
+
+          // ── repair-dashboard: create working /dashboard for apps with auth ──────────
+          if (strategy === 'repair-dashboard') {
+            narrate(`🏠 Login/signup found but /dashboard is missing — creating a working dashboard…`);
+            try {
+              const dashResult = await api({ action: 'repair-dashboard', projectPath: path });
+              if (dashResult.repaired) {
+                appendLog(`✅ Dashboard created at app/dashboard/page.tsx`);
+                await new Promise(r => setTimeout(r, 2000)); // HMR picks up new files automatically
+              } else {
+                appendLog(`ℹ️ repair-dashboard: ${dashResult.reason ?? 'dashboard already exists'}`);
+              }
+            } catch (e) {
+              appendLog(`⚠️ repair-dashboard failed: ${e instanceof Error ? e.message : 'unknown'}`);
+            }
+            continue;
+          }
+
+          // ── repair-dynamic-routes: detect template-literal hrefs, create [id] pages ──
+          if (strategy === 'repair-dynamic-routes') {
+            narrate(`🔗 Scanning for dynamic route references (e.g. /products/\${id}) and creating detail pages…`);
+            try {
+              const dynResult = await api({ action: 'repair-dynamic-routes', projectPath: path });
+              if (dynResult.total > 0) {
+                appendLog(`✅ Dynamic routes created: ${dynResult.created.join(', ')}`);
+                await new Promise(r => setTimeout(r, 2000)); // HMR picks up new files automatically
+              } else {
+                appendLog(`ℹ️ repair-dynamic-routes: no missing [id] pages found`);
+              }
+            } catch (e) {
+              appendLog(`⚠️ repair-dynamic-routes failed: ${e instanceof Error ? e.message : 'unknown'}`);
+            }
+            continue;
+          }
+
+          // ── repair-missing-routes: scan all source files, create missing page stubs ──
+          if (strategy === 'repair-missing-routes') {
+            narrate(`🗺️ Scanning nav links for missing pages and creating stubs…`);
+            try {
+              const routeFixResult = await api({ action: 'repair-missing-routes', projectPath: path });
+              if (routeFixResult.total > 0) {
+                appendLog(`✅ Missing routes created: ${routeFixResult.created.join(', ')}`);
+                await new Promise(r => setTimeout(r, 2000)); // HMR picks up new files automatically
+              } else {
+                appendLog(`ℹ️ repair-missing-routes: all nav routes already have pages`);
+              }
+            } catch (e) {
+              appendLog(`⚠️ repair-missing-routes failed: ${e instanceof Error ? e.message : 'unknown'}`);
+            }
+            continue;
+          }
+
           // ── AI repair strategies (targeted / broader / rewrite) ───────────
           const targetFiles = [...new Set(
             codeErrors.flatMap(c => [c.fixFile, c.rootCause?.fixFile].filter(Boolean) as string[])
@@ -4583,6 +6208,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             tsErrors,
             browserErrors: browserContextCache,
             strategy,
+            errorKind: dominantKind, // lets the API scope-filter UI files for backend errors
           });
 
           appendLog(fixResult.success && fixResult.fixedCount > 0
@@ -4592,6 +6218,31 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           if (!fixResult.success || !fixResult.fixedCount) {
             // AI produced nothing — strategy already consumed, loop will pick next
             continue;
+          }
+
+          // ── Design drift guard ─────────────────────────────────────────────
+          // For broader/rewrite strategies, check if any UI file was significantly
+          // overwritten. If yes, restore those files from the design baseline so
+          // the original UI is preserved while the backend fix still applies.
+          if ((strategy === 'broader' || strategy === 'rewrite') && (fixResult.changedFiles?.length ?? 0) > 0) {
+            try {
+              const driftCheck = await api({
+                action: 'check-baseline-drift',
+                projectPath: path,
+                changedFiles: fixResult.changedFiles ?? [],
+              });
+              if (driftCheck.hasDrift && driftCheck.drifted?.length > 0) {
+                appendLog(`⚠️ Design drift detected in: ${driftCheck.drifted.join(', ')} — restoring from baseline`);
+                const restoreUI = await api({
+                  action: 'restore-baseline-files',
+                  projectPath: path,
+                  changedFiles: driftCheck.drifted,
+                });
+                if (restoreUI.count > 0) {
+                  appendLog(`🎨 Baseline restored for: ${restoreUI.restored.join(', ')}`);
+                }
+              }
+            } catch { /* non-critical */ }
           }
 
           // Wait for HMR or force-restart if the rewrite strategy changed config files
@@ -4662,6 +6313,16 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           break;
         }
       }
+
+      // ── Bridge escalation guard ────────────────────────────────────────────
+      // If any escalation point above fired, the bridge is now running asynchronously.
+      // Exit the pipeline immediately so the bridge has sole ownership of the project:
+      // it will fix the issue, restart the server, run post-bridge verification, and
+      // show the final result via onComplete. Running the health gate, browser journey,
+      // and result-setting code below CONCURRENTLY with the bridge causes race conditions
+      // (interleaved status messages, stale setBuildProgress calls) and is what made
+      // the repair sequence appear to loop back to "Iteration 1/7".
+      if (escalatedToBridge) return;
 
       const passedChecks = verifyData.checks?.filter(c => c.passed).length ?? 0;
       const totalChecks = verifyData.checks?.length ?? 0;
@@ -5136,6 +6797,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       );
     } finally {
       if (installTicker) clearInterval(installTicker);
+      if (buildHeartbeatRef.current) { clearInterval(buildHeartbeatRef.current); buildHeartbeatRef.current = null; }
+      setBuildHeartbeatMsg(null);
       setLoading(false);
       setPhase(p => p === 'building' ? 'idle' : p);
     }
@@ -5329,341 +6992,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     }
   };
 
-  // ── Intent classification — 8-class semantic system ───────────────────────
-  // Routes: conversation, greeting, question, research, planning, build, design,
-  //         debug, deployment, billing, logo_request, clarification_needed.
-  // Uses sentence structure + question detection + vocabulary scoring.
-  // NEVER re-introduces the assistant for acknowledgements or continuations.
-
-  type MessageIntent =
-    | 'conversation'       // "thank you", "okay", "continue" — never re-intro
-    | 'greeting'           // first-time hi/hello when conversation history is empty
-    | 'question'           // explain / how does X work
-    | 'research'           // find / compare / what API / best tool
-    | 'web_research'       // "go online and search X", "browse alibaba", "check what amazon does"
-    | 'planning'           // "how would X work", "something like Facebook"
-    | 'design'             // "add my name to the logo", "modify the image"
-    | 'logo_request'       // "generate a logo for..."
-    | 'logo_edit'          // refine / edit the EXISTING selected logo
-    | 'clarification_needed'
-    | 'build'              // confirmed build with enough detail
-    | 'debug'
-    | 'deployment'
-    | 'billing';           // pricing, subscription, upgrade questions
-
-  const detectIntent = (message: string, hasHistory: boolean, ctx?: { hasLogo: boolean; builderStage?: string }): MessageIntent => {
-    const lower = message.toLowerCase().trim();
-    const words = lower.split(/\s+/).filter(Boolean);
-
-    // 0. EXPLICIT BUILD TRIGGERS — must run BEFORE continuations check so
-    //    "Build Now", "Create Now", "Go Build" don't get swallowed as small-talk.
-    //    These are short imperative commands that confirm execution after planning.
-    const BUILD_TRIGGERS = [
-      'create now', 'build now', 'generate now', 'develop now', 'implement now',
-      'start building', 'start build', 'start creating', 'start generating',
-      'build it', 'build it now', 'create it', 'create it now', 'generate it',
-      'build the app', 'create the app', 'generate the app', 'build this', 'create this',
-      'make it', 'make now', 'go build', 'just build', 'just create',
-      'build please', 'create please', 'generate please',
-      'build the platform', 'create the platform', 'generate the platform',
-      'build the project', 'create the project', 'generate the project',
-      'build this app', 'create this app', 'build this project',
-      'build my app', 'create my app', 'generate my app',
-      'build my project', 'create my project', 'generate my project',
-      'generate platform', 'generate project', 'generate app',
-      'create project', 'create platform', 'build project', 'build platform',
-      'deploy project', 'deploy app', 'deploy now',
-      "let's build", 'lets build', "let's create", 'lets create', "let's go build",
-      'execute', 'execute now', 'run the build', 'start the build',
-      'proceed with build', 'proceed to build', 'go ahead and build',
-    ];
-    if (BUILD_TRIGGERS.includes(lower)) return 'build';
-    // Also match "create now", "build now" when followed by an optional project name
-    if (/^(create|build|generate|make|develop|implement)\s+(now|it|this|the\s+app|the\s+project|the\s+platform|my\s+app|my\s+project)\b/i.test(lower)) return 'build';
-
-    // 1. CONTINUATIONS & SMALL TALK — never re-introduce the assistant
-    // Exact-match acknowledgements and affirmatives
-    const CONTINUATIONS = [
-      'ok', 'okay', 'yes', 'yep', 'yeah', 'yup', 'no', 'nope', 'sure', 'of course',
-      'thanks', 'thank you', 'ty', 'thx', 'thank u', 'great', 'cool', 'nice', 'wow',
-      'perfect', 'got it', 'alright', 'sounds good', 'good', 'fine', 'interesting',
-      'awesome', 'lol', 'haha', 'noted', 'understood', 'continue', 'proceed', 'go ahead',
-      "let's go", 'go for it', 'do it', 'do that', 'that works', "that's great",
-      "that's fine", "that's good", 'agreed', 'correct', 'exactly', 'right', 'fair enough',
-      'makes sense', 'sounds great', 'love it', 'i like it', 'nice work', 'well done',
-    ];
-    if (CONTINUATIONS.includes(lower)) return 'conversation';
-    // Short 2-3 word phrases that are clearly continuations
-    if (words.length <= 3 && CONTINUATIONS.some(c => lower.startsWith(c))) return 'conversation';
-
-    // 2. GREETING — only introduces the assistant when there is NO existing history
-    const GREET_WORDS  = ['hi', 'hello', 'hey', 'hiya', 'howdy', 'yo', 'sup', 'greetings'];
-    const TIME_GREETS  = ['good morning', 'good afternoon', 'good evening', 'good night'];
-    const isGreeting = GREET_WORDS.some(g =>
-        lower === g || lower.startsWith(g + ' ') || lower.startsWith(g + ',') || lower.startsWith(g + '!'))
-      || TIME_GREETS.some(t => lower === t || lower.startsWith(t + ' ') || lower.startsWith(t + '!'));
-    if (isGreeting) return hasHistory ? 'conversation' : 'greeting';
-
-    // 3. BILLING — only match EXPLICIT questions about THIS platform's pricing, not project domain words.
-    // "What is the subscription model for my app?" must NOT trigger this — only "What is DWOMOH's pricing?"
-    const billingKeywords = [
-      'your pricing', 'your plan', 'your plans', 'your subscription', 'dwomoh pricing',
-      'dwomoh plan', 'vibe code pricing', 'vibe code plan', 'this platform cost',
-      'upgrade my plan', 'upgrade my account', 'downgrade my plan', 'cancel my plan',
-      'cancel my subscription', 'cancel my account', 'my current plan', 'billing portal',
-      'billing page', 'billing section', 'invoice from dwomoh', 'switch plan',
-    ];
-    const isExplicitBillingQ = billingKeywords.some(k => lower.includes(k))
-      || /\bhow much (does|is) (dwomoh|vibe code|this (tool|platform|service))\b/i.test(lower)
-      || /\bwhat (are|is) (the )?(dwomoh|vibe code) (plans?|pricing|tiers?|cost)\b/i.test(lower)
-      || (/\b(free|pro|starter|business)\s+plan\b/i.test(lower) && !/\b(app|project|website|site|system|platform|user|role)\b/i.test(lower));
-    if (isExplicitBillingQ) return 'billing';
-
-    // 3b. WEB RESEARCH — browsing websites, competitor research, online search, docs, npm, RapidAPI
-    const WEB_RESEARCH_PATTERNS = [
-      // Explicit web browsing — user wants the AI to open/visit/read a live page
-      /\b(go online|search (the )?web|browse (the )?web|search online|look online|go to the internet)\b/i,
-      /\b(go online and (search|check|look|browse|find|research))\b/i,
-      /\b(search for|look at|browse|visit|check out|research|analyse|analyze)\s+(the\s+)?(website|site|page|store)\s+(of|for|at)?\s+\w/i,
-      // "open/visit/go to [site] homepage/page" — catches "open today's Google homepage"
-      /\b(open|visit|go to|navigate to|load|show me)\s+.{0,30}(homepage|home page|website|web page|site|page)\b/i,
-      /\b(open|visit|go to|navigate to|check out)\s+(today'?s?\s+)?(google|youtube|tiktok|twitter|facebook|instagram|amazon|github|wikipedia|reddit|bbc|cnn|apple|microsoft|netflix|airbnb|tripadvisor|linkedin|whatsapp|telegram|snapchat|pinterest|ebay|etsy|shopify|alibaba|jumia|konga)\b/i,
-      // Named brands — check/browse/visit
-      /\b(check|look at|browse|visit|search|analyze|analyse|research|open)\s+(alibaba|amazon|shopify|etsy|zara|asos|shein|temu|nike|h&m|zalando|ebay|pinterest|instagram|facebook|twitter|linkedin|apple|google|netflix|airbnb|booking|tripadvisor|jumia|konga|paypal|stripe|flutterwave)\b/i,
-      /\b(what does|how does)\s+(alibaba|amazon|shopify|etsy|zara|asos|shein|temu|nike|h&m|zalando|ebay)\s+(do|look|show|handle|display|design|structure)\b/i,
-      // Competitor comparison
-      /\b(compare (my |our )?(site|store|app|website|project) (with|to|against))\b/i,
-      /\b(advise|advice).{0,30}\b(website|site|store|app|design|ui|ux)\b/i,
-      /\bsearch\s+\w+\s+(to (see|give|advise|advice|help|recommend|suggest|show))\b/i,
-      // Documentation & package research
-      /\b(search|look up|find|check|browse)\s+(npm|docs?|documentation|rapidapi|api docs?|sdk docs?)\s*(for|of|about)?\s+\w/i,
-      /\b(find|look up|search for|check)\s+(the\s+)?(documentation|docs?|api reference|sdk|package|library|module)\s+(for|of|on)\s+\w/i,
-      /\bnpm\s+(search|find|look up|docs?|registry)\b/i,
-      /\b(rapidapi|programmableweb|api\.marketplace)\b/i,
-      /\b(what (npm |)package|which (npm |)library|what (sdk|module|api client))\s+(should|do) i use\b/i,
-      /\bfind (me )?(an? |the )?(npm |)package (for|to|that)\b/i,
-      // How-to searches that need live docs
-      /\bhow (do i|to|can i) (install|use|integrate|connect|add|set up|configure)\s+\w.{3,30}\s+(in|with|to|for)\s+(next\.?js|react|node|typescript|javascript)\b/i,
-    ];
-    if (WEB_RESEARCH_PATTERNS.some(p => p.test(lower))) return 'web_research';
-
-    // 4. DEPLOYMENT
-    if (/\b(deploy|go live|connect domain|custom domain|production|publish|vercel|netlify|go to production|launch my site|hosting)\b/.test(lower))
-      return 'deployment';
-
-    // 5. DEBUG (short vague messages only — detailed ones are edits handled by editPipeline)
-    if (/\b(fix|debug|broken|not working|crashed|crash|bug|issue|problem)\b/.test(lower) && words.length <= 6)
-      return 'debug';
-
-    // 5b. Logo guard — exclude logo commands from build verbs below.
-    // (The greedy "any build verb + 2 words → build" gate was removed because it fired on vague
-    // short messages like "Build a marketplace" before the user had described any features,
-    // causing the pipeline to start immediately in the middle of a planning conversation.
-    // Intent now falls through to the feature-score gate at step 11-12.)
-
-    // 6. QUESTION STRUCTURE GUARD — compute early so logo/design checks can use it
-    const isQuestion = lower.endsWith('?')
-      || /^(how|what|why|when|where|who|which|whose|is|are|do|does|did|will|would|could|should|may|might|can)\s/.test(lower);
-
-    // 6b. LOGO EDIT — only fires when a logo already exists in session
-    if (!isQuestion && ctx?.hasLogo && (
-      /\b(refine|edit|update|modify|adjust|improve|revise|redo|tweak)\s*(the\s+)?(logo|design|icon|brand|it)\b/i.test(lower)
-      // color / style / font / sizing changes
-      || /\b(change|swap|update|alter|make|use)\s*(the\s+)?(color|colour|font|typeface|typography|text|style|size|background|icon|shape|name|weight)\b/i.test(lower)
-      || /\b(darker|lighter|bolder|thinner|bigger|smaller|larger|wider|taller|rounder|sharper)\b/i.test(lower)
-      || /\b(use|try|apply)\s+(a\s+)?(modern|minimal|bold|elegant|serif|sans.serif|script|condensed|geometric|rounded)\s*(font|typeface|style|look)?\b/i.test(lower)
-      || /\bmake\s*(the\s+)?(text|font|icon|logo|design|colors?|background)\s*(bigger|smaller|bolder|lighter|darker|cleaner|minimal|modern|thicker|thinner|larger)\b/i.test(lower)
-      || /\bmake\s*(it|the\s*logo)\s*(more|less|bolder|cleaner|darker|lighter|bigger|smaller|professional|minimal|modern|elegant|bold|clean|vibrant|muted|simple|complex)\b/i.test(lower)
-      // add elements
-      || /\badd\s*(my\s+)?(brand\s+)?(name|text|tagline|slogan|title|subtitle|icon|symbol)/i.test(lower)
-      // explicit name reveal
-      || /\b(the\s+)?name\s+is\s+\w+/i.test(lower)
-      // general intent when logo present
-      || /\bgive\s*(it|the\s*logo)\s*(a\s+)?(new|different|more|fresh|better)/i.test(lower)
-      || /\blogo\s*(needs|should|must|has to)\s*(be|have|look|use)/i.test(lower)
-      || /\b(remove|delete|hide)\s*(the\s+)?(icon|symbol|circle|background|border|text|name|tagline)\b/i.test(lower)
-      || /\b(center|align|left|right|stack|arrange|reorder|move)\s*(the\s+)?(text|icon|logo|elements?)\b/i.test(lower)
-    ))
-      return 'logo_edit';
-
-    // 7. DESIGN — image/logo modification (only non-questions)
-    // All patterns use bounded .{0,80} to prevent spanning across long build prompts.
-    if (!isQuestion && (
-      /add.{0,60}(?:text|name|brand|company|title|label).{0,60}(?:logo|image|design|photo)/i.test(lower)
-      || /(?:modify|change|edit|update|adjust|redesign|restyle).{0,80}(?:logo|image|design|photo)/i.test(lower)
-      || /(?:logo|image|design).{0,80}(?:modify|change|edit|update|adjust)/i.test(lower)
-      || /put.{0,50}(?:name|brand|text).{0,50}(?:on|in).{0,30}(?:logo|image)/i.test(lower)
-      || /add.{0,30}logo.{0,30}to|add.{0,30}image.{0,30}to/i.test(lower)
-      || /\bcreate.{0,40}variation\b|\bmake.{0,40}logo.{0,40}look\b|\bstyle.{0,30}logo\b/i.test(lower)))
-      return 'design';
-
-    // 8. LOGO GENERATION — imperative requests only, never questions
-    // "Can you create a logo?" → question (answered by AI), "Create a logo for my brand" → logo_request
-    if (!isQuestion && (
-      /\b(generate|create|make|design)\s+(a\s+|me\s+a\s+)?logo\b/i.test(lower)
-      || /\blogo\s+(for|generation|design|generator)\b/i.test(lower)
-      || /\bi\s+(want|need)\s+(a\s+)?logo\b/i.test(lower)
-      || /\bbuild\s+(a\s+)?logo\b/i.test(lower)))
-      return 'logo_request';
-
-    // (isQuestion already computed above — used below)
-
-    if (isQuestion) {
-      // Research-flavoured questions: "Find me X", "What API should I use", "Which is best"
-      if (/\b(find|search|look for|look up|discover)\b/i.test(lower)
-        || /api for|apis for|api do i need|api to use|best api|which api|what api|payment api|sports api|weather api|maps api/i.test(lower)
-        || /best framework|best library|best tool|best database|best approach|compare|versus|\bvs\b|difference between|which is better|alternatives|how to choose/i.test(lower))
-        return 'research';
-
-      // Everything else is an explanatory question
-      return 'question';
-    }
-
-    // 9. NON-QUESTION RESEARCH: "Find me X", "Search for X", "Recommend an API"
-    if (/^(find|search|look for|discover|recommend|suggest|compare)\b/i.test(lower) && words.length >= 3)
-      return 'research';
-
-    // 10. PLANNING / EXPLORATION — informational, not a build trigger
-    if (/want to know|want to understand|how it goes|how would it work|tell me how|explain how|something like|similar to|like facebook|like uber|like airbnb|like amazon|like instagram|like twitter|like whatsapp|thinking of building|curious about|wondering about|help me understand/i.test(lower))
-      return 'planning';
-
-    // 11. BUILD VOCABULARY
-    const BUILD_VERBS    = ['build', 'create', 'generate', 'make', 'develop', 'design', 'code', 'write', 'implement', 'set up'];
-    const INTENT_PHRASES = ['i want', 'i need', 'i would like', "i'd like", 'please build', 'please create', 'please make'];
-    const APP_TYPES      = [
-      'app', 'application', 'website', 'web app', 'platform', 'marketplace',
-      'dashboard', 'store', 'shop', 'ecommerce', 'e-commerce', 'portal', 'system',
-      'landing page', 'landing', 'site', 'saas', 'crm', 'cms', 'booking', 'forum',
-      'blog', 'portfolio', 'tool', 'directory', 'social network', 'mobile app', 'pwa',
-      'social media', 'management system', 'tracking system', 'generator', 'engine',
-      'service', 'solution', 'software', 'product', 'api', 'bot', 'agent',
-      // Utility / tool types
-      'downloader', 'converter', 'calculator', 'tracker', 'analyzer', 'analyser',
-      'scraper', 'extractor', 'viewer', 'player', 'editor', 'manager', 'monitor',
-      'notifier', 'aggregator', 'scheduler', 'automator', 'processor', 'scanner',
-      'builder', 'creator', 'designer', 'shortener', 'checker', 'validator',
-      // Common suffixes in branded app names — "Ghana Music Hub", "DeliverGH Pro", etc.
-      'hub', 'suite', 'pro', 'plus', 'zone', 'space', 'base', 'core', 'lab', 'labs',
-      'studio', 'connect', 'flow', 'go', 'link', 'net', 'box', 'pad', 'io', 'ai',
-      'market', 'central', 'center', 'point', 'place', 'spot', 'gate', 'pass',
-      'watch', 'track', 'view', 'scope', 'lens', 'dash', 'pulse', 'stream',
-    ];
-    const hasBuildVerb    = BUILD_VERBS.some(v => { const i = lower.indexOf(v); return i !== -1 && (i === 0 || lower[i - 1] === ' '); });
-    const hasIntentPhrase = INTENT_PHRASES.some(p => lower.includes(p));
-    const hasAppType      = APP_TYPES.some(t => lower.includes(t));
-    const hasAction       = hasBuildVerb || hasIntentPhrase;
-
-    // DIRECT BUILD COMMAND: imperative verb + enough detail to build without clarification.
-    // Short commands ("Build a marketplace", "Create an app") fall through to feature-score
-    // analysis so DWOMOH can ask clarifying questions rather than building blindly.
-    // Only bypass feature-score when the message is long enough to be self-descriptive (8+ words).
-    const IMPERATIVE_BUILD_VERBS = /^(build|create|generate|make|develop|produce|code|write|implement)\b/i;
-    const isDirectCommand = IMPERATIVE_BUILD_VERBS.test(lower) && words.length >= 8
-      && !/^(build|create|generate|make|design|implement)\s+(a\s+|me\s+a\s+)?logo\b/i.test(lower);
-    if (isDirectCommand) return 'build';
-
-    // NAMED APP BUILD: "Build [ProperCaseName]" — user names their app directly.
-    // Detect: imperative verb + capitalized app name (2–6 words, each starting with uppercase or known word).
-    // Examples: "Build Ghana Music Hub", "Create DeliverGH", "Generate KidLearn AI"
-    const isNamedAppBuild = IMPERATIVE_BUILD_VERBS.test(lower)
-      && words.length >= 2 && words.length <= 8
-      && !/^(build|create|generate|make|design|implement)\s+(a\s+|me\s+a\s+)?logo\b/i.test(lower)
-      && words.slice(1).some(w => /^[A-Z]/.test(w));  // at least one ProperCase word after the verb
-    if (isNamedAppBuild) return 'build';
-
-    // Build request referencing unknown external API → research APIs first
-    if (hasAction && hasAppType && /sports api|football api|weather api|stock api|crypto api|news api|using an api|using a sports|using weather|real.time score|live score/i.test(lower))
-      return 'research';
-
-    if (!hasAction && !hasAppType && words.length <= 4) return 'conversation';
-    if (!hasAction && !hasAppType) return 'question';
-
-    // 12. CONFIRMED BUILD — action + app type + enough detail (2+ features OR 8+ words)
-    if (hasAction && hasAppType) {
-      const FEATURE_WORDS = ['with', 'including', 'featuring', 'login', 'auth', 'authentication',
-        'payment', 'paystack', 'stripe', 'search', 'filter', 'map', 'maps', 'chart', 'analytics',
-        'user', 'users', 'admin', 'cart', 'checkout', 'booking', 'calendar', 'profile', 'notification',
-        'email', 'upload', 'gallery', 'rating', 'review', 'category', 'listing', 'listings', 'property',
-        'product', 'products', 'menu', 'order', 'orders', 'delivery', 'messaging', 'chat', 'feed',
-        'post', 'follow', 'subscription', 'report', 'invoice', 'inventory', 'responsive',
-        'video', 'audio', 'stream', 'live', 'ai', 'ml', 'generate', 'detection', 'recognition'];
-      const featureScore = FEATURE_WORDS.filter(f => lower.includes(f)).length;
-
-      // Well-known app categories: build immediately with smart defaults, no clarification needed
-      const KNOWN_DOMAINS = [
-        'football', 'soccer', 'sports prediction', 'match prediction', 'score predictor',
-        'food delivery', 'restaurant', 'recipe', 'meal planner', 'ordering',
-        'real estate', 'property', 'housing', 'rental', 'airbnb',
-        'e-commerce', 'ecommerce', 'online store', 'marketplace',
-        'todo', 'task manager', 'project management', 'kanban',
-        'blog', 'news', 'article', 'content',
-        'chat', 'messaging', 'social network', 'social media',
-        'fintech', 'finance', 'banking', 'payment', 'wallet',
-        'healthcare', 'hospital', 'clinic', 'medical', 'appointment',
-        'education', 'learning', 'school', 'course', 'quiz',
-        'hotel', 'travel', 'booking', 'event', 'ticket',
-        'crypto', 'stock', 'trading', 'portfolio',
-        'job board', 'recruitment', 'hiring', 'freelance',
-        'logistics', 'delivery', 'tracking', 'fleet',
-        'fitness', 'gym', 'workout', 'nutrition',
-        'crm', 'inventory', 'invoicing', 'accounting', 'erp',
-        'weather', 'agriculture', 'farming', 'agri',
-        'church', 'charity', 'non.profit', 'community',
-        'pharmacy', 'grocery', 'supermarket', 'retail',
-        // AI / content / media
-        'ai', 'artificial intelligence', 'machine learning', 'video generation', 'image generation',
-        'text generation', 'content creation', 'video platform', 'streaming', 'media', 'podcast',
-        'music', 'photo', 'photography', 'gallery', 'portfolio',
-        // Productivity / SaaS
-        'saas', 'productivity', 'collaboration', 'team', 'workspace', 'project tracker',
-        'time tracker', 'note', 'notes', 'wiki', 'knowledge base', 'documentation',
-        // Other common domains
-        'donation', 'crowdfunding', 'nft', 'marketplace', 'auction', 'bidding',
-        'survey', 'poll', 'quiz', 'game', 'gaming', 'leaderboard', 'tournament',
-        'service directory', 'services directory', 'directory',
-        // Specific platform downloaders / tools — always build, never ask for clarification
-        'tiktok', 'youtube', 'instagram', 'twitter', 'facebook', 'whatsapp', 'telegram',
-        'tiktok downloader', 'youtube downloader', 'instagram downloader', 'video downloader',
-        'pdf converter', 'pdf to word', 'image converter', 'file converter',
-        'url shortener', 'link shortener', 'qr code', 'barcode generator', 'barcode scanner',
-        'password manager', 'password generator', 'color picker', 'unit converter',
-        'currency converter', 'tax calculator', 'loan calculator', 'mortgage calculator',
-        'countdown timer', 'stopwatch', 'pomodoro', 'habit tracker', 'mood tracker',
-        'expense tracker', 'budget tracker', 'calorie tracker', 'workout tracker',
-        'price tracker', 'stock tracker', 'crypto tracker', 'weather dashboard',
-        'ip lookup', 'dns lookup', 'whois lookup', 'speed test', 'uptime monitor',
-        'web scraper', 'data scraper', 'email extractor', 'contact extractor',
-        'resume builder', 'cv builder', 'invoice generator', 'contract generator',
-        'flashcard', 'typing test', 'text summarizer', 'paraphraser', 'translator',
-        'code formatter', 'json viewer', 'csv viewer', 'markdown editor', 'diff tool',
-        'drawing tool', 'whiteboard', 'mind map', 'flowchart', 'diagram',
-        'chat app', 'forum', 'community', 'discord', 'slack',
-        'clone', 'like', 'similar to', 'inspired by',
-      ];
-      const isWellKnownDomain = KNOWN_DOMAINS.some(d => lower.includes(d));
-      // Long detailed specifications (12+ words) with any app vocabulary reliably signal a build intent
-      const isDetailedSpec = words.length >= 12 && (hasAppType || featureScore >= 1);
-      // Build only when the request is specific enough to generate without guessing:
-      //   • 2+ feature words  (e.g. "with listings, search, and Paystack")
-      //   • 1 feature + 8 words  (e.g. "a property site with map search for Accra")
-      //   • known domain + 1 feature  (e.g. "e-commerce store with cart and checkout")
-      //   • known domain + 8 words  (enough context for smart defaults)
-      //   • 12+ words with any app vocabulary  (long specification)
-      // Everything else asks for clarification — never build from a vague short command.
-      if (isDetailedSpec
-        || featureScore >= 2
-        || (featureScore >= 1 && words.length >= 8)
-        || (featureScore >= 1 && isWellKnownDomain)
-        || (isWellKnownDomain && words.length >= 8)
-      ) return 'build';
-      return 'clarification_needed';
-    }
-    if (!hasAction && hasAppType) return 'clarification_needed';
-    if (hasAction && !hasAppType) return 'planning';
-
-    return 'conversation';
-  };
-
+  // Intent classification — see lib/intent-classifier.ts (extracted for
+  // permanent unit testing; see lib/__tests__/intent-classifier.test.ts).
   // ── Canned responses (plain text, no markdown asterisks) ──────────────────
 
   const getGreetingResponse = (message: string, userName?: string): string => {
@@ -5783,12 +7113,30 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     const userMessage = input.trim();
     if (!userMessage || loading || editApplying || phase === 'building') return;
 
+    // Dismiss goal picker when user sends any message
+    if (goalStep !== 'idle') setGoalStep('idle');
+
     setInput('');
     if (inputRef.current) inputRef.current.style.height = 'auto';
     addMsg('user', userMessage);
 
     const newHistory: ConversationTurn[] = [...history, { role: 'user', content: userMessage }];
     setHistory(newHistory);
+
+    // Instrumented per explicit request: confirms whether currentProject is
+    // actually set at the moment a message is sent, since a null value here
+    // (e.g. after a page refresh, with no restoration mechanism) means the
+    // ENTIRE "project open → edit, not new build" branch below never runs,
+    // regardless of any fix inside it.
+    console.log(`[send-routing] handleSubmit: currentProject=${currentProject ? `"${currentProject.name}" (port ${currentProject.port}, path ${currentProject.projectPath})` : 'NULL — no project open, message goes to top-level intent classification'}`);
+
+    // BRIDGE TEST MODE: Skip ALL intent classification, editing, and recommendation logic.
+    // Every message goes directly to the bridge pipeline. DWOMOH Vibe Code is pure orchestration.
+    if (bridgeTestMode) {
+      const enrichedBridge = enrichPromptWithAssets(userMessage);
+      runBridgeOnlyPipeline(enrichedBridge);
+      return;
+    }
 
     // AUTONOMOUS EDIT MODE: Project is open — apply changes immediately.
     // Exceptions: web_research, logo, research are always global.
@@ -5797,27 +7145,29 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     if (currentProject) {
       const hasLogo0 = assets.some(a => a.role === 'logo');
       const projectIntent = detectIntent(userMessage, history.length > 0, { hasLogo: hasLogo0 });
-      if (projectIntent === 'web_research') { await respondWithAI(userMessage, newHistory, 'think-agentic'); return; }
-      if (projectIntent === 'logo_request')  { await handleLogoGenerate(userMessage); return; }
-      if (projectIntent === 'logo_edit')     { await handleLogoRefine(userMessage); return; }
-      if (projectIntent === 'research')      { await runResearch(userMessage); return; }
-      // Build intent while a project is open → user wants a NEW app, not an edit.
-      // Fall through to the build pipeline below (don't return here).
-      if (projectIntent !== 'build') {
+      // Computed BEFORE the build-intent fall-through — with a project
+      // already open, an explicit problem-report signal always means "fix
+      // what I have," regardless of how detectIntent classified the message.
+      // See lib/repair-routing.ts's decideProjectOpenRouting for the full
+      // root-cause explanation (extracted so this exact decision is
+      // permanently unit-tested, not just re-derived by reading this block).
+      const appRunning = !!(buildProgress?.port || currentProject?.port);
+      const livePort404 = buildProgress?.port || currentProject?.port;
+      const livePathForRepair = buildProgress?.projectPath || currentProject?.projectPath;
+      const route = decideProjectOpenRouting({
+        projectIntent, appRunning, hasLivePathAndPort: !!(livePathForRepair && livePort404), userMessage,
+      });
+
+      if (route === 'web_research') { await respondWithAI(userMessage, newHistory, 'think-agentic'); return; }
+      if (route === 'logo_request')  { await handleLogoGenerate(userMessage); return; }
+      if (route === 'logo_edit')     { await handleLogoRefine(userMessage); return; }
+      if (route === 'research')      { await runResearch(userMessage); return; }
+
+      if (route === 'scan_and_repair_routes' || route === 'edit_pipeline') {
         const nlCmd = interpretCommand(userMessage);
 
-        // "Broken app" detection: user reports a visible problem while the app is running.
-        // Strategy:
-        //   1. Run scan-and-repair-routes (deterministic, instant — handles /login, /signup, etc.)
-        //   2. If that fixes everything → report success and refresh preview
-        //   3. If routes still broken → route to think-agentic with scan context injected
-        const appRunning = !!(buildProgress?.port || currentProject?.port);
-        const livePort404 = buildProgress?.port || currentProject?.port;
-        const livePathForRepair = buildProgress?.projectPath || currentProject?.projectPath;
-        const reportsBroken = /\b(404|not found|broken|not working|doesn't work|won't load|blank page|white screen|shows? (a |an )?(404|error|blank)|preview shows|page not found|can'?t (see|access|open|reach)|crashed|failed to load|loading forever|stuck on|keeps? (failing|crashing)|error page|something('?s| is) wrong|nothing (loads?|shows?|appears?))\b/i.test(userMessage);
-        const reportsRouting = /\b(404|page not found|links? (are |is )?(broken|not working)|navigation|clicking|click|button|dashboard not|can'?t (navigate|open|reach|get to)|routing|routes?)\b/i.test(userMessage);
-
-        if (appRunning && reportsBroken && livePathForRepair && livePort404) {
+        if (route === 'scan_and_repair_routes') {
+          const reportsRouting = reportsRoutingProblem(userMessage);
           // Phase 1: fast deterministic route scan + repair
           addStatus('Scanning route structure…', 'checking');
           const scanRepair = await api({
@@ -5866,7 +7216,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         runEditPipeline(userMessage, newHistory, nlCmd);
         return;
       }
-      // 'build' intent falls through to the pipeline at the bottom of handleSubmit
+      // route === 'new_build' falls through to the pipeline at the bottom of handleSubmit
     }
 
     // INTENT CLASSIFICATION
@@ -5874,6 +7224,10 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     const hasHistory = history.length > 0;
     const hasLogo = assets.some(a => a.role === 'logo');
     const intent = detectIntent(userMessage, hasHistory, { hasLogo });
+    // Capture the PRIOR turn's intent before overwriting it with this one —
+    // see lastIntentRef's declaration for why this exists.
+    const wasLastResponseClarifying = lastIntentRef.current === 'clarification_needed' || lastIntentRef.current === 'planning';
+    lastIntentRef.current = intent;
 
     const respondConversationally = async (text: string) => {
       setLoading(true);
@@ -5936,7 +7290,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       case 'planning': {
         // If user is in a long planning session and sends a short imperative command, treat it
         // as a build confirmation — they want to build what was discussed, not plan more.
-        const isPlanningBuildConfirm = inActiveSession && msgWords.length <= 5 &&
+        const isPlanningBuildConfirm = (inActiveSession || wasLastResponseClarifying) && msgWords.length <= 5 &&
           /^(build|create|generate|make|develop|implement|start|go|let|proceed|execute)\b/i.test(userMessage.trim());
         if (isPlanningBuildConfirm) {
           const pName3 = extractProjectName(userMessage);
@@ -5979,7 +7333,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       // Vague build request — in active sessions check if the user means "build the thing we planned"
       case 'clarification_needed': {
         // Short message after a long planning session = "build what we discussed"
-        const isLateSessionBuildConfirm = inActiveSession && msgWords.length <= 6 &&
+        const isLateSessionBuildConfirm = (inActiveSession || wasLastResponseClarifying) && msgWords.length <= 6 &&
           /^(build|create|generate|make|develop|implement|start|go|let)/i.test(userMessage.trim());
         if (isLateSessionBuildConfirm) {
           // Fall through to build pipeline
@@ -6036,10 +7390,26 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
     // BUILD MODE: verified intent + sufficient detail — start pipeline
     // Enrich prompt with any uploaded assets before handing off to the pipeline
-    if (buildTarget === 'flutter') {
-      runFlutterBuildPipeline(newHistory, enrichPromptWithAssets(userMessage));
+    const enriched = enrichPromptWithAssets(userMessage);
+
+    // ── Platform recommendation (spec point 4) ────────────────────────────
+    // Only offer recommendation when user hasn't explicitly chosen via goal flow
+    if (!currentProject && goalPlatform === null && goalStep === 'idle') {
+      const rec = analyzePromptForPlatform(userMessage);
+      if (rec.platform && rec.platform !== (buildTarget === 'flutter' ? 'flutter' : 'website')) {
+        setBuildRecommendation({ platform: rec.platform, reason: rec.reason, icon: rec.icon });
+        setPendingBuildPrompt(enriched);
+        return; // wait for user to accept/dismiss recommendation
+      }
+    }
+
+    if (bridgeTestMode) {
+      // Bridge Test Mode — skip all internal generation, route directly to Claude Bridge
+      runBridgeOnlyPipeline(enriched);
+    } else if (buildTarget === 'flutter') {
+      runFlutterBuildPipeline(newHistory, enriched);
     } else {
-      runBuildPipeline(newHistory, enrichPromptWithAssets(userMessage));
+      runBuildPipeline(newHistory, enriched);
     }
   };
 
@@ -6607,13 +7977,26 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       const res = await fetch('/api/domains', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'purchase', domain, autoRenew: true }),
+        body: JSON.stringify({ action: 'purchase', domain }),
       });
       const data = await res.json();
-      if (data.ok) {
+      // New flow: the server returns a price quote + a Paystack payment URL.
+      // We confirm the price with the user BEFORE redirecting to pay. The domain
+      // is only registered after payment is verified by the webhook (and never in
+      // sandbox/test mode).
+      if (data.ok && data.requiresPayment) {
+        const q = data.quote ?? {};
+        const proceed = window.confirm(
+          `Register ${domain} for $${q.sellingPriceUsd}?\n\n` +
+          `You'll be redirected to Paystack to pay. The domain is registered only after your payment is confirmed.` +
+          (q.sellingPriceUsd ? '' : '')
+        );
+        if (proceed && data.authorizationUrl) {
+          window.location.href = data.authorizationUrl;
+        }
+      } else if (data.ok) {
         setPurchaseSuccess(domain);
-        addStatus(`Purchased ${domain} — DNS configures automatically`, 'done');
-        addMsg('assistant', `**${domain} purchased successfully.**\n\nYour domain is being registered through AWS Route 53. It will be ready in a few minutes.\n\nOnce active, you can connect it to any project from the Domains panel.`);
+        addStatus(`Domain order created for ${domain}`, 'done');
         setTimeout(loadDomainsData, 5000);
       } else {
         addStatus(`Purchase failed: ${data.error}`, 'error');
@@ -6669,12 +8052,188 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
     } catch { setDeployRecord(null); }
   };
 
+  const getProjectEmoji = (name: string) => {
+    if (/hotel|book/i.test(name)) return '🏨';
+    if (/food|market|shop|grocer/i.test(name)) return '🛒';
+    if (/music|audio|sound|beat|boomplay/i.test(name)) return '🎵';
+    if (/property|estate|rent|house/i.test(name)) return '🏠';
+    if (/calc/i.test(name)) return '🧮';
+    if (/weather/i.test(name)) return '🌤';
+    if (/social|chat|msg|messag/i.test(name)) return '💬';
+    if (/ai|studio|agent|vibe/i.test(name)) return '⚡';
+    if (/school|edu|kid|learn/i.test(name)) return '📚';
+    if (/health|medic|hospital/i.test(name)) return '🏥';
+    if (/sport|foot|basket|score/i.test(name)) return '⚽';
+    if (/logistics|delivery|transport/i.test(name)) return '🚚';
+    if (/travel|flight|trip/i.test(name)) return '✈️';
+    if (/money|payment|fintech|wallet/i.test(name)) return '💳';
+    if (/ghana|africa/i.test(name)) return '🌍';
+    return '📱';
+  };
+
   const isBusy = loading || editApplying || phase === 'building' || makeSearchWorking;
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
     <>
+      {/* ── Engine Build (Test) — Step 9, additive floating panel ───────────────── */}
+      {/* Developer Mode: this whole panel exposes raw engine internals — an
+          internal debugging tool, never meant for customers. Requires BOTH
+          VIEW_DEVELOPER_MODE (SUPER_ADMIN/future roles granted it) AND
+          debugMode currently ON, so a SUPER_ADMIN with Developer Mode off
+          sees the same clean customer interface as everyone else. */}
+      {myPermissions.has('VIEW_DEVELOPER_MODE') && debugMode && (
+      <div style={{ position: 'fixed', right: 16, bottom: 16, zIndex: 9999, fontFamily: 'system-ui,sans-serif' }}>
+        {!engineOpen && (
+          <button onClick={() => setEngineOpen(true)}
+            style={{ padding: '10px 16px', borderRadius: 10, border: '1px solid #6366f1', background: '#1e1b4b', color: '#c7d2fe', fontSize: 13, fontWeight: 700, cursor: 'pointer', boxShadow: '0 4px 14px rgba(0,0,0,0.45)' }}>
+            🧪 Engine Build (Test)
+          </button>
+        )}
+        {engineOpen && (
+          <div style={{ width: 390, maxHeight: '74vh', overflow: 'auto', background: '#0b1020', border: '1px solid #334155', borderRadius: 14, padding: 16, color: '#e2e8f0', boxShadow: '0 10px 40px rgba(0,0,0,0.6)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <strong style={{ fontSize: 14 }}>🧪 New Engine Build (Test)</strong>
+              <button onClick={() => setEngineOpen(false)} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 16 }}>✕</button>
+            </div>
+            <textarea value={enginePrompt} onChange={e => setEnginePrompt(e.target.value)} rows={3}
+              placeholder="Describe an app to build with the NEW engine — e.g. 'a clinic appointment booking app'"
+              style={{ width: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 8, padding: 8, fontSize: 13, resize: 'vertical' }} />
+            <button disabled={engineBusy || !enginePrompt.trim()}
+              onClick={() => {
+                // Real-time SSE stream — the UI reflects the LIVE backend stage and
+                // only shows FAILED on an actual failure, never on a client timeout.
+                setEngineBusy(true); setEngineError(''); setEngineReport(null); setEngineStage('Planning architecture');
+                engineEsRef.current?.close();
+                const STAGE_LABELS: Record<string, string> = {
+                  plan: 'Planning architecture', build: 'Building app (streaming + writing files)',
+                  verify: 'Verifying', repair: 'Repairing', preview: 'Starting preview server',
+                  learn: 'Saving learnings', done: 'Finishing up',
+                };
+                const es = new EventSource(`/api/engine-build-stream?prompt=${encodeURIComponent(enginePrompt.trim())}`);
+                engineEsRef.current = es;
+                es.addEventListener('stage', (e) => {
+                  try { const d = JSON.parse((e as MessageEvent).data); setEngineStage(STAGE_LABELS[d.stage] ?? d.message ?? d.stage); } catch { /* ignore */ }
+                });
+                es.addEventListener('report', (e) => {
+                  try { setEngineReport(JSON.parse((e as MessageEvent).data)); } catch { /* ignore */ }
+                });
+                // Server rejected a duplicate: a build for this project is already active.
+                es.addEventListener('busy', (e) => {
+                  let msg = 'A build is already running for this project.';
+                  try { const d = JSON.parse((e as MessageEvent).data); if (d?.message) msg = d.message; } catch { /* ignore */ }
+                  setEngineError(msg); setEngineBusy(false); setEngineStage('');
+                  es.close(); engineEsRef.current = null;
+                });
+                es.addEventListener('done', () => { setEngineBusy(false); setEngineStage(''); es.close(); engineEsRef.current = null; });
+                es.addEventListener('error', (e) => {
+                  // Server-sent 'error' event carries a message; a bare connection drop does not.
+                  const raw = (e as MessageEvent).data;
+                  if (raw) { try { const d = JSON.parse(raw); if (d?.error) setEngineError(d.error); } catch { /* ignore */ } }
+                  else if (engineBusy && !engineReport) setEngineError('Connection to engine stream lost.');
+                  setEngineBusy(false); setEngineStage(''); es.close(); engineEsRef.current = null;
+                });
+              }}
+              style={{ marginTop: 8, width: '100%', padding: '9px', borderRadius: 8, border: 'none', cursor: engineBusy ? 'wait' : 'pointer', background: 'linear-gradient(135deg,#8b5cf6,#6366f1)', color: '#fff', fontSize: 13, fontWeight: 700, opacity: (!enginePrompt.trim() && !engineBusy) ? 0.6 : 1 }}>
+              {engineBusy ? `Running… ${engineStage || 'starting'}` : 'Run Engine Build'}
+            </button>
+            {engineBusy && <div style={{ marginTop: 8, fontSize: 12, color: '#a78bfa' }}>⏳ {engineStage || 'Working…'} — live from the backend (won’t report failed while running)</div>}
+            {engineError && <div style={{ marginTop: 10, color: '#fca5a5', fontSize: 12 }}>❌ {engineError}</div>}
+            {engineReport && (
+              <div style={{ marginTop: 12, fontSize: 12, lineHeight: 1.6 }}>
+                {/* Four INDEPENDENT statuses — none gates the others. A verify/repair
+                    failure or timeout must never hide a preview that actually started. */}
+                {(() => {
+                  const badge = (label: string, value: string, ok: boolean | 'neutral') => (
+                    <span key={label} style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 4, padding: '3px 8px', borderRadius: 999,
+                      fontSize: 11, fontWeight: 700, marginRight: 6, marginBottom: 6,
+                      background: ok === 'neutral' ? '#1e293b' : ok ? 'rgba(34,197,94,0.15)' : 'rgba(248,113,113,0.15)',
+                      color: ok === 'neutral' ? '#94a3b8' : ok ? '#4ade80' : '#fca5a5',
+                      border: `1px solid ${ok === 'neutral' ? '#334155' : ok ? '#16a34a' : '#dc2626'}`,
+                    }}>
+                      {label}: {value}
+                    </span>
+                  );
+                  const bs = engineReport.buildStatus ?? (engineReport.build?.filesCreated?.length ? 'success' : 'failed');
+                  const ps = engineReport.previewStatus ?? (engineReport.previewUrl ? 'available' : 'unavailable');
+                  const vs = engineReport.verifyStatus ?? (engineReport.verify ? (engineReport.verify.passed ? 'passed' : 'failed') : 'not_run');
+                  const rs = engineReport.repairStatus ?? (engineReport.repair ? (engineReport.repair.resolved ? 'passed' : 'failed') : 'not_run');
+                  return (
+                    <div style={{ marginBottom: 6 }}>
+                      {badge('Build', bs, bs === 'success')}
+                      {badge('Preview', ps, ps === 'available')}
+                      {badge('Verify', vs, vs === 'not_run' ? 'neutral' : vs === 'passed')}
+                      {badge('Repair', rs.replace('_', ' '), rs === 'not_run' ? 'neutral' : rs === 'passed')}
+                    </div>
+                  );
+                })()}
+                <div style={{ color: '#94a3b8' }}>{engineReport.summary}</div>
+                {/* Open Preview — shown whenever a preview URL was produced. Independent
+                    of Verify/Repair status: humans need this link to manually test the
+                    generated app on localhost even when verification/repair failed. */}
+                {engineReport.previewUrl && (
+                  <a href={engineReport.previewUrl} target="_blank" rel="noopener noreferrer"
+                    style={{ display: 'inline-block', marginTop: 8, padding: '7px 14px', borderRadius: 8, background: 'linear-gradient(135deg,#22c55e,#16a34a)', color: '#fff', fontSize: 13, fontWeight: 700, textDecoration: 'none' }}>
+                    🔗 Open Preview
+                  </a>
+                )}
+                {!engineReport.previewUrl && engineReport.previewError && (
+                  <div style={{ marginTop: 8, color: '#fca5a5', fontSize: 12 }}>Preview not started: {engineReport.previewError}</div>
+                )}
+                <hr style={{ border: 'none', borderTop: '1px solid #1e293b', margin: '8px 0' }} />
+                <div><b>Planner:</b> {engineReport.intent ? `${engineReport.intent.appType} (${engineReport.intent.source}, conf ${engineReport.intent.confidence})` : '—'}</div>
+                <div><b>Pages planned:</b> {engineReport.plan ? engineReport.plan.pages.length : 0} · <b>Capabilities:</b> {engineReport.plan ? engineReport.plan.capabilities.join(', ') : '—'}</div>
+                <div><b>Builder:</b> {engineReport.build ? `${engineReport.build.filesCreated.length} files, fresh=${String(engineReport.build.isFreshFolder)}${engineReport.build.recoveredFromLooseFormat ? ', recovered' : ''}` : '—'}</div>
+                <div><b>Verifier:</b> {engineReport.verify ? `passed=${String(engineReport.verify.passed)} · routes ${engineReport.verify.routes.length} · deadLinks ${engineReport.verify.deadLinks.length} · 404s ${engineReport.verify.notFoundRoutes.length} · brokenImports ${engineReport.verify.brokenImports.length}` : '—'}</div>
+                <div><b>Workflows:</b> {engineReport.verify ? `${engineReport.verify.workflowTests.filter((w: { status: string }) => w.status === 'passed').length}/${engineReport.verify.workflowTests.length}` : '—'} · <b>Security:</b> {engineReport.verify ? String(engineReport.verify.securityPassed) : '—'} · <b>Perf OK:</b> {engineReport.verify ? String(engineReport.verify.performanceWithinBudget) : '—'}</div>
+                <div><b>Browser journey (Playwright):</b> {
+                  engineReport.verify?.browserJourney
+                    ? `${engineReport.verify.browserJourney.verdict} — ${engineReport.verify.browserJourney.summary}`
+                    : 'did not run (no live preview, or check unavailable)'
+                }</div>
+                <div><b>Repair attempts:</b> {engineReport.repair ? `${engineReport.repair.attempts}/${engineReport.repair.maxAttempts} (resolved=${String(engineReport.repair.resolved)})` : 'none'}</div>
+                <div><b>Learner:</b> {engineReport.success ? 'recorded (verified success)' : 'skipped'} · <b>External issues:</b> {engineReport.verify ? engineReport.verify.externalIssues.length : 0}</div>
+                {/* Developer Mode report fields — all sourced from data already
+                    present on engineReport/VerifyResult/RepairResult, no new
+                    backend computation. DB/API-change diffing and per-stage
+                    (verify/repair) timing are not computed anywhere today —
+                    intentionally omitted rather than improvised. */}
+                <hr style={{ border: 'none', borderTop: '1px solid #1e293b', margin: '8px 0' }} />
+                <div style={{ color: '#a78bfa', fontWeight: 700, marginBottom: 4 }}>Developer Mode</div>
+                <div><b>Root cause:</b> {
+                  engineReport.verify?.classifiedFailures?.length
+                    ? engineReport.verify.classifiedFailures.map((f: { message?: string; description?: string }) => f.message ?? f.description).filter(Boolean).join('; ')
+                    : engineReport.plan?.summary ?? '—'
+                }</div>
+                <div><b>Files changed:</b> {
+                  engineReport.repair?.changedFiles?.length ? engineReport.repair.changedFiles.join(', ') : 'none'
+                }</div>
+                <div><b>Routes affected:</b> {
+                  engineReport.verify
+                    ? [...(engineReport.verify.deadLinks ?? []), ...(engineReport.verify.notFoundRoutes ?? [])].join(', ') || 'none'
+                    : '—'
+                }</div>
+                <div><b>Remaining warnings:</b> {
+                  engineReport.repair?.remainingIssues?.length ? engineReport.repair.remainingIssues.join('; ') : 'none'
+                }</div>
+                <div><b>Build duration:</b> {
+                  engineReport.build?.startedAt && engineReport.build?.finishedAt
+                    ? `${Math.round((new Date(engineReport.build.finishedAt).getTime() - new Date(engineReport.build.startedAt).getTime()) / 1000)}s`
+                    : '—'
+                }</div>
+                <details style={{ marginTop: 8 }}>
+                  <summary style={{ cursor: 'pointer', color: '#a78bfa' }}>Execution logs</summary>
+                  <pre style={{ whiteSpace: 'pre-wrap', fontSize: 11, color: '#94a3b8', marginTop: 6 }}>{(engineReport.logs || []).join('\n')}</pre>
+                </details>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -6768,7 +8327,612 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         /* Live indicator dot */
         .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ide-green); display: inline-block; position: relative; }
         .live-dot::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: var(--ide-green); animation: statusPing 1.5s ease-out infinite; }
+
+        /* ── Mobile workspace — premium native feel ── */
+        .mob-ws { position: fixed; top: 0; left: 0; right: 0; overflow: hidden; touch-action: pan-y; overscroll-behavior: none; -webkit-overflow-scrolling: auto; }
+        .mob-ws * { -webkit-tap-highlight-color: transparent; }
+        @keyframes mobIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+        .mob-screen { animation: mobIn 0.22s cubic-bezier(0.25,0.46,0.45,0.94) both; }
+        .mob-nav-btn { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; flex:1; background:none; border:none; cursor:pointer; transition:color 0.18s, border-color 0.18s; position:relative; user-select:none; }
+        .mob-nav-btn:active { opacity:0.65; }
+        .mob-tab-btn { background:none; border:none; border-bottom:2px solid transparent; cursor:pointer; white-space:nowrap; display:flex; align-items:center; gap:5px; transition:all 0.18s; user-select:none; }
+        .mob-card { width:100%; background:rgba(13,19,32,0.95); border:1px solid rgba(255,255,255,0.07); border-radius:14px; cursor:pointer; text-align:left; display:flex; align-items:center; gap:12px; transition:background 0.15s, border-color 0.15s, transform 0.1s; user-select:none; }
+        .mob-card:active { transform:scale(0.98) !important; background:rgba(99,102,241,0.08) !important; }
+        .mob-chip { display:inline-flex; align-items:center; padding:8px 14px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:20px; color:#94a3b8; font-size:13px; cursor:pointer; white-space:nowrap; transition:all 0.18s; user-select:none; font-family:inherit; }
+        .mob-chip:active { background:rgba(99,102,241,0.12); border-color:rgba(99,102,241,0.3); color:#a5b4fc; transform:scale(0.97); }
+        .mob-tpl-card { flex-shrink:0; width:148px; padding:14px; background:rgba(13,19,32,0.95); border:1px solid rgba(255,255,255,0.07); border-radius:14px; cursor:pointer; transition:all 0.18s; user-select:none; text-align:left; }
+        .mob-tpl-card:active { border-color:rgba(99,102,241,0.4); background:rgba(99,102,241,0.07); transform:scale(0.96); }
+        .mob-section-hdr { font-size:10px; font-weight:700; color:#334155; text-transform:uppercase; letter-spacing:0.09em; margin-bottom:10px; }
+        .mob-scroll-x { overflow-x:auto; scrollbar-width:none; -ms-overflow-style:none; }
+        .mob-scroll-x::-webkit-scrollbar { display:none; }
+        .mob-scroll-y { overflow-y:auto; -webkit-overflow-scrolling:touch; }
       `}</style>
+      {isMobile ? (
+        /* ── MOBILE WORKSPACE ── */
+        <div
+          className="mob-ws"
+          style={{
+            bottom: mobileKbOffset > 0 ? `${mobileKbOffset}px` : 0,
+            background: '#080c14',
+            color: '#e2e8f0',
+            display: 'flex',
+            flexDirection: 'column',
+            fontFamily: '"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+            transition: 'bottom 0.2s cubic-bezier(0.4,0,0.2,1)',
+          }}
+        >
+          {/* ── HEADER — collapses when keyboard visible ── */}
+          <div style={{
+            flexShrink: 0,
+            height: (mobileFocused && mobileKbOffset > 50) ? 0 : 52,
+            overflow: 'hidden',
+            transition: 'height 0.22s cubic-bezier(0.4,0,0.2,1)',
+            background: 'rgba(10,14,26,0.98)',
+            borderBottom: '1px solid rgba(255,255,255,0.06)',
+            display: 'flex', alignItems: 'center',
+            padding: '0 14px', gap: 10,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+              <div style={{ width: 28, height: 28, borderRadius: 8, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, fontWeight: 800, color: '#fff', flexShrink: 0, boxShadow: '0 2px 10px rgba(99,102,241,0.4)' }}>V</div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.2 }}>
+                  {currentProject ? currentProject.name : 'DWOMOH Vibe Code'}
+                </div>
+                {currentProject && (
+                  <div style={{ fontSize: 10, color: phase === 'building' ? '#f59e0b' : previewUrl ? '#22d3a0' : '#334155', lineHeight: 1.2, fontWeight: 600 }}>
+                    {phase === 'building' ? '● Building…' : previewUrl ? '● Live' : '○ Ready'}
+                  </div>
+                )}
+              </div>
+            </div>
+            {mobileTab === 'chat' && previewUrl && (
+              <button onClick={() => setMobileTab('preview')} style={{ padding: '5px 12px', background: 'rgba(34,211,160,0.1)', border: '1px solid rgba(34,211,160,0.25)', borderRadius: 20, color: '#22d3a0', fontSize: 11, fontWeight: 700, cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <span className="live-dot" /> Preview
+              </button>
+            )}
+            {phase === 'building' && mobileTab !== 'chat' && (
+              <button onClick={() => setMobileTab('chat')} style={{ padding: '5px 10px', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: 20, color: '#f59e0b', fontSize: 11, fontWeight: 700, cursor: 'pointer', flexShrink: 0, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', animation: 'pulse 1s ease-in-out infinite' }} /> Building
+              </button>
+            )}
+          </div>
+
+          {/* ── AI ACTIVITY TIMELINE ── */}
+          {(phase === 'building' || editApplying) && (() => {
+            const stages = [
+              { label: 'Understanding', icon: '◎' },
+              { label: 'Inspecting',    icon: '◈' },
+              { label: 'Planning',      icon: '⊡' },
+              { label: 'Editing',       icon: '✎' },
+              { label: 'Testing',       icon: '⟳' },
+              { label: 'Preview',       icon: '▶' },
+              { label: 'Deploying',     icon: '⊕' },
+              { label: 'Verifying',     icon: '✓' },
+              { label: 'Done',          icon: '✦' },
+            ];
+            const stepIdx: Record<string, number> = { idle: 0, checking: 1, reading: 2, building: 3, installing: 4, testing: 5, done: 8 };
+            const cur = editApplying ? 3 : (buildProgress ? (stepIdx[buildProgress.step] ?? 3) : 0);
+            return (
+              <div className="mob-scroll-x" style={{ flexShrink: 0, background: 'rgba(7,9,20,0.98)', borderBottom: '1px solid rgba(255,255,255,0.05)', padding: '7px 14px' }}>
+                <div style={{ display: 'flex', gap: 3, alignItems: 'center', minWidth: 'max-content' }}>
+                  {stages.map((s, i) => {
+                    const done = i < cur; const active = i === cur;
+                    return (
+                      <div key={s.label} style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 9px', borderRadius: 20, background: done ? 'rgba(34,211,160,0.1)' : active ? 'rgba(99,102,241,0.18)' : 'rgba(255,255,255,0.03)', border: `1px solid ${done ? 'rgba(34,211,160,0.25)' : active ? 'rgba(99,102,241,0.4)' : 'transparent'}`, boxShadow: active ? '0 0 10px rgba(99,102,241,0.18)' : 'none', transition: 'all 0.3s' }}>
+                          <span style={{ fontSize: 9, color: done ? '#22d3a0' : active ? '#a5b4fc' : '#1e3a5f' }}>{s.icon}</span>
+                          <span style={{ fontSize: 9, fontWeight: 700, color: done ? '#22d3a0' : active ? '#c4b5fd' : '#334155', whiteSpace: 'nowrap' }}>{s.label}</span>
+                          {active && <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#6366f1', animation: 'pulse 1s ease-in-out infinite' }} />}
+                        </div>
+                        {i < stages.length - 1 && <div style={{ width: 7, height: 1, background: done ? 'rgba(34,211,160,0.25)' : 'rgba(255,255,255,0.05)', flexShrink: 0 }} />}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* ── SCREEN AREA ── */}
+          <div style={{ flex: 1, overflow: 'hidden', position: 'relative', minHeight: 0 }}>
+
+            {/* PROJECT LIBRARY */}
+            {mobileTab === 'library' && (
+              <div className="mob-screen mob-scroll-y" style={{ height: '100%', padding: '16px 16px 8px' } as React.CSSProperties}>
+                <div style={{ position: 'relative', marginBottom: 12 }}>
+                  <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: '#334155', fontSize: 14, pointerEvents: 'none' }}>⌕</span>
+                  <input value={mobileSearchQuery} onChange={e => setMobileSearchQuery(e.target.value)} placeholder="Search projects and templates…"
+                    style={{ width: '100%', boxSizing: 'border-box', padding: '11px 12px 11px 36px', background: 'rgba(15,21,35,0.95)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 12, color: '#e2e8f0', fontSize: 13, outline: 'none' } as React.CSSProperties} />
+                </div>
+                <button onClick={() => { handleNewProject(); setMobileTab('chat'); }}
+                  style={{ width: '100%', padding: '14px', marginBottom: 20, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', color: '#fff', border: 'none', borderRadius: 14, cursor: 'pointer', fontSize: 15, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center', boxShadow: '0 6px 24px rgba(99,102,241,0.32)', letterSpacing: '-0.01em' }}>
+                  <span style={{ fontSize: 20, lineHeight: 1, fontWeight: 300 }}>+</span> Start New Project
+                </button>
+
+                {mobileSearchQuery ? (
+                  <>
+                    <div className="mob-section-hdr">{projects.filter(p => p.name.toLowerCase().includes(mobileSearchQuery.toLowerCase())).length} results</div>
+                    {projects.filter(p => p.name.toLowerCase().includes(mobileSearchQuery.toLowerCase())).map(project => (
+                      <button key={project.id} onClick={() => { handleOpenProject(project); setMobileTab('chat'); }} className="mob-card" style={{ padding: '13px 14px', marginBottom: 8 }}>
+                        <div style={{ width: 40, height: 40, borderRadius: 10, flexShrink: 0, background: 'linear-gradient(135deg,rgba(99,102,241,0.2),rgba(139,92,246,0.2))', border: '1px solid rgba(99,102,241,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>{getProjectEmoji(project.name)}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</div>
+                          <div style={{ fontSize: 11, color: '#475569', marginTop: 1 }}>{project.createdAt ? new Date(project.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'Recent'}</div>
+                        </div>
+                        <div style={{ fontSize: 11, color: '#6366f1', fontWeight: 700, padding: '4px 10px', background: 'rgba(99,102,241,0.1)', borderRadius: 6 }}>Open →</div>
+                      </button>
+                    ))}
+                    {projects.filter(p => p.name.toLowerCase().includes(mobileSearchQuery.toLowerCase())).length === 0 && (
+                      <div style={{ textAlign: 'center', padding: '32px 0', color: '#334155', fontSize: 13 }}>No matching projects</div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {projects.length > 0 && (
+                      <>
+                        <div className="mob-section-hdr">Recent Projects</div>
+                        {projects.sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? '')).slice(0, 6).map(project => (
+                          <button key={project.id} onClick={() => { handleOpenProject(project); setMobileTab('chat'); }} className="mob-card"
+                            style={{ padding: '13px 14px', marginBottom: 8, borderColor: currentProject?.id === project.id ? 'rgba(99,102,241,0.4)' : 'rgba(255,255,255,0.07)', background: currentProject?.id === project.id ? 'rgba(99,102,241,0.08)' : 'rgba(13,19,32,0.95)' }}>
+                            <div style={{ width: 42, height: 42, borderRadius: 11, flexShrink: 0, background: 'linear-gradient(135deg,rgba(99,102,241,0.18),rgba(139,92,246,0.18))', border: '1px solid rgba(99,102,241,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20 }}>{getProjectEmoji(project.name)}</div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{project.name}</div>
+                              <div style={{ fontSize: 11, color: '#475569', marginTop: 2 }}>{project.createdAt ? new Date(project.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' }) : 'Recently created'}</div>
+                            </div>
+                            {currentProject?.id === project.id
+                              ? <div style={{ fontSize: 10, color: '#22d3a0', fontWeight: 700, padding: '3px 8px', background: 'rgba(34,211,160,0.1)', borderRadius: 6, flexShrink: 0 }}>Active</div>
+                              : <div style={{ fontSize: 11, color: '#6366f1', fontWeight: 700, padding: '4px 10px', background: 'rgba(99,102,241,0.1)', borderRadius: 6, flexShrink: 0 }}>Open →</div>
+                            }
+                          </button>
+                        ))}
+                        <div style={{ marginBottom: 22 }} />
+                      </>
+                    )}
+
+                    <div className="mob-section-hdr">Popular Templates</div>
+                    <div className="mob-scroll-x" style={{ display: 'flex', gap: 10, paddingBottom: 4, marginBottom: 22 }}>
+                      {[
+                        { emoji: '🏠', name: 'Property App', desc: 'Listings + Paystack', prompt: 'Build a property marketplace for Ghana with listings, search filters, and Paystack payments' },
+                        { emoji: '🏨', name: 'Hotel Booking', desc: 'Calendar + checkout', prompt: 'Create a hotel booking platform with room calendar, availability, and Stripe checkout' },
+                        { emoji: '💬', name: 'Social Network', desc: 'Feed + DMs', prompt: 'Generate a social network with news feed, follow system, direct messages, and user profiles' },
+                        { emoji: '🛒', name: 'E-commerce', desc: 'Products + cart', prompt: 'Build an e-commerce store with product listings, shopping cart, and Paystack checkout' },
+                        { emoji: '🎵', name: 'Music Platform', desc: 'Streaming + artists', prompt: 'Create a music streaming platform with playlists, audio player, and artist profiles' },
+                        { emoji: '⚡', name: 'AI Dashboard', desc: 'Analytics + charts', prompt: 'Build an AI analytics dashboard with charts, data tables, and real-time metrics' },
+                      ].map(t => (
+                        <button key={t.name} className="mob-tpl-card" onClick={() => { handleNewProject(); setInput(t.prompt); setMobileTab('chat'); }}>
+                          <div style={{ fontSize: 28, marginBottom: 9 }}>{t.emoji}</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0', marginBottom: 3, lineHeight: 1.3 }}>{t.name}</div>
+                          <div style={{ fontSize: 10, color: '#475569' }}>{t.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="mob-section-hdr">Quick Actions</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 24 }}>
+                      {[
+                        { icon: '⊕', label: 'Import from GitHub', sub: 'Coming soon', action: () => { addMsg('assistant', 'GitHub import is coming soon. Describe your project idea and I\'ll build it from scratch.'); setMobileTab('chat'); } },
+                        { icon: '⊟', label: 'Browse all projects', sub: `${projects.length} projects`, action: () => setMobileSearchQuery(' ') },
+                      ].map(a => (
+                        <button key={a.label} onClick={a.action}
+                          style={{ width: '100%', padding: '13px 14px', background: 'rgba(13,19,32,0.95)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12, transition: 'all 0.15s' } as React.CSSProperties}>
+                          <span style={{ fontSize: 18, color: '#334155', flexShrink: 0 }}>{a.icon}</span>
+                          <div style={{ textAlign: 'left' }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, color: '#94a3b8' }}>{a.label}</div>
+                            <div style={{ fontSize: 11, color: '#334155' }}>{a.sub}</div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    {projects.length === 0 && (
+                      <div style={{ textAlign: 'center', padding: '24px 16px' }}>
+                        <div style={{ width: 56, height: 56, borderRadius: 16, background: 'linear-gradient(135deg,rgba(99,102,241,0.18),rgba(139,92,246,0.18))', border: '1px solid rgba(99,102,241,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, margin: '0 auto 12px' }}>✦</div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: '#e2e8f0', marginBottom: 6 }}>Start building</div>
+                        <div style={{ fontSize: 13, color: '#475569', lineHeight: 1.6 }}>Pick a template above or tap New Project to describe your idea.</div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* AI WORKSPACE / CHAT */}
+            {mobileTab === 'chat' && (
+              <div className="mob-screen" style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <div className="mob-scroll-y" style={{ flex: 1, padding: '14px 14px 6px' } as React.CSSProperties}>
+                  {/* Goal-first flow — mobile */}
+                  {goalStep === 'type' && !currentProject && displayed.length === 0 && !buildProgress && (
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '65%', padding: '16px 0' }}>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: '#e2e8f0', marginBottom: 8, letterSpacing: '-0.03em', textAlign: 'center' }}>What would you like to build?</div>
+                      <div style={{ fontSize: 13, color: '#475569', marginBottom: 28, textAlign: 'center', lineHeight: 1.6 }}>Choose your output type.</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%', maxWidth: 280 }}>
+                        {[
+                          { icon: '🌐', label: 'Website', sub: 'Marketplace, SaaS, dashboard, booking, portfolio', action: () => handleGoalSelect('website') },
+                          { icon: '📱', label: 'Mobile App', sub: 'Android & iPhone — Flutter or native', action: () => handleGoalSelect('mobile') },
+                        ].map(opt => (
+                          <button key={opt.label} onClick={opt.action} style={{ padding: '18px 20px', background: 'rgba(13,19,32,0.95)', border: '1.5px solid rgba(255,255,255,0.08)', borderRadius: 16, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 14, width: '100%', textAlign: 'left' }}>
+                            <span style={{ fontSize: 28, lineHeight: 1, flexShrink: 0 }}>{opt.icon}</span>
+                            <div>
+                              <div style={{ fontSize: 15, fontWeight: 800, color: '#e2e8f0', marginBottom: 3 }}>{opt.label}</div>
+                              <div style={{ fontSize: 11, color: '#475569', lineHeight: 1.5 }}>{opt.sub}</div>
+                            </div>
+                            <span style={{ marginLeft: 'auto', color: '#334155', fontSize: 16 }}>›</span>
+                          </button>
+                        ))}
+                      </div>
+                      <div style={{ marginTop: 22, fontSize: 12, color: '#334155', textAlign: 'center' }}>Or type your idea below</div>
+                    </div>
+                  )}
+                  {goalStep === 'mobile-tech' && !currentProject && displayed.length === 0 && !buildProgress && (
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '65%', padding: '16px 0' }}>
+                      <button onClick={() => setGoalStep('type')} style={{ alignSelf: 'flex-start', background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: 13, marginBottom: 20, display: 'flex', alignItems: 'center', gap: 5 }}>← Back</button>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: '#e2e8f0', marginBottom: 8, textAlign: 'center' }}>Choose Mobile Technology</div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%', maxWidth: 300 }}>
+                        {[
+                          { icon: '🦋', label: 'Flutter', sub: 'One app for both Android and iPhone.', badge: 'Recommended', action: () => { handleMobileTechSelect('flutter'); setMobileTab('chat'); } },
+                          { icon: '🤖', label: 'Native Android', sub: 'Kotlin app for Android only.', badge: '', action: () => { handleMobileTechSelect('android'); setMobileTab('chat'); } },
+                          { icon: '🍎', label: 'Native iPhone', sub: 'Swift app for iPhone only.', badge: '', action: () => { handleMobileTechSelect('ios'); setMobileTab('chat'); } },
+                        ].map(opt => (
+                          <button key={opt.label} onClick={opt.action} style={{ padding: '14px 16px', background: opt.badge ? 'rgba(99,102,241,0.08)' : 'rgba(13,19,32,0.95)', border: `1.5px solid ${opt.badge ? 'rgba(99,102,241,0.3)' : 'rgba(255,255,255,0.07)'}`, borderRadius: 14, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12, width: '100%', textAlign: 'left', position: 'relative' } as React.CSSProperties}>
+                            {opt.badge && <span style={{ position: 'absolute', top: -8, right: 12, background: '#6366f1', color: '#fff', fontSize: 9, fontWeight: 800, padding: '2px 8px', borderRadius: 10 }}>{opt.badge}</span>}
+                            <span style={{ fontSize: 24, lineHeight: 1, flexShrink: 0 }}>{opt.icon}</span>
+                            <div>
+                              <div style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', marginBottom: 2 }}>{opt.label}</div>
+                              <div style={{ fontSize: 11, color: '#475569' }}>{opt.sub}</div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Platform recommendation banner — mobile */}
+                  {buildRecommendation && pendingBuildPrompt && (
+                    <div style={{ marginBottom: 14, padding: '14px 16px', background: 'rgba(99,102,241,0.1)', border: '1.5px solid rgba(99,102,241,0.3)', borderRadius: 16 }}>
+                      <div style={{ fontSize: 12, color: '#a5b4fc', fontWeight: 800, marginBottom: 5, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span>{buildRecommendation.icon}</span> Platform Recommendation
+                      </div>
+                      <div style={{ fontSize: 14, color: '#e2e8f0', fontWeight: 700, marginBottom: 4 }}>
+                        {buildRecommendation.platform === 'flutter' ? '📱 Mobile App — Flutter' : '🌐 Website'}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.6, marginBottom: 12 }}>{buildRecommendation.reason}</div>
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        <button onClick={() => {
+                          const h = [...history];
+                          if (buildRecommendation.platform === 'flutter') setBuildTarget('flutter'); else setBuildTarget('web');
+                          const prompt = pendingBuildPrompt;
+                          setBuildRecommendation(null); setPendingBuildPrompt(null);
+                          if (bridgeTestMode) { runBridgeOnlyPipeline(prompt ?? ''); }
+                          else if (buildRecommendation.platform === 'flutter') runFlutterBuildPipeline(h, prompt); else runBuildPipeline(h, prompt);
+                        }} style={{ flex: 1, padding: '10px 16px', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', border: 'none', borderRadius: 10, color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer', minWidth: 0 }}>
+                          ✓ Accept
+                        </button>
+                        <button onClick={() => {
+                          const prompt = pendingBuildPrompt;
+                          setBuildRecommendation(null); setPendingBuildPrompt(null);
+                          if (bridgeTestMode) { runBridgeOnlyPipeline(prompt ?? ''); }
+                          else if (buildTarget === 'flutter') runFlutterBuildPipeline(history, prompt); else runBuildPipeline(history, prompt);
+                        }} style={{ padding: '10px 16px', background: 'transparent', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 10, color: '#94a3b8', fontSize: 13, cursor: 'pointer' }}>
+                          Keep current
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {goalStep === 'idle' && displayed.length === 0 && !buildProgress && !buildRecommendation && (
+                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '65%', padding: '20px 0' }}>
+                      <div style={{ width: 62, height: 62, borderRadius: 18, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28, fontWeight: 800, color: '#fff', marginBottom: 16, boxShadow: '0 8px 32px rgba(99,102,241,0.28)' }}>V</div>
+                      <div style={{ fontSize: 19, fontWeight: 800, color: '#e2e8f0', marginBottom: 6, letterSpacing: '-0.03em', textAlign: 'center' }}>
+                        {currentProject ? `Editing ${currentProject.name}` : 'What do you want to build?'}
+                      </div>
+                      <div style={{ fontSize: 13, color: '#475569', marginBottom: 22, textAlign: 'center', lineHeight: 1.6, maxWidth: 280 }}>
+                        {currentProject ? 'Describe a change, fix, or new feature.' : 'Describe your idea — I\'ll build it, install dependencies, and start the preview.'}
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+                        {(currentProject
+                          ? ['Fix all bugs', 'Improve the UI', 'Add authentication', 'Add payments', 'Add a search feature', 'Make it mobile-friendly']
+                          : ['Ghana property marketplace with Paystack', 'Hotel booking with calendar', 'Social network with DMs', 'E-commerce store', 'Music streaming platform', 'AI analytics dashboard']
+                        ).map(s => (
+                          <button key={s} className="mob-chip" onClick={() => { setInput(s); inputRef.current?.focus(); }}>{s}</button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {displayed.map((msg, i) => {
+                    if (msg.role === 'status') return (
+                      <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '4px 0', animation: 'slidein 0.2s ease' }}>
+                        <div style={{ width: 18, height: 18, borderRadius: '50%', background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.22)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1, fontSize: 8, color: '#6366f1' }}>◈</div>
+                        <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.6, flex: 1 }}>{msg.content}</div>
+                      </div>
+                    );
+                    if (msg.role === 'user') return (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10, animation: 'slidein 0.2s ease' }}>
+                        <div style={{ maxWidth: '82%', padding: '11px 15px', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', borderRadius: '18px 18px 4px 18px', fontSize: 14, color: '#fff', lineHeight: 1.55, boxShadow: '0 2px 12px rgba(99,102,241,0.28)' }}>{msg.content}</div>
+                      </div>
+                    );
+                    const isLast = i === displayed.length - 1;
+                    const text = isLast && streamingMsg ? streamingMsg : msg.content;
+                    return (
+                      <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 12, animation: 'slidein 0.2s ease' }}>
+                        <div style={{ width: 28, height: 28, borderRadius: 9, background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 800, color: '#fff', flexShrink: 0, marginTop: 1, boxShadow: '0 2px 8px rgba(99,102,241,0.25)' }}>V</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 14, color: '#e2e8f0', lineHeight: 1.65, background: 'rgba(15,21,35,0.8)', padding: '11px 14px', borderRadius: '4px 16px 16px 16px', border: '1px solid rgba(255,255,255,0.06)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{text}</div>
+                          {isLast && streamingMsg && <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#6366f1', display: 'inline-block', marginLeft: 6, marginTop: 5, animation: 'pulse 1s ease-in-out infinite' }} />}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {buildProgress && (
+                    <div style={{ marginBottom: 12, padding: '12px 14px', background: 'rgba(13,19,32,0.95)', border: '1px solid rgba(99,102,241,0.22)', borderRadius: 14, animation: 'slidein 0.2s ease' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                        <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#6366f1', animation: 'pulse 1s ease-in-out infinite', flexShrink: 0 }} />
+                        <div style={{ fontSize: 12, fontWeight: 700, color: '#a5b4fc' }}>{buildProgress.message || 'Building…'}</div>
+                      </div>
+                      <div style={{ height: 3, background: 'rgba(255,255,255,0.06)', borderRadius: 2 }}>
+                        <div style={{ height: '100%', borderRadius: 2, background: 'linear-gradient(90deg,#6366f1,#8b5cf6)', width: buildProgress.step === 'done' ? '100%' : `${Math.max(8, Math.min(90, buildProgress.logs.length * 5))}%`, transition: 'width 0.5s ease' }} />
+                      </div>
+                      {buildProgress.logs.length > 0 && (
+                        <div style={{ fontSize: 10, color: '#334155', marginTop: 6, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{buildProgress.logs[buildProgress.logs.length - 1]}</div>
+                      )}
+                    </div>
+                  )}
+
+                  <div ref={messagesEndRef} />
+                </div>
+
+                <div style={{ flexShrink: 0, padding: '8px 12px 10px', borderTop: '1px solid rgba(255,255,255,0.05)', background: 'rgba(10,14,26,0.98)' }}>
+                  <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }} onChange={e => handleFileSelect(e.target.files)} />
+                  <form onSubmit={handleSubmit}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                      <div style={{ flex: 1, display: 'flex', alignItems: 'flex-end', background: 'rgba(15,21,35,0.95)', border: `1.5px solid ${composerFocused ? 'rgba(99,102,241,0.65)' : 'rgba(255,255,255,0.07)'}`, borderRadius: 16, overflow: 'hidden', transition: 'border-color 0.2s, box-shadow 0.2s', boxShadow: composerFocused ? '0 0 0 3px rgba(99,102,241,0.1)' : 'none' }}>
+                        <textarea
+                          ref={inputRef}
+                          value={input}
+                          onChange={e => { setInput(e.target.value); const el = e.target; el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); const f = e.currentTarget.closest('form'); if (f) (f as HTMLFormElement).requestSubmit(); } }}
+                          onFocus={() => { setComposerFocused(true); setMobileFocused(true); }}
+                          onBlur={() => { setComposerFocused(false); setTimeout(() => setMobileFocused(false), 300); }}
+                          placeholder={currentProject ? 'Describe a change…' : 'Describe what you want to build…'}
+                          disabled={phase === 'building' || editApplying}
+                          rows={1}
+                          style={{ flex: 1, minHeight: 46, maxHeight: 120, padding: '13px 12px', background: 'transparent', color: '#e2e8f0', fontSize: 15, lineHeight: 1.5, outline: 'none', resize: 'none', border: 'none', fontFamily: 'inherit', display: 'block', opacity: (phase === 'building' || editApplying) ? 0.4 : 1 } as React.CSSProperties}
+                        />
+                        <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px 7px', gap: 0 }}>
+                          <button type="button" onClick={() => fileInputRef.current?.click()} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#334155', fontSize: 18, padding: '5px 6px', borderRadius: 8, lineHeight: 1 }}>📎</button>
+                          <button type="button" onClick={isRecording ? stopVoiceInput : startVoiceInput} style={{ background: isRecording ? 'rgba(239,68,68,0.12)' : 'none', border: 'none', cursor: 'pointer', color: isRecording ? '#ef4444' : '#334155', fontSize: 18, padding: '5px 6px', borderRadius: 8, lineHeight: 1 }}>
+                            {isRecording ? '🔴' : '🎤'}
+                          </button>
+                        </div>
+                      </div>
+                      <button type="submit" disabled={isBusy || !input.trim()}
+                        style={{ width: 46, height: 46, flexShrink: 0, borderRadius: 14, background: isBusy || !input.trim() ? 'rgba(99,102,241,0.14)' : 'linear-gradient(135deg,#6366f1,#8b5cf6)', border: 'none', cursor: isBusy || !input.trim() ? 'not-allowed' : 'pointer', color: '#fff', fontSize: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.18s', boxShadow: isBusy || !input.trim() ? 'none' : '0 4px 16px rgba(99,102,241,0.32)' }}>
+                        {isBusy ? <span style={{ fontSize: 14, animation: 'spin 1s linear infinite', display: 'inline-block' }}>◌</span> : '↑'}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            )}
+
+            {/* LIVE PREVIEW */}
+            {mobileTab === 'preview' && (
+              <div className="mob-screen" style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#040810' }}>
+                {previewUrl && !previewLoading && (
+                  <div style={{ flexShrink: 0, height: 38, background: 'rgba(10,14,26,0.98)', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'flex', alignItems: 'center', padding: '0 14px', gap: 8 }}>
+                    <span className="live-dot" />
+                    <span style={{ fontSize: 11, color: '#22d3a0', fontWeight: 700, flex: 1 }}>Live Preview</span>
+                    <a href={previewUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: '#475569', fontWeight: 600, textDecoration: 'none', display: 'flex', alignItems: 'center', gap: 3 }}>Open ↗</a>
+                  </div>
+                )}
+                {previewUrl ? (
+                  previewLoading ? (
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 14 }}>
+                      <div style={{ width: 40, height: 40, borderRadius: '50%', border: '3px solid rgba(99,102,241,0.2)', borderTopColor: '#6366f1', animation: 'spin 0.8s linear infinite' }} />
+                      <div style={{ fontSize: 13, color: '#475569' }}>Loading preview…</div>
+                    </div>
+                  ) : (
+                    <iframe key={previewKey} src={previewUrl} style={{ flex: 1, border: 'none', width: '100%', background: '#fff' }} allow="same-origin" title="App Preview" />
+                  )
+                ) : (
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, padding: 24 }}>
+                    <div style={{ width: 64, height: 64, borderRadius: 20, background: 'linear-gradient(135deg,rgba(99,102,241,0.14),rgba(139,92,246,0.14))', border: '1px solid rgba(99,102,241,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 28 }}>▶</div>
+                    <div style={{ textAlign: 'center' }}>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: '#e2e8f0', marginBottom: 8 }}>No preview yet</div>
+                      <div style={{ fontSize: 13, color: '#475569', marginBottom: 20, lineHeight: 1.6, maxWidth: 260 }}>Build a project first. The live preview appears here automatically after generation.</div>
+                      <button onClick={() => setMobileTab('chat')} style={{ padding: '11px 24px', background: 'rgba(99,102,241,0.14)', border: '1px solid rgba(99,102,241,0.3)', borderRadius: 12, color: '#a5b4fc', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>Go to AI Chat</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* DEVELOPER TOOLS */}
+            {mobileTab === 'tools' && (
+              <div className="mob-screen" style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                <div className="mob-scroll-x" style={{ flexShrink: 0, borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', padding: '0 10px', background: 'rgba(10,14,26,0.98)' } as React.CSSProperties}>
+                  {([
+                    { id: 'terminal', label: 'Terminal', icon: '_' },
+                    { id: 'logs',     label: 'Logs',     icon: '≡' },
+                    { id: 'deploy',   label: 'Deploy',   icon: '⊕' },
+                    { id: 'files',    label: 'Files',    icon: '⊟' },
+                    { id: 'database', label: 'Database', icon: '◩' },
+                  ] as const).map(t => (
+                    <button key={t.id} onClick={() => setMobileToolsSection(t.id)} className="mob-tab-btn"
+                      style={{ padding: '11px 14px', color: mobileToolsSection === t.id ? '#e2e8f0' : '#475569', fontSize: 12, fontWeight: 600, borderBottom: `2px solid ${mobileToolsSection === t.id ? '#6366f1' : 'transparent'}` }}>
+                      <span style={{ fontFamily: 'monospace', fontSize: 10 }}>{t.icon}</span> {t.label}
+                    </button>
+                  ))}
+                </div>
+                <div style={{ flex: 1, overflow: 'hidden' }}>
+
+                  {mobileToolsSection === 'terminal' && (
+                    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#02060e', fontFamily: '"JetBrains Mono","Fira Code",monospace', fontSize: 12 }}>
+                      <div className="mob-scroll-y" style={{ flex: 1, padding: '12px 14px' } as React.CSSProperties}>
+                        {terminalLogs.length === 0 && <div style={{ color: '#334155' }}>$ <span style={{ color: '#1e3a5f' }}>Terminal ready.</span></div>}
+                        {terminalLogs.map((l, i) => <div key={i} style={{ color: l.startsWith('$ ') ? '#60a5fa' : l.startsWith('❌') ? '#f87171' : l.startsWith('✅') ? '#4ade80' : '#64748b', marginBottom: 2, lineHeight: 1.6, wordBreak: 'break-all', fontSize: 11 }}>{l}</div>)}
+                        {terminalRunning && <div style={{ color: '#fbbf24', animation: 'pulse 1s ease-in-out infinite' }}>Running…</div>}
+                      </div>
+                      <form onSubmit={async e => { e.preventDefault(); const cmd = terminalInput.trim(); if (!cmd || terminalRunning || !currentProject) return; setTerminalInput(''); setTerminalLogs(l => [...l, `$ ${cmd}`]); setTerminalRunning(true); try { const r = await api({ action: 'run-command', projectPath: currentProject.projectPath, command: cmd }); setTerminalLogs(l => [...l, ...(r.output || ['(no output)']).slice(0, 50)]); if (r.exitCode !== 0) setTerminalLogs(l => [...l, `❌ Exit ${r.exitCode}`]); } catch (err) { setTerminalLogs(l => [...l, `❌ ${err instanceof Error ? err.message : 'Error'}`]); } finally { setTerminalRunning(false); } }}
+                        style={{ display: 'flex', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.05)', padding: '8px 12px', gap: 8, background: 'rgba(2,6,14,0.98)' }}>
+                        <span style={{ color: '#22d3a0', fontFamily: 'monospace', fontSize: 13, flexShrink: 0 }}>❯</span>
+                        <input value={terminalInput} onChange={e => setTerminalInput(e.target.value)} placeholder={currentProject ? 'npm run build, ls…' : 'Open a project first'} disabled={terminalRunning || !currentProject}
+                          style={{ flex: 1, background: 'none', border: 'none', color: '#e2e8f0', fontFamily: 'inherit', fontSize: 12, outline: 'none', opacity: !currentProject ? 0.3 : 1 } as React.CSSProperties} />
+                        <button type="submit" disabled={terminalRunning || !currentProject || !terminalInput.trim()} style={{ padding: '5px 12px', background: '#1e3a5f', border: 'none', borderRadius: 6, color: '#60a5fa', cursor: 'pointer', fontSize: 11, fontWeight: 700, opacity: terminalRunning || !currentProject || !terminalInput.trim() ? 0.4 : 1 }}>Run</button>
+                      </form>
+                    </div>
+                  )}
+
+                  {mobileToolsSection === 'logs' && (
+                    <div className="mob-scroll-y" style={{ height: '100%', padding: '12px 14px', background: '#02060e', fontFamily: 'monospace', fontSize: 11, lineHeight: 1.7 } as React.CSSProperties}>
+                      {buildProgress ? (
+                        <>{buildProgress.logs.map((l, i) => <div key={i} style={{ color: l.startsWith('❌') ? '#f87171' : l.startsWith('✅') ? '#4ade80' : l.startsWith('⚠️') ? '#fbbf24' : '#475569', marginBottom: 1, wordBreak: 'break-all' }}>{l}</div>)}</>
+                      ) : (
+                        <div style={{ color: '#334155', paddingTop: 24, textAlign: 'center', fontFamily: 'inherit', fontSize: 12 }}>Build logs appear here when a project is building.</div>
+                      )}
+                      {errorLogs.length > 0 && (
+                        <div style={{ marginTop: 20, borderTop: '1px solid rgba(248,113,113,0.12)', paddingTop: 12 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 10, color: '#ef4444', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'inherit' }}>
+                            <span>Error Log</span>
+                            <button onClick={() => setErrorLogs([])} style={{ background: 'none', border: 'none', color: '#334155', cursor: 'pointer', fontSize: 10, fontFamily: 'inherit' }}>Clear</button>
+                          </div>
+                          {errorLogs.map((l, i) => <div key={i} style={{ color: '#f87171', marginBottom: 4, wordBreak: 'break-all', fontSize: 11 }}>{l}</div>)}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {mobileToolsSection === 'deploy' && (
+                    <div className="mob-scroll-y" style={{ height: '100%', padding: 16 } as React.CSSProperties}>
+                      {currentProject ? (
+                        <>
+                          <div style={{ marginBottom: 16 }}>
+                            <div className="mob-section-hdr">Project Health</div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                              {[
+                                { label: 'Preview',    ok: !!previewUrl },
+                                { label: 'Build',      ok: buildProgress?.step === 'done' || !!previewUrl },
+                                { label: 'Deployment', ok: deployRecord?.status === 'live' },
+                                { label: 'File Tree',  ok: (currentMemory?.fileTree?.length ?? 0) > 0 },
+                              ].map(h => (
+                                <div key={h.label} style={{ padding: '10px 12px', background: h.ok ? 'rgba(34,211,160,0.06)' : 'rgba(255,255,255,0.02)', border: `1px solid ${h.ok ? 'rgba(34,211,160,0.18)' : 'rgba(255,255,255,0.05)'}`, borderRadius: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  <div style={{ width: 6, height: 6, borderRadius: '50%', background: h.ok ? '#22d3a0' : '#1e3a5f', flexShrink: 0 }} />
+                                  <span style={{ fontSize: 11, color: h.ok ? '#6ee7b7' : '#334155', fontWeight: 600 }}>{h.label}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          {deployRecord && (
+                            <div style={{ padding: '12px 14px', background: 'rgba(13,19,32,0.95)', border: `1px solid ${deployRecord.status === 'live' ? 'rgba(34,211,160,0.25)' : deployRecord.status === 'failed' ? 'rgba(248,113,113,0.25)' : 'rgba(250,204,21,0.18)'}`, borderRadius: 14, marginBottom: 12 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                                <span style={{ fontSize: 12, fontWeight: 700, color: '#e2e8f0' }}>Last Deployment</span>
+                                <span style={{ fontSize: 10, padding: '2px 9px', borderRadius: 20, fontWeight: 700, background: deployRecord.status === 'live' ? 'rgba(34,211,160,0.12)' : deployRecord.status === 'failed' ? 'rgba(248,113,113,0.12)' : 'rgba(250,204,21,0.1)', color: deployRecord.status === 'live' ? '#6ee7b7' : deployRecord.status === 'failed' ? '#fca5a5' : '#fde68a' }}>
+                                  {deployRecord.status === 'live' ? 'Live' : deployRecord.status === 'failed' ? 'Failed' : 'Building'}
+                                </span>
+                              </div>
+                              {deployRecord.brandedUrl && <a href={deployRecord.brandedUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: '#6366f1', wordBreak: 'break-all', textDecoration: 'none' }}>{deployRecord.brandedUrl}</a>}
+                            </div>
+                          )}
+                          <button onClick={handleDeploy} disabled={deploying || deployPolling}
+                            style={{ width: '100%', padding: '14px', background: deploying || deployPolling ? 'rgba(99,102,241,0.25)' : 'linear-gradient(135deg,#6366f1,#8b5cf6)', border: 'none', borderRadius: 14, color: '#fff', fontSize: 14, fontWeight: 700, cursor: (deploying || deployPolling) ? 'not-allowed' : 'pointer', boxShadow: deploying || deployPolling ? 'none' : '0 4px 18px rgba(99,102,241,0.28)', letterSpacing: '-0.01em' }}>
+                            {deploying ? '◌ Deploying…' : deployPolling ? '◌ Verifying…' : deployRecord?.status === 'live' ? '↻ Redeploy to Cloud' : '⊕ Deploy to Cloud'}
+                          </button>
+                        </>
+                      ) : (
+                        <div style={{ textAlign: 'center', padding: '48px 20px' }}>
+                          <div style={{ fontSize: 36, marginBottom: 14 }}>⊕</div>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: '#475569', marginBottom: 6 }}>No project selected</div>
+                          <div style={{ fontSize: 12, color: '#334155' }}>Open a project from the Library to deploy it</div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {mobileToolsSection === 'files' && (
+                    <div className="mob-scroll-y" style={{ height: '100%', padding: '12px 14px', fontFamily: 'monospace', fontSize: 11 } as React.CSSProperties}>
+                      {currentMemory?.fileTree?.length ? (
+                        <>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: '#334155', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 10, fontFamily: 'inherit' }}>{currentMemory.fileTree.length} files</div>
+                          {currentMemory.fileTree.slice(0, 120).map((f: string, i: number) => (
+                            <div key={i} style={{ padding: '3px 0', display: 'flex', alignItems: 'center', gap: 7, lineHeight: 1.6 }}>
+                              <span style={{ flexShrink: 0, fontSize: 11 }}>{f.endsWith('/') ? '📁' : '📄'}</span>
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: f.endsWith('/') ? '#94a3b8' : '#475569' }}>{f}</span>
+                            </div>
+                          ))}
+                        </>
+                      ) : (
+                        <div style={{ color: '#334155', padding: '24px 0', textAlign: 'center', fontFamily: 'inherit', fontSize: 12 }}>
+                          {currentProject ? 'Loading file tree…' : 'Open a project to browse files.'}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {mobileToolsSection === 'database' && (
+                    <div className="mob-scroll-y" style={{ height: '100%', padding: 16 } as React.CSSProperties}>
+                      <div className="mob-section-hdr">Database Configuration</div>
+                      <div style={{ marginBottom: 10 }}>
+                        <label style={{ fontSize: 11, fontWeight: 600, color: '#475569', display: 'block', marginBottom: 6 }}>Provider</label>
+                        <select value={dbType} onChange={e => setDbType(e.target.value)} style={{ width: '100%', padding: '11px 12px', background: 'rgba(15,21,35,0.95)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 11, color: '#e2e8f0', fontSize: 13, outline: 'none' } as React.CSSProperties}>
+                          <option value="supabase">Supabase</option>
+                          <option value="planetscale">PlanetScale</option>
+                          <option value="neon">Neon</option>
+                          <option value="sqlite">SQLite (Local)</option>
+                        </select>
+                      </div>
+                      <div style={{ marginBottom: 14 }}>
+                        <label style={{ fontSize: 11, fontWeight: 600, color: '#475569', display: 'block', marginBottom: 6 }}>Connection String</label>
+                        <input value={dbResource} onChange={e => setDbResource(e.target.value)} placeholder="postgres://user:pass@host:5432/db"
+                          style={{ width: '100%', boxSizing: 'border-box', padding: '11px 12px', background: 'rgba(15,21,35,0.95)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 11, color: '#e2e8f0', fontSize: 13, outline: 'none', fontFamily: 'monospace' } as React.CSSProperties} />
+                      </div>
+                      <button onClick={handleDbScaffold} disabled={dbScaffolding || !currentProject}
+                        style={{ width: '100%', padding: '12px', background: 'rgba(99,102,241,0.14)', border: '1px solid rgba(99,102,241,0.3)', borderRadius: 12, color: '#a5b4fc', fontSize: 13, fontWeight: 700, cursor: dbScaffolding || !currentProject ? 'not-allowed' : 'pointer', opacity: dbScaffolding || !currentProject ? 0.45 : 1 }}>
+                        {dbScaffolding ? '◌ Scaffolding schema…' : 'Scaffold Database Schema'}
+                      </button>
+                    </div>
+                  )}
+
+                </div>
+              </div>
+            )}
+
+          </div>{/* end screen */}
+
+          {/* ── BOTTOM NAVIGATION ── */}
+          <div style={{
+            flexShrink: 0,
+            background: 'rgba(10,14,26,0.98)',
+            borderTop: '1px solid rgba(255,255,255,0.06)',
+            display: 'flex', alignItems: 'stretch',
+            height: 60,
+            paddingBottom: 'env(safe-area-inset-bottom)',
+            transform: (mobileFocused && mobileKbOffset > 50) ? 'translateY(100%)' : 'translateY(0)',
+            transition: 'transform 0.25s cubic-bezier(0.4,0,0.2,1)',
+          }}>
+            {([
+              { id: 'library', label: 'Library', icon: '⊞' },
+              { id: 'chat',    label: 'AI Chat',  icon: '◈' },
+              { id: 'preview', label: 'Preview',  icon: '▶' },
+              { id: 'tools',   label: 'Tools',    icon: '⊟' },
+            ] as const).map(tab => (
+              <button key={tab.id} onClick={() => setMobileTab(tab.id)} className="mob-nav-btn"
+                style={{ color: mobileTab === tab.id ? '#a5b4fc' : '#2d3f5a', borderTop: `2px solid ${mobileTab === tab.id ? '#6366f1' : 'transparent'}` }}>
+                <span style={{ fontSize: 19, lineHeight: 1 }}>{tab.icon}</span>
+                <span style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.02em' }}>{tab.label}</span>
+                {tab.id === 'preview' && previewUrl && mobileTab !== 'preview' && (
+                  <div style={{ position: 'absolute', top: 8, right: 'calc(50% - 18px)', width: 6, height: 6, borderRadius: '50%', background: '#22d3a0' }} />
+                )}
+                {tab.id === 'chat' && (phase === 'building' || editApplying) && mobileTab !== 'chat' && (
+                  <div style={{ position: 'absolute', top: 8, right: 'calc(50% - 18px)', width: 6, height: 6, borderRadius: '50%', background: '#f59e0b', animation: 'pulse 1s ease-in-out infinite' }} />
+                )}
+              </button>
+            ))}
+          </div>
+
+        </div>
+        /* ── END MOBILE WORKSPACE ── */
+      ) : (
       <div style={{ display: 'flex', height: '100vh', width: '100vw', background: 'var(--ide-bg)', color: 'var(--ide-text)', fontFamily: '"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', overflow: 'hidden' }}>
 
         {/* ── IDE Sidebar ────────────────────────────────────────────────── */}
@@ -7888,6 +10052,33 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 style={{ padding: '5px 10px', background: focusMode ? 'rgba(99,102,241,0.15)' : 'var(--ide-surface-2)', border: `1px solid ${focusMode ? 'rgba(99,102,241,0.4)' : 'var(--ide-border)'}`, borderRadius: '6px', color: focusMode ? '#a5b4fc' : 'var(--ide-text-muted)', cursor: 'pointer', fontSize: '11px', fontWeight: '600' }}>
                 {focusMode ? '⊞ Focus' : '⊟'}
               </button>
+              {/* Obvious, always-visible Developer Mode toggle — SUPER_ADMIN
+                  (or any future role granted VIEW_DEVELOPER_MODE) only. Lives
+                  in the persistent top header bar (not the composer toolbar,
+                  which can scroll out of view) so it is impossible to miss.
+                  Reuses the same debugMode state everything else already
+                  gates on (Bridge Test, Engine Build/Test, Worker Panel,
+                  Developer Mode report fields) — turning this on/off is a
+                  single source of truth for all of them. */}
+              {myPermissions.has('VIEW_DEVELOPER_MODE') && (
+                <button
+                  onClick={() => setDebugMode(d => {
+                    const next = !d;
+                    if (!next) setBridgeTestMode(false);
+                    return next;
+                  })}
+                  title={debugMode ? 'Developer Mode ON — Bridge Test, Engine Build/Test, and internal diagnostics are visible. Click to hide them.' : 'Developer Mode OFF — click to reveal Bridge Test, Engine Build/Test, and internal build/repair diagnostics (SUPER_ADMIN only).'}
+                  style={{
+                    padding: '5px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '11px', fontWeight: '700',
+                    display: 'flex', alignItems: 'center', gap: '5px',
+                    background: debugMode ? 'linear-gradient(135deg,#3b82f6,#2563eb)' : 'var(--ide-surface-2)',
+                    border: `1px solid ${debugMode ? '#3b82f6' : 'var(--ide-border)'}`,
+                    color: debugMode ? '#fff' : 'var(--ide-text-muted)',
+                  }}>
+                  <span style={{ fontSize: '10px' }}>{debugMode ? '●' : '○'}</span>
+                  {debugMode ? 'Developer Mode: ON' : 'Developer Mode'}
+                </button>
+              )}
             </div>
           </div>
 
@@ -7948,6 +10139,94 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
           {/* Messages */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '20px', background: 'var(--ide-bg)' }}>
+
+            {/* ── Goal-First Build Flow (spec points 1-5) ── */}
+            {goalStep === 'type' && !currentProject && displayed.length === 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '70%', gap: 0 }}>
+                <div style={{ fontSize: '28px', fontWeight: '800', color: '#e2e8f0', marginBottom: '8px', letterSpacing: '-0.03em', textAlign: 'center' }}>What would you like to build?</div>
+                <div style={{ fontSize: '14px', color: '#475569', marginBottom: '40px', textAlign: 'center' }}>Choose your output type — we handle the technology for you.</div>
+                <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {[
+                    { icon: '🌐', label: 'Website', sub: 'Marketplace, SaaS, dashboard, booking, portfolio, blog', action: () => handleGoalSelect('website') },
+                    { icon: '📱', label: 'Mobile App', sub: 'Android & iPhone app, native or cross-platform', action: () => handleGoalSelect('mobile') },
+                  ].map(opt => (
+                    <button key={opt.label} onClick={opt.action} style={{ width: 200, padding: '28px 20px', background: '#0d1526', border: '1.5px solid rgba(255,255,255,0.08)', borderRadius: '18px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', transition: 'all 0.2s', boxShadow: '0 4px 24px rgba(0,0,0,0.25)' }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(99,102,241,0.55)'; e.currentTarget.style.background = 'rgba(99,102,241,0.07)'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = 'rgba(255,255,255,0.08)'; e.currentTarget.style.background = '#0d1526'; e.currentTarget.style.transform = 'none'; }}>
+                      <span style={{ fontSize: '40px', lineHeight: 1 }}>{opt.icon}</span>
+                      <div style={{ fontSize: '17px', fontWeight: '800', color: '#e2e8f0', letterSpacing: '-0.02em' }}>{opt.label}</div>
+                      <div style={{ fontSize: '11px', color: '#475569', textAlign: 'center', lineHeight: '1.55' }}>{opt.sub}</div>
+                    </button>
+                  ))}
+                </div>
+                <div style={{ marginTop: '40px', fontSize: '12px', color: '#1e3a5f' }}>Or just describe what you want below and I'll recommend the best platform.</div>
+              </div>
+            )}
+
+            {/* ── Mobile Technology Picker ── */}
+            {goalStep === 'mobile-tech' && !currentProject && displayed.length === 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '70%', gap: 0 }}>
+                <button onClick={() => setGoalStep('type')} style={{ alignSelf: 'flex-start', background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: '13px', marginBottom: '24px', display: 'flex', alignItems: 'center', gap: '5px' }}>← Back</button>
+                <div style={{ fontSize: '26px', fontWeight: '800', color: '#e2e8f0', marginBottom: '8px', letterSpacing: '-0.03em', textAlign: 'center' }}>Choose Mobile Technology</div>
+                <div style={{ fontSize: '14px', color: '#475569', marginBottom: '40px', textAlign: 'center' }}>Select the platform for your mobile app.</div>
+                <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', justifyContent: 'center' }}>
+                  {[
+                    { icon: '🦋', label: 'Flutter', sub: 'One application that runs on both Android and iPhone using a single codebase.', badge: 'Recommended', action: () => handleMobileTechSelect('flutter') },
+                    { icon: '🤖', label: 'Native Android', sub: 'Kotlin application for Android devices only.', badge: '', action: () => handleMobileTechSelect('android') },
+                    { icon: '🍎', label: 'Native iPhone', sub: 'Swift application for iPhone and iPad only.', badge: '', action: () => handleMobileTechSelect('ios') },
+                  ].map(opt => (
+                    <button key={opt.label} onClick={opt.action} style={{ width: 190, padding: '24px 18px', background: '#0d1526', border: `1.5px solid ${opt.badge ? 'rgba(99,102,241,0.35)' : 'rgba(255,255,255,0.08)'}`, borderRadius: '18px', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px', transition: 'all 0.2s', position: 'relative' }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(99,102,241,0.55)'; e.currentTarget.style.background = 'rgba(99,102,241,0.07)'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = opt.badge ? 'rgba(99,102,241,0.35)' : 'rgba(255,255,255,0.08)'; e.currentTarget.style.background = '#0d1526'; e.currentTarget.style.transform = 'none'; }}>
+                      {opt.badge && <span style={{ position: 'absolute', top: '-10px', left: '50%', transform: 'translateX(-50%)', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', color: '#fff', fontSize: '9px', fontWeight: '800', padding: '2px 10px', borderRadius: '20px', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>{opt.badge}</span>}
+                      <span style={{ fontSize: '36px', lineHeight: 1 }}>{opt.icon}</span>
+                      <div style={{ fontSize: '15px', fontWeight: '800', color: '#e2e8f0' }}>{opt.label}</div>
+                      <div style={{ fontSize: '11px', color: '#475569', textAlign: 'center', lineHeight: '1.55' }}>{opt.sub}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── Platform Recommendation Banner (spec point 4) ── */}
+            {buildRecommendation && pendingBuildPrompt && (
+              <div style={{ marginBottom: '20px', padding: '18px 20px', background: 'rgba(99,102,241,0.08)', border: '1.5px solid rgba(99,102,241,0.3)', borderRadius: '16px' }}>
+                <div style={{ fontSize: '13px', color: '#a5b4fc', fontWeight: '800', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '7px' }}>
+                  <span>{buildRecommendation.icon}</span> Platform Recommendation
+                </div>
+                <div style={{ fontSize: '14px', color: '#e2e8f0', marginBottom: '4px', fontWeight: '600' }}>
+                  {buildRecommendation.platform === 'flutter' ? 'Mobile App — Flutter' : 'Website — Next.js'}
+                </div>
+                <div style={{ fontSize: '13px', color: '#64748b', marginBottom: '16px', lineHeight: '1.6' }}>{buildRecommendation.reason}</div>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  <button onClick={() => {
+                    const h = [...history];
+                    if (buildRecommendation.platform === 'flutter') setBuildTarget('flutter');
+                    else setBuildTarget('web');
+                    const prompt = pendingBuildPrompt;
+                    setBuildRecommendation(null); setPendingBuildPrompt(null);
+                    if (bridgeTestMode) { runBridgeOnlyPipeline(prompt ?? ''); }
+                    else if (buildRecommendation.platform === 'flutter') runFlutterBuildPipeline(h, prompt);
+                    else runBuildPipeline(h, prompt);
+                  }} style={{ padding: '9px 20px', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', border: 'none', borderRadius: '10px', color: '#fff', fontSize: '13px', fontWeight: '700', cursor: 'pointer' }}>
+                    ✓ Accept — Build {buildRecommendation.platform === 'flutter' ? 'Mobile App' : 'Website'}
+                  </button>
+                  <button onClick={() => {
+                    const prompt = pendingBuildPrompt;
+                    setBuildRecommendation(null); setPendingBuildPrompt(null);
+                    if (bridgeTestMode) { runBridgeOnlyPipeline(prompt ?? ''); }
+                    else if (buildTarget === 'flutter') runFlutterBuildPipeline(history, prompt);
+                    else runBuildPipeline(history, prompt);
+                  }} style={{ padding: '9px 20px', background: 'transparent', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#94a3b8', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>
+                    Keep {buildTarget === 'flutter' ? 'Flutter' : 'Web'} anyway
+                  </button>
+                  <button onClick={() => { setBuildRecommendation(null); setPendingBuildPrompt(null); setGoalStep('type'); }} style={{ padding: '9px 20px', background: 'transparent', border: '1px solid rgba(255,255,255,0.12)', borderRadius: '10px', color: '#94a3b8', fontSize: '13px', fontWeight: '600', cursor: 'pointer' }}>
+                    Choose different platform
+                  </button>
+                </div>
+              </div>
+            )}
+
             {displayed.map((msg, idx) => {
               const isLast = idx === displayed.length - 1;
               if (msg.role === 'status') {
@@ -8011,8 +10290,9 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                                 if (ra.action === 'retry-logo') { handleLogoBriefSubmit(); }
                                 else if (ra.action === 'open-logs') { setPreviewTab('logs'); }
                                 else if (ra.action === 'focus-input') { if (ra.prompt) setInput(ra.prompt); setTimeout(() => inputRef.current?.focus(), 50); }
+                                else if (ra.action === 'claude-bridge') { launchBridge(ra.prompt ?? ''); }
                               }}
-                                style={{ padding: '6px 14px', background: ri === 0 ? 'rgba(37,99,235,0.2)' : '#141e2e', border: `1px solid ${ri === 0 ? '#2563eb' : '#1e3a5f'}`, borderRadius: '8px', color: ri === 0 ? '#93c5fd' : '#64748b', cursor: 'pointer', fontSize: '12px', fontWeight: '700' }}>
+                                style={{ padding: '6px 14px', background: ra.action === 'claude-bridge' ? 'rgba(99,102,241,0.2)' : ri === 0 ? 'rgba(37,99,235,0.2)' : '#141e2e', border: `1px solid ${ra.action === 'claude-bridge' ? '#6366f1' : ri === 0 ? '#2563eb' : '#1e3a5f'}`, borderRadius: '8px', color: ra.action === 'claude-bridge' ? '#a5b4fc' : ri === 0 ? '#93c5fd' : '#64748b', cursor: 'pointer', fontSize: '12px', fontWeight: '700' }}>
                                 {ra.label}
                               </button>
                             ))}
@@ -8424,22 +10704,49 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           {/* ── Premium Composer ───────────────────────────────────────────────── */}
           <div style={{ padding: '10px 16px 14px', background: 'var(--ide-surface)', borderTop: '1px solid var(--ide-border)' }}>
 
+            {/* Bridge Test — internal debugging tool, never meant for customers.
+                The Developer Mode toggle itself now lives in the persistent
+                top header bar (impossible to miss, always visible to
+                SUPER_ADMIN). This row only shows Bridge Test, and only once
+                Developer Mode is already ON via that header toggle — a
+                SUPER_ADMIN with Developer Mode off sees the same clean
+                customer interface as everyone else. */}
+            {myPermissions.has('VIEW_DEVELOPER_MODE') && debugMode && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: bridgeTestMode ? '0' : '6px' }}>
+              <button
+                onClick={() => {
+                  const next = !bridgeTestMode;
+                  setBridgeTestMode(next);
+                  // If toggled ON mid-build, stop the current build and restart via bridge
+                  if (next && (phase === 'building' || loading)) {
+                    handleForceReset();
+                  }
+                }}
+                title={bridgeTestMode ? 'Bridge Test Mode ON — every prompt goes to Claude Code CLI via Bridge. Click to disable.' : 'Bridge Test Mode OFF — click to route your next build through the Claude Bridge (Claude Code CLI does all generation).'}
+                style={{ padding: '4px 12px', background: bridgeTestMode ? 'linear-gradient(135deg,rgba(124,58,237,0.7),rgba(99,58,200,0.7))' : 'rgba(15,23,42,0.5)', border: `1px solid ${bridgeTestMode ? '#7c3aed' : '#1e3a5f'}`, borderRadius: '6px', color: bridgeTestMode ? '#e9d5ff' : '#475569', cursor: 'pointer', fontSize: '11px', fontWeight: '700', display: 'flex', alignItems: 'center', gap: '5px', transition: 'all 0.15s ease', letterSpacing: '0.02em' }}
+              >
+                <span style={{ fontSize: '10px', color: bridgeTestMode ? '#a78bfa' : '#334155' }}>{bridgeTestMode ? '⚡' : '○'}</span>
+                {bridgeTestMode ? 'Bridge Test: ON' : 'Bridge Test'}
+              </button>
+              {bridgeTestMode && (
+                <span style={{ fontSize: '10px', color: '#7c3aed', fontStyle: 'italic' }}>
+                  Next prompt → Claude Code CLI (bridge handles all generation)
+                </span>
+              )}
+            </div>
+            )}
+
             {/* Busy / stuck banner */}
             {isBusy && (
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px', padding: '8px 14px', background: '#111827', borderRadius: '10px', border: '1px solid #1e3a5f' }}>
-                <span style={{ fontSize: '12px', color: '#60a5fa', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span style={{ animation: 'spin 1.2s linear infinite', display: 'inline-block', fontSize: '12px' }}>⚙️</span>
-                  {phase === 'building' ? 'Generating code…' : editApplying ? 'Applying changes…' : 'Processing…'}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px', padding: '8px 14px', background: '#111827', borderRadius: '10px', border: `1px solid ${bridgeTestMode ? 'rgba(124,58,237,0.4)' : '#1e3a5f'}` }}>
+                <span style={{ fontSize: '12px', color: bridgeTestMode ? '#c4b5fd' : '#60a5fa', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ animation: 'spin 1.2s linear infinite', display: 'inline-block', fontSize: '12px' }}>{bridgeTestMode ? '⚡' : '⚙️'}</span>
+                  {bridgeTestMode
+                    ? 'Claude Code CLI via Bridge — building your app…'
+                    : phase === 'building' ? 'Generating code…' : editApplying ? 'Applying changes…' : 'Processing…'}
                 </span>
                 <button onClick={handleForceReset} style={{ padding: '3px 10px', background: 'rgba(127,29,29,0.5)', border: '1px solid #7f1d1d', borderRadius: '6px', color: '#f87171', cursor: 'pointer', fontSize: '11px', fontWeight: '600' }}>
                   Reset
-                </button>
-                <button
-                  onClick={() => setDebugMode(d => !d)}
-                  title={debugMode ? 'Debug Mode ON — click to hide engineering reports' : 'Debug Mode OFF — click to show engineering reports'}
-                  style={{ padding: '3px 10px', background: debugMode ? 'rgba(30,58,138,0.6)' : 'rgba(15,23,42,0.5)', border: `1px solid ${debugMode ? '#3b82f6' : '#1e3a5f'}`, borderRadius: '6px', color: debugMode ? '#93c5fd' : '#475569', cursor: 'pointer', fontSize: '11px', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '4px' }}
-                >
-                  <span style={{ fontSize: '9px' }}>{debugMode ? '●' : '○'}</span> Debug
                 </button>
               </div>
             )}
@@ -8465,6 +10772,100 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                 <span style={{ fontSize: '11px', color: '#334155', alignSelf: 'center', marginLeft: '2px' }}>
                   {assets.length} attachment{assets.length > 1 ? 's' : ''}
                 </span>
+              </div>
+            )}
+
+            {/* ── Bridge Test Telemetry Panel — always visible during bridge test runs ── */}
+            {bridgeTestMode && bridgeTelemetry.length > 0 && (
+              <div style={{ marginBottom: '10px', background: 'rgba(6,10,20,0.97)', border: '1.5px solid rgba(124,58,237,0.5)', borderRadius: '12px', overflow: 'hidden' }}>
+                <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '8px', borderBottom: '1px solid rgba(124,58,237,0.15)', background: 'rgba(124,58,237,0.08)' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#7c3aed', display: 'inline-block', animation: 'pulse 1s ease-in-out infinite', flexShrink: 0 }} />
+                  <span style={{ fontSize: '11px', fontWeight: '800', color: '#c4b5fd', letterSpacing: '0.06em' }}>⚡ BRIDGE TEST — LIVE TELEMETRY</span>
+                  <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#4c1d95', fontFamily: 'monospace' }}>Claude Code CLI</span>
+                </div>
+                <div style={{ padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  {bridgeTelemetry.map(stage => (
+                    <div key={stage.id} style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', padding: '4px 6px', borderRadius: '6px', background: stage.status === 'active' ? 'rgba(124,58,237,0.12)' : stage.status === 'done' ? 'rgba(34,197,94,0.06)' : stage.status === 'error' ? 'rgba(239,68,68,0.08)' : 'transparent' }}>
+                      <span style={{ fontSize: '12px', flexShrink: 0, marginTop: '1px' }}>
+                        {stage.status === 'waiting' ? '○' : stage.status === 'active' ? '⟳' : stage.status === 'done' ? '✅' : '❌'}
+                      </span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '11px', fontWeight: stage.status === 'waiting' ? '400' : '600', color: stage.status === 'waiting' ? '#334155' : stage.status === 'active' ? '#c4b5fd' : stage.status === 'done' ? '#86efac' : '#f87171' }}>
+                          {stage.label}
+                        </div>
+                        {stage.detail && (
+                          <div style={{ fontSize: '10px', color: '#64748b', fontFamily: 'monospace', marginTop: '1px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {stage.detail}
+                          </div>
+                        )}
+                      </div>
+                      {stage.ts && <span style={{ fontSize: '9px', color: '#334155', fontFamily: 'monospace', flexShrink: 0 }}>{stage.ts}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── Claude Code Worker Panel (Developer Mode only) ────────── */}
+            {/* Defense-in-depth: gated by VIEW_DEVELOPER_MODE in addition to
+                debugMode, in case debugMode is ever set another way (e.g. a
+                restored localStorage value or a future dev shortcut) — this
+                panel must never render for an account without the permission,
+                regardless of debugMode's value. */}
+            {debugMode && myPermissions.has('VIEW_DEVELOPER_MODE') && bridgeSession && (
+              <div style={{ marginBottom: '10px', background: 'rgba(6,10,20,0.97)', border: `1.5px solid ${bridgeSession.status === 'complete' && bridgeSession.verifyResult?.verified ? 'rgba(34,211,160,0.4)' : bridgeSession.status === 'error' ? 'rgba(248,113,113,0.4)' : 'rgba(99,102,241,0.4)'}`, borderRadius: '12px', overflow: 'hidden' }}>
+                {/* Header */}
+                <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', gap: '8px', borderBottom: '1px solid rgba(255,255,255,0.05)', background: 'rgba(99,102,241,0.07)' }}>
+                  {bridgeSession.status === 'connecting' || bridgeSession.status === 'running'
+                    ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#6366f1', display: 'inline-block', animation: 'pulse 1s ease-in-out infinite', flexShrink: 0 }} />
+                    : bridgeSession.status === 'complete' && bridgeSession.verifyResult?.verified
+                    ? <span style={{ color: '#4ade80', fontSize: '12px' }}>✅</span>
+                    : bridgeSession.status === 'complete'
+                    ? <span style={{ color: '#fbbf24', fontSize: '12px' }}>⚠️</span>
+                    : <span style={{ color: '#f87171', fontSize: '12px' }}>❌</span>
+                  }
+                  <span style={{ fontSize: '11px', fontWeight: '700', color: '#a5b4fc', flex: 1, letterSpacing: '0.03em', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <span style={{ padding: '1px 7px', background: bridgeSession.status === 'running' || bridgeSession.status === 'connecting' ? 'rgba(99,102,241,0.25)' : 'rgba(30,41,59,0.5)', border: `1px solid ${bridgeSession.status === 'running' || bridgeSession.status === 'connecting' ? '#6366f1' : '#334155'}`, borderRadius: '4px', fontSize: '10px', fontWeight: '800', color: bridgeSession.status === 'running' || bridgeSession.status === 'connecting' ? '#c7d2fe' : '#64748b', letterSpacing: '0.08em' }}>
+                      {bridgeSession.status === 'connecting' || bridgeSession.status === 'running' ? '⚡ BRIDGE ACTIVE' : bridgeSession.status === 'complete' ? '✓ BRIDGE COMPLETE' : '✗ BRIDGE ERROR'}
+                    </span>
+                    <span style={{ color: '#475569', fontSize: '10px', fontFamily: 'monospace', fontWeight: '400' }}>
+                      {bridgeSession.status === 'connecting' ? 'Connecting…' : bridgeSession.status === 'running' ? 'Working…' : bridgeSession.status === 'complete' ? `${bridgeSession.changedFiles.length} file(s) changed` : 'Error — see log'}
+                    </span>
+                    <span style={{ color: '#334155', fontSize: '9px', fontFamily: 'monospace', marginLeft: 'auto' }} title="Bridge session ID (matches audit log)">
+                      {bridgeSession.sessionId}
+                    </span>
+                  </span>
+                  {bridgeSession.verifyResult && (
+                    <span style={{ fontSize: '10px', padding: '2px 8px', borderRadius: '20px', background: bridgeSession.verifyResult.verified ? 'rgba(34,211,160,0.12)' : 'rgba(251,191,36,0.12)', color: bridgeSession.verifyResult.verified ? '#4ade80' : '#fbbf24', fontWeight: '700', border: `1px solid ${bridgeSession.verifyResult.verified ? 'rgba(74,222,128,0.3)' : 'rgba(251,191,36,0.3)'}` }}>
+                      {bridgeSession.verifyResult.passedCount}/{bridgeSession.verifyResult.totalCount} checks
+                    </span>
+                  )}
+                  <button onClick={() => { if (bridgeEsRef.current) { bridgeEsRef.current.close(); bridgeEsRef.current = null; } setBridgeSession(null); }}
+                    style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: '16px', lineHeight: 1, padding: '2px 4px', flexShrink: 0 }}>×</button>
+                </div>
+                {/* Log stream */}
+                <div style={{ maxHeight: '180px', overflowY: 'auto', padding: '8px 12px', fontFamily: '"JetBrains Mono","Fira Code",monospace', fontSize: '11px', lineHeight: '1.7' }}>
+                  {bridgeSession.logs.map((line, i) => (
+                    <div key={i} style={{ color: line.startsWith('❌') ? '#f87171' : line.startsWith('✅') ? '#4ade80' : line.startsWith('⚠️') ? '#fbbf24' : line.startsWith('ℹ️') ? '#a5b4fc' : line.startsWith('✏️') || line.startsWith('📝') || line.startsWith('📖') || line.startsWith('⚡') ? '#22d3a0' : '#64748b', marginBottom: '1px', wordBreak: 'break-all' }}>
+                      {line}
+                    </div>
+                  ))}
+                  {(bridgeSession.status === 'connecting' || bridgeSession.status === 'running') && (
+                    <div style={{ color: '#475569', animation: 'pulse 1s ease-in-out infinite' }}>▌</div>
+                  )}
+                </div>
+                {/* Changed files (on complete) */}
+                {bridgeSession.status === 'complete' && bridgeSession.changedFiles.length > 0 && (
+                  <div style={{ padding: '6px 12px 10px', borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+                    <div style={{ fontSize: '10px', color: '#334155', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '4px' }}>Files changed</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                      {bridgeSession.changedFiles.slice(0, 8).map((f, i) => (
+                        <span key={i} style={{ fontSize: '10px', padding: '1px 7px', background: 'rgba(34,211,160,0.08)', border: '1px solid rgba(34,211,160,0.2)', borderRadius: '4px', color: '#22d3a0', fontFamily: 'monospace' }}>{f.split('/').pop()}</span>
+                      ))}
+                      {bridgeSession.changedFiles.length > 8 && <span style={{ fontSize: '10px', color: '#334155' }}>+{bridgeSession.changedFiles.length - 8} more</span>}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -8556,7 +10957,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                   }}
                   onFocus={() => setComposerFocused(true)}
                   onBlur={() => setComposerFocused(false)}
-                  placeholder=""
+                  placeholder={bridgeTestMode ? 'Describe the app you want Claude Code CLI to build from scratch…' : ''}
                   disabled={phase === 'building' || editApplying}
                   style={{
                     width: '100%',
@@ -8623,44 +11024,24 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                     </div>
                   )}
 
-                  {/* Build target selector — only visible when not building and no project open */}
+                  {/* Platform badge + change button — visible when not building and no project open */}
                   {!currentProject && phase === 'idle' && (
-                    <div style={{ display: 'flex', gap: '4px', marginRight: '10px', background: '#0d1526', borderRadius: '8px', padding: '3px', border: '1px solid #1e3a5f', flexShrink: 0 }}>
-                      <button
-                        type="button"
-                        onClick={() => setBuildTarget('web')}
-                        title="Build a Next.js web application"
-                        style={{
-                          padding: '4px 10px',
-                          background: buildTarget === 'web' ? 'rgba(37,99,235,0.25)' : 'transparent',
-                          border: `1px solid ${buildTarget === 'web' ? 'rgba(37,99,235,0.5)' : 'transparent'}`,
-                          borderRadius: '6px',
-                          color: buildTarget === 'web' ? '#60a5fa' : '#334155',
-                          cursor: 'pointer',
-                          fontSize: '11px',
-                          fontWeight: '700',
-                          transition: 'all 0.15s',
-                        }}>
-                        Web
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setBuildTarget('flutter')}
-                        title="Build a Flutter Android/iOS app"
-                        style={{
-                          padding: '4px 10px',
-                          background: buildTarget === 'flutter' ? 'rgba(124,58,237,0.25)' : 'transparent',
-                          border: `1px solid ${buildTarget === 'flutter' ? 'rgba(124,58,237,0.5)' : 'transparent'}`,
-                          borderRadius: '6px',
-                          color: buildTarget === 'flutter' ? '#a78bfa' : '#334155',
-                          cursor: 'pointer',
-                          fontSize: '11px',
-                          fontWeight: '700',
-                          transition: 'all 0.15s',
-                        }}>
-                        Flutter
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setGoalStep(goalStep === 'idle' ? 'type' : 'idle')}
+                      title="Change platform"
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: '5px',
+                        marginRight: '10px',
+                        padding: '4px 12px',
+                        background: buildTarget === 'flutter' ? 'rgba(124,58,237,0.15)' : 'rgba(37,99,235,0.12)',
+                        border: `1px solid ${buildTarget === 'flutter' ? 'rgba(124,58,237,0.4)' : 'rgba(37,99,235,0.35)'}`,
+                        borderRadius: '20px', cursor: 'pointer', fontSize: '11px', fontWeight: '700',
+                        color: buildTarget === 'flutter' ? '#a78bfa' : '#60a5fa',
+                        transition: 'all 0.15s', flexShrink: 0,
+                      }}>
+                      {buildTarget === 'flutter' ? '📱 Mobile App' : '🌐 Website'} <span style={{ opacity: 0.5, fontSize: '9px' }}>▾</span>
+                    </button>
                   )}
 
                   {/* Word count badge */}
@@ -8669,6 +11050,45 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
                       {input.trim().split(/\s+/).filter(Boolean).length}w
                     </span>
                   )}
+
+                  {/* ⚡ Build with Bridge — always-visible; bypasses DWOMOH pipeline entirely */}
+                  <button
+                    type="button"
+                    disabled={isBusy || !input.trim()}
+                    onClick={() => {
+                      if (!input.trim() || isBusy) return;
+                      const prompt = enrichPromptWithAssets(input.trim());
+                      setInput('');
+                      if (inputRef.current) inputRef.current.style.height = 'auto';
+                      addMsg('user', input.trim());
+                      const newHist: ConversationTurn[] = [...history, { role: 'user', content: input.trim() }];
+                      setHistory(newHist);
+                      setBridgeTestMode(true);
+                      runBridgeOnlyPipeline(prompt);
+                    }}
+                    title="Build with Claude Code CLI via Bridge — DWOMOH Vibe Code writes zero code"
+                    style={{
+                      padding: '9px 16px',
+                      background: input.trim() && !isBusy
+                        ? 'linear-gradient(135deg,rgba(124,58,237,0.9),rgba(99,58,200,0.85))'
+                        : 'var(--ide-surface-2)',
+                      color: input.trim() && !isBusy ? '#e9d5ff' : 'var(--ide-text-dim)',
+                      border: input.trim() && !isBusy ? '1px solid rgba(124,58,237,0.5)' : '1px solid var(--ide-border)',
+                      borderRadius: '10px',
+                      cursor: input.trim() && !isBusy ? 'pointer' : 'not-allowed',
+                      fontWeight: '700',
+                      fontSize: '12px',
+                      transition: 'all 0.2s',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '5px',
+                      whiteSpace: 'nowrap',
+                      boxShadow: input.trim() && !isBusy ? '0 2px 12px rgba(124,58,237,0.35)' : 'none',
+                      flexShrink: 0,
+                    }}>
+                    <span>⚡</span>
+                    <span>Bridge</span>
+                  </button>
 
                   {/* Send button */}
                   <button type="submit"
@@ -9544,6 +11964,7 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         </div>
 
       </div>
+      )}{/* end desktop/mobile conditional */}
     </>
   );
 }

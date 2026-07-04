@@ -23,15 +23,31 @@ const socialBtnStyle: React.CSSProperties = {
 
 function SocialButtons({ disabled }: { disabled: boolean }) {
   const [socialLoading, setSocialLoading] = useState<string | null>(null);
+  const [socialError, setSocialError] = useState('');
 
   async function handleSocial(provider: 'Google' | 'Apple' | 'Facebook') {
     setSocialLoading(provider);
+    setSocialError('');
     try {
       await signInWithRedirect({ provider });
-      // Page will redirect — no further handling needed here
-    } catch (e) {
-      console.error('Social sign-in error:', e);
-      setSocialLoading(null);
+    } catch (err: unknown) {
+      const e = err as { name?: string; message?: string };
+      if (e.name === 'UserAlreadyAuthenticatedException') {
+        // Stale session in localStorage is blocking the redirect.
+        // Sign out locally (clears tokens without a server round-trip), then retry.
+        try {
+          await signOut({ global: false });
+          await signInWithRedirect({ provider });
+          // If we get here signInWithRedirect threw again — fall through to error display
+        } catch (retryErr: unknown) {
+          const re = retryErr as { name?: string; message?: string };
+          setSocialLoading(null);
+          setSocialError(re.message ?? `${provider} sign-in failed — please try again.`);
+        }
+      } else {
+        setSocialLoading(null);
+        setSocialError(e.message ?? `${provider} sign-in failed — please try again.`);
+      }
     }
   }
 
@@ -82,6 +98,12 @@ function SocialButtons({ disabled }: { disabled: boolean }) {
           </>
         )}
       </button>
+
+      {socialError && (
+        <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '10px 14px', color: '#fca5a5', fontSize: 14, marginTop: 4 }}>
+          {socialError}
+        </div>
+      )}
     </div>
   );
 }

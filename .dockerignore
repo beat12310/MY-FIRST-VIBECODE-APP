@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+generated-projects
+.dwomoh
+.dwomoh-api-manager.json
+**/*.log
+.env.local
+.env*.local
+infra/cdk.out
+infra/node_modules
+public/browser-screenshots
+tsconfig.tsbuildinfo
+.DS_Store

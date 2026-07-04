@@ -65,7 +65,7 @@ function NavItem({ href, label, icon, active }: { href: string; label: string | 
 /* ─── sidebar content (shared between desktop and mobile drawer) */
 function SidebarContent({ pathname, user, initial, planLabel, onSignOut }: {
   pathname: string;
-  user: { name?: string; email: string };
+  user: { name?: string; email: string; picture?: string };
   initial: string;
   planLabel: string;
   onSignOut: () => void;
@@ -107,20 +107,29 @@ function SidebarContent({ pathname, user, initial, planLabel, onSignOut }: {
       {/* User footer */}
       <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', padding: '14px 14px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
-          <div style={{
-            width: 34, height: 34, borderRadius: '50%',
-            background: 'linear-gradient(135deg,#8b5cf6,#6366f1)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 13, fontWeight: 800, color: '#fff', flexShrink: 0,
-          }}>
-            {initial}
-          </div>
+          {user.picture ? (
+            <img
+              src={user.picture}
+              alt={user.name ?? user.email}
+              referrerPolicy="no-referrer"
+              style={{ width: 34, height: 34, borderRadius: '50%', flexShrink: 0, objectFit: 'cover', border: '2px solid rgba(139,92,246,0.3)' }}
+            />
+          ) : (
+            <div style={{
+              width: 34, height: 34, borderRadius: '50%',
+              background: 'linear-gradient(135deg,#8b5cf6,#6366f1)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 13, fontWeight: 800, color: '#fff', flexShrink: 0,
+            }}>
+              {initial}
+            </div>
+          )}
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {user.name ?? user.email.split('@')[0]}
             </div>
             <div style={{ fontSize: 11, color: '#475569', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {planLabel} plan
+              {user.email.includes('@') ? user.email : planLabel + ' plan'}
             </div>
           </div>
         </div>
@@ -158,7 +167,21 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
   // Close drawer on route change
   useEffect(() => { setSidebarOpen(false); }, [pathname]);
 
-  if (loading) {
+  // Auth guard — runs AFTER React commits state updates. Using useEffect instead
+  // of a synchronous render-time check prevents a timing race where the dashboard
+  // renders before refresh()'s setUser({...}) is committed (React 18 MessageChannel
+  // commits fire after microtasks, so a synchronous check sees stale user=null).
+  useEffect(() => {
+    if (!loading && !user) {
+      console.log('[Dashboard Guard] No session after load — redirecting to sign-in');
+      router.replace('/auth/signin');
+    }
+    if (!loading && user) {
+      console.log('[Dashboard Guard] Session valid — user:', user.userId);
+    }
+  }, [loading, user, router]);
+
+  if (loading || !user) {
     return (
       <div style={{ minHeight: '100vh', background: '#06060c', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'system-ui,sans-serif' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14 }}>
@@ -171,12 +194,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
     );
   }
 
-  if (!user) {
-    router.replace('/auth/signin');
-    return null;
-  }
-
-  const initial = (user.name ?? user.email).slice(0, 1).toUpperCase();
+  const displayName = user.name ?? (user.email.includes('@') ? user.email.split('@')[0] : null) ?? '?';
+  const initial = displayName.slice(0, 1).toUpperCase();
   const planLabel = (user as { planId?: string }).planId ?? 'Free';
 
   async function handleSignOut() {

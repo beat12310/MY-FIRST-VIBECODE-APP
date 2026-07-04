@@ -281,6 +281,14 @@ export interface VerifyResult {
   securityChecks: SecurityCheck[];
   securityPassed: boolean;      // all CRITICAL security checks passed
   /**
+   * Real headless-browser click-through journey (register/login/nav/logout),
+   * as opposed to workflowTests above which are plain HTTP probes. null when
+   * no browserJourney dep was supplied or no live preview existed to test
+   * against — NOT the same as a passing result, callers must check for null
+   * explicitly rather than treating it as vacuously true.
+   */
+  browserJourney: { passed: boolean; verdict: string; summary: string; failureDetail?: string } | null;
+  /**
    * The hard Success Rule. passed === true requires ALL of:
    *  structural OK ∧ previewLoads ∧ workflowsPassed ∧ performanceWithinBudget ∧
    *  securityPassed ∧ no INTERNAL classifiedFailures.

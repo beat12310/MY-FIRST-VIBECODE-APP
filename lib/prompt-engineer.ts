@@ -1226,6 +1226,185 @@ CRITICAL CODE RULES (NEVER BREAK)
 6. COMPONENTS: For apps with 3+ UI sections, split into components/
    Import with @/components/ComponentName (the @/* alias handles this)
 
+7. AUTH ROUTE CONTRACT — form field names MUST match API field names EXACTLY:
+   If a login form sends: { email, password } — the login API MUST destructure: { email, password }
+   If a register form sends: { name, email, password } — the register API MUST destructure: { name, email, password }
+   NEVER use different field names on the form vs. the API. This causes HTTP 400 "missing field" errors.
+   ✅ CORRECT:
+     // Form sends:           { email, password }
+     // API reads:       const { email, password } = await req.json();
+   ❌ WRONG:
+     // Form sends:           { email, password }
+     // API reads:       const { username, pass } = await req.json();  ← 400 error!
+
+8. PROTECTED PAGES — must redirect to /login, NEVER return HTTP 401:
+   ✅ CORRECT: if (!auth) return NextResponse.redirect(new URL('/login', request.url));
+   ❌ WRONG:   if (!auth) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+   This applies in every page.tsx, layout.tsx, or middleware that checks auth.
+   A page that returns 401 makes the browser show a blank or JSON error — not the login form.
+
+9. ALL NAV LINKS MUST HAVE A REAL PAGE:
+   Every <Link href="/path">, router.push('/path'), and <a href="/path"> MUST have a corresponding
+   app/path/page.tsx file. NEVER generate a nav link to a non-existent route.
+   The verification engine WILL test every page route and fail the build if any returns 404.
+
+10. DASHBOARD MUST ALWAYS LOAD:
+    app/dashboard/page.tsx must handle two states:
+    a. User is logged in → show dashboard content
+    b. User is not logged in → redirect('/login') using redirect() from 'next/navigation'
+    ✅ import { redirect } from 'next/navigation';
+       const auth = await getAuthUser(request); // server component
+       if (!auth) redirect('/login');
+
+11. AUTH PAGE MUST BE A REAL FORM — NEVER A REDIRECT STUB:
+    If your app uses /auth, /login, /signin, /signup, /register as the auth entry point,
+    that page MUST contain actual sign-in and sign-up forms wired to the API.
+
+    ❌ FORBIDDEN — stub auth page (causes Sign In button to go nowhere):
+      export default function AuthPage() {
+        const router = useRouter();
+        useEffect(() => { router.replace('/'); }, [router]);  // ← WRONG: sends user away!
+        return null;
+      }
+
+    ✅ REQUIRED — real combined auth page at app/auth/page.tsx:
+      'use client';
+      import { useState, Suspense } from 'react';
+      import { useRouter, useSearchParams } from 'next/navigation';
+      import Link from 'next/link';
+
+      function AuthForm() {
+        const router = useRouter();
+        const params = useSearchParams();
+        const [mode, setMode] = useState<'signin'|'signup'>(
+          params.get('mode') === 'signup' ? 'signup' : 'signin'
+        );
+        const [name, setName] = useState('');
+        const [email, setEmail] = useState('');
+        const [password, setPassword] = useState('');
+        const [error, setError] = useState('');
+        const [loading, setLoading] = useState(false);
+
+        async function handleSubmit(e: React.FormEvent) {
+          e.preventDefault();
+          setError(''); setLoading(true);
+          try {
+            const url = mode === 'signup' ? '/api/auth/register' : '/api/auth/login';
+            const body = mode === 'signup' ? { name, email, password } : { email, password };
+            const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            const data = await res.json();
+            if (!res.ok) { setError(data.error || 'Authentication failed'); return; }
+            router.push('/dashboard');
+            router.refresh();
+          } catch { setError('Network error'); }
+          finally { setLoading(false); }
+        }
+
+        return (
+          <main className="min-h-screen flex items-center justify-center bg-slate-50 px-4 py-12">
+            <div className="w-full max-w-md">
+              <h1 className="text-2xl font-bold text-center text-slate-900 mb-8">Welcome</h1>
+              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
+                <div className="flex rounded-xl bg-slate-100 p-1 mb-6">
+                  <button type="button" onClick={() => setMode('signin')}
+                    className={\`flex-1 py-2 rounded-lg text-sm font-medium transition-colors \${mode==='signin' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500'}\`}>Sign In</button>
+                  <button type="button" onClick={() => setMode('signup')}
+                    className={\`flex-1 py-2 rounded-lg text-sm font-medium transition-colors \${mode==='signup' ? 'bg-white shadow-sm text-slate-900' : 'text-slate-500'}\`}>Sign Up</button>
+                </div>
+                <form onSubmit={handleSubmit} className="space-y-4">
+                  {mode === 'signup' && (
+                    <input type="text" required value={name} onChange={e=>setName(e.target.value)}
+                      placeholder="Full name" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  )}
+                  <input type="email" required value={email} onChange={e=>setEmail(e.target.value)}
+                    placeholder="Email address" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  <input type="password" required minLength={6} value={password} onChange={e=>setPassword(e.target.value)}
+                    placeholder="Password" className="w-full px-4 py-2.5 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  {error && <p className="text-red-600 text-sm">{error}</p>}
+                  <button type="submit" disabled={loading}
+                    className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm transition-colors disabled:opacity-60">
+                    {loading ? 'Please wait…' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
+                  </button>
+                </form>
+                <p className="mt-4 text-center text-sm text-slate-500">
+                  {mode === 'signin'
+                    ? <><button onClick={()=>setMode('signup')} className="text-blue-600 font-medium hover:underline">No account? Sign up</button></>
+                    : <><button onClick={()=>setMode('signin')} className="text-blue-600 font-medium hover:underline">Already have an account? Sign in</button></>}
+                </p>
+              </div>
+              <div className="mt-4 text-center"><Link href="/" className="text-xs text-slate-400 hover:text-slate-600">← Back to Home</Link></div>
+            </div>
+          </main>
+        );
+      }
+
+      export default function AuthPage() {
+        return (
+          <Suspense fallback={<div className="min-h-screen flex items-center justify-center"><div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full"/></div>}>
+            <AuthForm />
+          </Suspense>
+        );
+      }
+
+    IMPORTANT: The auth page MUST:
+    ✅ Use Suspense to wrap useSearchParams (Next.js requires this)
+    ✅ POST to /api/auth/login with { email, password }
+    ✅ POST to /api/auth/register with { name, email, password }
+    ✅ Redirect to /dashboard on success (router.push('/dashboard') after successful login OR signup)
+    ✅ Show inline error messages on failure
+
+12. DASHBOARD IS MANDATORY WHEN APP HAS LOGIN/SIGNUP:
+    Every app with an auth page MUST also have app/dashboard/page.tsx.
+    The dashboard MUST:
+    ✅ Call GET /api/auth/me on mount — redirect to /auth if not logged in
+    ✅ Show the user's name or email in a welcome message
+    ✅ Show stat cards using data from the app's own API routes
+    ✅ Have a "Sign out" button that calls POST /api/auth/logout → redirect to /auth
+    ✅ Have quick-nav links to the app's main sections
+    ❌ WRONG: dashboard just returns null, redirects to '/', or shows a spinner forever
+    ❌ WRONG: dashboard exists in nav links but app/dashboard/page.tsx is not in the output
+    ✅ CORRECT PATTERN:
+      export default function DashboardPage() {
+        const [user, setUser] = useState(null);
+        useEffect(() => {
+          fetch('/api/auth/me').then(r => r.ok ? r.json() : Promise.reject()).then(setUser).catch(() => router.replace('/auth'));
+        }, []);
+        if (!user) return <Spinner />;
+        return <main>Welcome, {user.name}! ...</main>;
+      }
+
+14. NAV ARRAY LINKS ALSO NEED PAGES:
+    Object-literal navigation configs are scanned too. Every href in an array is required to have a page.
+    ❌ WRONG:
+      const navLinks = [
+        { href: '/dashboard', label: 'Dashboard' },   // /dashboard has no page file!
+        { href: '/orders', label: 'Orders' },          // /orders has no page file!
+      ];
+    ✅ CORRECT: create app/dashboard/page.tsx AND app/orders/page.tsx before using those hrefs.
+
+15. DYNAMIC ROUTES — for every list page that links to individual items, create [id] routes:
+    If a page links to \`/courses/\${id}\` or \`/products/\${id}\`, you MUST create:
+    ✅ app/courses/[id]/page.tsx — detail page that fetches /api/courses/\${id}
+    ✅ app/api/courses/[id]/route.ts — GET handler returning the single item
+    This applies to ALL resource types: products, courses, jobs, listings, articles, posts, etc.
+    ❌ WRONG: CourseCard links to \`/courses/\${course.id}\` but app/courses/[id]/page.tsx is missing
+    ✅ CORRECT: Whenever you generate a list component, also generate the detail page and API route
+
+16. PRE-SHIPMENT CHECKLIST — run this BEFORE writing [END_PROJECT]:
+    For EVERY page route in your [ROUTE_MANIFEST]:
+    □ app/{route}/page.tsx exists in your output
+    □ Every page has real content (forms, data, components) — not just a redirect or blank div
+    □ Every auth page has a real form (email + password inputs + submit handler)
+    □ If app has login/signup → app/dashboard/page.tsx EXISTS with real auth-gated content
+    □ Dashboard calls /api/auth/me on mount and redirects to /auth if not logged in
+    □ Dashboard shows user name/email and has a Sign Out button
+    □ After login/signup success, router.push('/dashboard') is called
+    □ Every nav link points to a route that exists in this output
+    □ Every API route referenced by a fetch() call is included in this output
+    □ No page is just: useEffect(() => { router.replace('/'); }, [router]); return null;
+    □ Every href like \`/resource/\${id}\` has a corresponding app/resource/[id]/page.tsx
+    If any checkbox fails, CREATE THE MISSING FILE before writing [END_PROJECT].
+
 ═══════════════════════════════════════════════════════════
 DESIGN EXCELLENCE — MANDATORY FOR EVERY APP
 ═══════════════════════════════════════════════════════════

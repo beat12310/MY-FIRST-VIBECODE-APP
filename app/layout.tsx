@@ -1,10 +1,19 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import { Inter } from 'next/font/google';
 import './app.css';
 import ConfigureAmplify from './components/ConfigureAmplify';
 import { AuthProvider } from '@/lib/auth-context';
 
 const inter = Inter({ subsets: ['latin'] });
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  minimumScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  interactiveWidget: 'resizes-content',
+};
 
 export const metadata: Metadata = {
   title: 'DWOMOH Vibe Code — AI App Builder',

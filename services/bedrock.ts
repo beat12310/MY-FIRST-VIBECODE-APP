@@ -98,6 +98,29 @@ const RETRY_DELAYS_MS   = [2_000, 4_000, 8_000]; // 2s → 4s → 8s exponential
 const TIMEOUT_CHAT_MS   =  60_000;  // 60 s — chat responses are short
 const TIMEOUT_BUILD_MS  = 270_000;  // 4.5 min — code-gen can be very large
 
+// ─── Cancellation helpers ───────────────────────────────────────────────────
+// Every Bedrock call in this file accepts an optional AbortSignal. When it fires
+// (caller cancellation OR a per-call timeout below), the in-flight HTTP request
+// is actually aborted via the AWS SDK's `abortSignal` request option — not just
+// abandoned while it keeps running in the background.
+
+export class AbortedError extends Error {
+  constructor(reason = 'Operation cancelled') { super(reason); this.name = 'AbortedError'; }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new AbortedError();
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new AbortedError()); return; }
+    const t = setTimeout(resolve, ms);
+    const onAbort = () => { clearTimeout(t); reject(new AbortedError()); };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 // ─── Client singleton ──────────────────────────────────────────────────────
 
 let bedrockClient: BedrockRuntimeClient | null = null;
@@ -135,8 +158,10 @@ async function invokeStreaming(
   messages:     ConversationTurn[],
   systemPrompt: string,
   maxTokens:    number,
-  modelId:      string = BEDROCK_MODELS.HAIKU
+  modelId:      string = BEDROCK_MODELS.HAIKU,
+  signal?:      AbortSignal,
 ): Promise<string> {
+  throwIfAborted(signal);
   const client  = initializeClient();
   const command = new InvokeModelWithResponseStreamCommand({
     modelId,
@@ -151,17 +176,25 @@ async function invokeStreaming(
     }),
   });
 
-  const response = await client.send(command);
+  const __t0 = Date.now();
+  console.log(`[Bedrock] request started model=${modelId.split('.').pop()} maxTokens=${maxTokens}`);
+  // abortSignal is a standard AWS SDK v3 request option — it actually cancels the
+  // in-flight HTTP request (not just stops the caller from waiting on it).
+  const response = await client.send(command, { abortSignal: signal });
   if (!response.body) throw new Error('Empty response stream from Bedrock');
+  console.log(`[Bedrock] stream opened after ${Date.now() - __t0}ms`);
 
   const decoder = new TextDecoder();
   let text = '';
+  let firstChunk = true;
 
   for await (const event of response.body) {
+    throwIfAborted(signal);
     if (event.chunk?.bytes) {
       try {
         const chunk = JSON.parse(decoder.decode(event.chunk.bytes));
         if (chunk.type === 'content_block_delta' && chunk.delta?.type === 'text_delta') {
+          if (firstChunk) { firstChunk = false; console.log(`[Bedrock] first token after ${Date.now() - __t0}ms`); }
           text += chunk.delta.text ?? '';
         }
         if (chunk.type === 'message_stop') break;
@@ -172,6 +205,7 @@ async function invokeStreaming(
   }
 
   if (!text) throw new Error('Bedrock stream produced no content — invalid response');
+  console.log(`[Bedrock] completed ${text.length} chars in ${Date.now() - __t0}ms`);
   return text;
 }
 
@@ -184,7 +218,8 @@ async function invokeWithRetry(
   systemPrompt: string,
   maxTokens:    number,
   context:      string,
-  modelId:      string = BEDROCK_MODELS.HAIKU
+  modelId:      string = BEDROCK_MODELS.HAIKU,
+  signal?:      AbortSignal,
 ): Promise<string> {
   const timeoutMs = maxTokens > 5_000 ? TIMEOUT_BUILD_MS : TIMEOUT_CHAT_MS;
   let lastErr: Error = new Error('Unknown Bedrock error');
@@ -192,38 +227,47 @@ async function invokeWithRetry(
   console.log(`[Bedrock][${context}] model=${modelId.split('.').pop()} maxTokens=${maxTokens}`);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    throwIfAborted(signal);
     if (attempt > 1) {
-      const delay = RETRY_DELAYS_MS[attempt - 2];
+      const backoff = RETRY_DELAYS_MS[attempt - 2];
       const kind  = classifyBedrockError(lastErr.message);
       console.warn(
-        `[Bedrock][${context}] ${bedrockErrorMessage(kind, attempt - 1, MAX_RETRIES)}  → waiting ${delay / 1000}s before retry ${attempt}…`
+        `[Bedrock][${context}] ${bedrockErrorMessage(kind, attempt - 1, MAX_RETRIES)}  → waiting ${backoff / 1000}s before retry ${attempt}…`
       );
-      await new Promise(r => setTimeout(r, delay));
+      await delay(backoff, signal);
     }
 
-    try {
-      const result = await Promise.race([
-        invokeStreaming(messages, systemPrompt, maxTokens, modelId),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`BEDROCK_TIMEOUT: ${context} timed out after ${timeoutMs / 1000}s`)),
-            timeoutMs
-          )
-        ),
-      ]);
+    // One AbortController per attempt, combining the caller's cancellation signal
+    // with this call's own timeout — either source ACTUALLY cancels the in-flight
+    // Bedrock HTTP request (via invokeStreaming's abortSignal), instead of merely
+    // giving up on waiting for it while it keeps running in the background.
+    const attemptController = new AbortController();
+    const onExternalAbort = () => attemptController.abort();
+    signal?.addEventListener('abort', onExternalAbort, { once: true });
+    const timer = setTimeout(() => attemptController.abort(), timeoutMs);
 
+    try {
+      const result = await invokeStreaming(messages, systemPrompt, maxTokens, modelId, attemptController.signal);
       if (attempt > 1) {
         console.log(`[Bedrock][${context}] Recovered on attempt ${attempt}/${MAX_RETRIES}`);
       }
       return result;
     } catch (err) {
-      lastErr = err instanceof Error ? err : new Error(String(err));
+      throwIfAborted(signal); // caller cancelled — propagate immediately, no more retries
+      if (attemptController.signal.aborted) {
+        lastErr = new Error(`BEDROCK_TIMEOUT: ${context} timed out after ${timeoutMs / 1000}s`);
+      } else {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+      }
       const kind = classifyBedrockError(lastErr.message);
       console.error(
         `[Bedrock][${context}] Attempt ${attempt}/${MAX_RETRIES} FAILED — [${kind}] ${lastErr.message}`
       );
       // Auth errors will not fix themselves on retry
       if (kind === 'AUTH_ERROR' || kind === 'QUOTA_EXCEEDED') break;
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onExternalAbort);
     }
   }
 
@@ -262,15 +306,18 @@ async function invokeWithModelFallback(
   systemPrompt: string,
   maxTokens:    number,
   context:      string,
-  tier:         BedrockTier
+  tier:         BedrockTier,
+  signal?:      AbortSignal,
 ): Promise<string> {
   const chain = BEDROCK_FALLBACK_CHAINS[tier];
   let lastErr: Error = new Error(`No models available for tier ${tier}`);
 
   for (const modelId of chain) {
+    throwIfAborted(signal); // don't start another model in the chain once cancelled
     try {
-      return await invokeWithRetry(messages, systemPrompt, maxTokens, context, modelId);
+      return await invokeWithRetry(messages, systemPrompt, maxTokens, context, modelId, signal);
     } catch (err) {
+      if (err instanceof AbortedError) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (isModelUnavailableError(msg)) {
         console.warn(`[Bedrock][${context}] Model ${modelId} unavailable — trying next in ${tier} chain`);
@@ -313,11 +360,12 @@ export { BEDROCK_MODELS, type BedrockTier };
 export async function converseWithEngineer(
   messages:     ConversationTurn[],
   systemPrompt: string,
-  tier:         BedrockTier = 'HAIKU'
+  tier:         BedrockTier = 'HAIKU',
+  signal?:      AbortSignal,
 ): Promise<string> {
   try {
     return await invokeWithModelFallback(
-      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse', tier
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'converse', tier, signal
     );
   } catch (error) {
     logError('Bedrock conversation failed', error);
@@ -332,7 +380,8 @@ export async function converseWithEngineer(
 export async function buildWithAI(
   userMessage:  string,
   systemPrompt: string,
-  tier:         BedrockTier = 'SONNET'
+  tier:         BedrockTier = 'SONNET',
+  signal?:      AbortSignal,
 ): Promise<string> {
   try {
     return await invokeWithModelFallback(
@@ -340,12 +389,71 @@ export async function buildWithAI(
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
       'build',
-      tier
+      tier,
+      signal,
     );
   } catch (error) {
     logError('Bedrock build failed', error);
     throw error;
   }
+}
+
+/**
+ * Streaming build call — used ONLY by the new engine Builder. Invokes `onDelta`
+ * for every text chunk as Bedrock streams, so the caller can parse+write files
+ * incrementally instead of waiting for the whole 77k-char response. Returns the
+ * full text as well. Additive — does not change buildWithAI or Bedrock config.
+ */
+export async function buildWithAIStream(
+  userMessage:  string,
+  systemPrompt: string,
+  onDelta:      (text: string) => void,
+  tier:         BedrockTier = 'SONNET',
+  signal?:      AbortSignal,
+): Promise<string> {
+  throwIfAborted(signal);
+  const modelId = BEDROCK_MODELS[tier];
+  const client  = initializeClient();
+  const command = new InvokeModelWithResponseStreamCommand({
+    modelId, contentType: 'application/json', accept: 'application/json',
+    body: JSON.stringify({
+      anthropic_version: BEDROCK_CONFIG.ANTHROPIC_VERSION,
+      max_tokens:        BEDROCK_CONFIG.MAX_TOKENS_BUILD,
+      temperature:       BEDROCK_CONFIG.TEMPERATURE,
+      system:            systemPrompt,
+      messages:          [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  const __t0 = Date.now();
+  console.log(`[Bedrock][stream] request started model=${modelId.split('.').pop()}`);
+  // abortSignal actually cancels the in-flight HTTP request when the caller aborts —
+  // this is the same builder streaming call that was left running in the background
+  // after a repair-stage timeout in the live engine test; this closes that gap.
+  const response = await client.send(command, { abortSignal: signal });
+  if (!response.body) throw new Error('Empty response stream from Bedrock');
+
+  const decoder = new TextDecoder();
+  let text = '';
+  let firstChunk = true;
+  for await (const event of response.body) {
+    throwIfAborted(signal);
+    if (event.chunk?.bytes) {
+      try {
+        const chunk = JSON.parse(decoder.decode(event.chunk.bytes));
+        if (chunk.type === 'content_block_delta' && chunk.delta?.type === 'text_delta') {
+          if (firstChunk) { firstChunk = false; console.log(`[Bedrock][stream] first token after ${Date.now() - __t0}ms`); }
+          const t = chunk.delta.text ?? '';
+          text += t;
+          onDelta(t);
+        }
+        if (chunk.type === 'message_stop') break;
+      } catch { /* malformed chunk — skip */ }
+    }
+  }
+  if (!text) throw new Error('Bedrock stream produced no content — invalid response');
+  console.log(`[Bedrock][stream] completed ${text.length} chars in ${Date.now() - __t0}ms`);
+  return text;
 }
 
 /**
@@ -357,7 +465,8 @@ export async function buildWithAI(
 export async function fixErrorsWithAI(
   prompt:       string,
   systemPrompt: string,
-  tier:         BedrockTier = 'SONNET'
+  tier:         BedrockTier = 'SONNET',
+  signal?:      AbortSignal,
 ): Promise<string> {
   const maxTokens = tier === 'STRONGEST'
     ? BEDROCK_CONFIG.MAX_TOKENS_REPAIR
@@ -368,7 +477,8 @@ export async function fixErrorsWithAI(
       systemPrompt,
       maxTokens,
       'fix-errors',
-      tier
+      tier,
+      signal,
     );
   } catch (error) {
     logError('Bedrock error-fix failed', error);
@@ -385,7 +495,8 @@ export async function fixErrorsWithAI(
 export async function editWithAI(
   contextMessage: string,
   systemPrompt:   string,
-  tier:           BedrockTier = 'SONNET'
+  tier:           BedrockTier = 'SONNET',
+  signal?:        AbortSignal,
 ): Promise<string> {
   try {
     return await invokeWithModelFallback(
@@ -393,7 +504,8 @@ export async function editWithAI(
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_BUILD,
       'edit',
-      tier
+      tier,
+      signal,
     );
   } catch (error) {
     logError('Bedrock edit failed', error);
@@ -411,7 +523,8 @@ export async function analyzeImageWithAI(
   mediaType:    string,
   instruction:  string,
   systemPrompt: string,
-  tier:         BedrockTier = 'SONNET'
+  tier:         BedrockTier = 'SONNET',
+  signal?:      AbortSignal,
 ): Promise<string> {
   const messages: ConversationTurn[] = [{
     role: 'user',
@@ -422,7 +535,7 @@ export async function analyzeImageWithAI(
   }];
   try {
     return await invokeWithModelFallback(
-      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision', tier
+      messages, systemPrompt, BEDROCK_CONFIG.MAX_TOKENS_CHAT, 'vision', tier, signal
     );
   } catch (error) {
     logError('Bedrock image analysis failed', error);
@@ -437,7 +550,8 @@ export async function analyzeImageWithAI(
 export async function generateLogoWithAI(
   prompt:       string,
   systemPrompt: string,
-  tier:         BedrockTier = 'HAIKU'
+  tier:         BedrockTier = 'HAIKU',
+  signal?:      AbortSignal,
 ): Promise<string> {
   try {
     return await invokeWithModelFallback(
@@ -445,7 +559,8 @@ export async function generateLogoWithAI(
       systemPrompt,
       BEDROCK_CONFIG.MAX_TOKENS_CHAT,
       'logo-gen',
-      tier
+      tier,
+      signal,
     );
   } catch (error) {
     logError('Bedrock logo generation failed', error);
@@ -515,7 +630,8 @@ export async function converseAgentically(
   messages:     ConversationTurn[],
   systemPrompt: string,
   toolExecutor: ToolExecutor,
-  maxToolRounds = 5
+  maxToolRounds = 5,
+  signal?:      AbortSignal,
 ): Promise<string> {
   const client  = initializeClient();
   // Sonnet is required for reliable tool use — Haiku frequently responds in prose
@@ -531,6 +647,7 @@ export async function converseAgentically(
   }));
 
   for (let round = 0; round < maxToolRounds; round++) {
+    throwIfAborted(signal);
     const body = JSON.stringify({
       anthropic_version: BEDROCK_CONFIG.ANTHROPIC_VERSION,
       max_tokens: BEDROCK_CONFIG.MAX_TOKENS_CHAT,
@@ -547,7 +664,7 @@ export async function converseAgentically(
       body,
     });
 
-    const response = await client.send(command);
+    const response = await client.send(command, { abortSignal: signal });
     const decoded  = JSON.parse(new TextDecoder().decode(response.body));
     const content: Array<{ type: string; id?: string; name?: string; input?: Record<string, unknown>; text?: string }> = decoded.content ?? [];
 
