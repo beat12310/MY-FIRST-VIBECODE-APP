@@ -42,7 +42,19 @@ import {
 } from '@/services/project-discovery';
 import { parseEditFormat, applyEditsToProject } from '@/services/file-editor';
 import { verifyRunningApp } from '@/services/verification-engine';
-import { captureScreenshot, clickElement, fillForm, debugPage } from '@/services/browser-automation';
+// captureScreenshot/clickElement/fillForm/debugPage (services/browser-automation.ts)
+// are deliberately NOT statically imported here -- that file has a top-level
+// `import { chromium } from 'playwright'`, and next.config's
+// outputFileTracingExcludes deliberately excludes node_modules/playwright/**
+// from the production bundle (to stay under Amplify's 230MB limit). A static
+// import crashes the ENTIRE route module with ERR_MODULE_NOT_FOUND the
+// moment ANY request hits /api/chat, regardless of action -- confirmed live
+// in production (every action, including trivial ones, returned a bare 500).
+// The three other playwright-backed modules used elsewhere in this file
+// (browser-journey-runner, link-crawler, generation-verifier) already use
+// `await import(...)` inside their specific action handlers, which only
+// evaluates -- and only fails -- when that action actually runs. These four
+// functions now follow the same, already-established pattern.
 import { generateDatabaseScaffold } from '@/services/database-integrator';
 import type { DatabaseType } from '@/services/database-integrator';
 import { prepareDeployment } from '@/services/deployment-engine';
@@ -2154,6 +2166,7 @@ Complete, working, production-quality code. No placeholders.`;
       const { port, path: urlPath = '/' } = body;
       if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
       const url = `http://localhost:${port}${urlPath}`;
+      const { captureScreenshot } = await import('@/services/browser-automation');
       const result = await captureScreenshot(url);
       return NextResponse.json({ success: result.success, screenshotUrl: result.screenshotUrl, error: result.error });
     }
@@ -2163,6 +2176,7 @@ Complete, working, production-quality code. No placeholders.`;
       const { port, path: urlPath = '/', selector } = body;
       if (!port || !selector) return NextResponse.json({ success: false, error: 'Missing port or selector' }, { status: 400 });
       const url = `http://localhost:${port}${urlPath}`;
+      const { clickElement } = await import('@/services/browser-automation');
       const result = await clickElement(url, selector);
       return NextResponse.json({ success: result.success, screenshotUrl: result.screenshotUrl, error: result.error });
     }
@@ -2172,6 +2186,7 @@ Complete, working, production-quality code. No placeholders.`;
       const { port, path: urlPath = '/', fields, submitSelector } = body;
       if (!port || !fields) return NextResponse.json({ success: false, error: 'Missing port or fields' }, { status: 400 });
       const url = `http://localhost:${port}${urlPath}`;
+      const { fillForm } = await import('@/services/browser-automation');
       const result = await fillForm(url, fields, submitSelector);
       return NextResponse.json({ success: result.success, screenshotUrl: result.screenshotUrl, error: result.error });
     }
@@ -2181,6 +2196,7 @@ Complete, working, production-quality code. No placeholders.`;
       const { port, path: urlPath = '/' } = body;
       if (!port) return NextResponse.json({ success: false, error: 'Missing port' }, { status: 400 });
       const url = `http://localhost:${port}${urlPath}`;
+      const { debugPage } = await import('@/services/browser-automation');
       const result = await debugPage(url);
       if (projectPath && result.success) {
         try {

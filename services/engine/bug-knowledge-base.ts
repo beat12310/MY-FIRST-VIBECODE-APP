@@ -340,6 +340,53 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['REPAIR: TIMED OUT', 'repair timing out just seconds past the adaptive budget', 'ABORT detected before re-verify', 'stopReason=cancelled — orchestrator aborted this stage'],
   },
+  {
+    id: 'chat-route-static-playwright-import-crashes-every-action',
+    title: 'A single static top-level import crashed the ENTIRE /api/chat route for every action, surfacing to users as "Connection interrupted / Build interrupted"',
+    category: 'other',
+    rootCause:
+      "app/api/chat/route.ts had a top-level `import { captureScreenshot, clickElement, fillForm, debugPage } from " +
+      "'@/services/browser-automation'` — and browser-automation.ts itself has a top-level `import { chromium } " +
+      "from 'playwright'`. next.config.js's outputFileTracingExcludes deliberately excludes " +
+      "node_modules/playwright/** (and puppeteer/**, sharp/**) from the production bundle to keep it under " +
+      "Amplify's 230MB limit. The moment ANY request hit /api/chat, loading the route module tried to load " +
+      "playwright, which was not present in the deployed bundle, throwing ERR_MODULE_NOT_FOUND and crashing " +
+      "the ENTIRE route with a raw HTTP 500 for every single action — including trivial, unrelated ones like " +
+      "'feature-flags' and 'list-project-files'. Confirmed live via CloudWatch logs " +
+      "(/aws/amplify/<appId>): 'Error [ERR_MODULE_NOT_FOUND]: Cannot find package \"playwright\" imported from " +
+      "/tmp/app/.next/server/app/api/chat/route.js'. This is why enabling the ENGINE_BUILD_FOR_SEND feature " +
+      "flag (switching the Send button to the new SSE streaming route) did NOT fix the reported 'Connection " +
+      "interrupted' symptom on its own: the flag itself is read via a plain fetch to /api/chat " +
+      "(action:'feature-flags'), which was ALSO crashing — so the client's flag check silently failed and " +
+      "every build attempt, on either pipeline, hit the same dead route. Three OTHER playwright-backed modules " +
+      "used elsewhere in this same file (browser-journey-runner.ts, link-crawler.ts, generation-verifier.ts) " +
+      "were already correctly loaded via `await import(...)` inside their specific action handlers — lazy by " +
+      "construction, so they only evaluate (and only fail) when that action actually runs. This one static " +
+      "import was the sole exception.",
+    filesAffected: ['app/api/chat/route.ts', 'scripts/check-platform-deps.ts'],
+    fixApplied:
+      "Removed the top-level import; converted all 4 call sites (browser-screenshot, browser-click, " +
+      "browser-fill, browser-debug action handlers) to `const { fn } = await import('@/services/browser-" +
+      "automation')` at the point of use, matching the already-established pattern for the other 3 " +
+      "playwright-backed modules. Also extended scripts/check-platform-deps.ts (already run as part of `npm " +
+      "run verify`) with a new checkStaticImportsOfExcludedPackages() check: walks every Next.js entry point " +
+      "(route.ts/page.tsx/layout.tsx/middleware.ts) for a STATIC-only import chain (through this platform's " +
+      "own @/-prefixed modules) that reaches a bare-package import of anything listed in next.config.js's " +
+      "outputFileTracingExcludes — structurally preventing this exact class of bug from recurring, since a " +
+      "dynamic `await import(...)` is exempt by construction.",
+    verificationPerformed:
+      "Confirmed live via CloudWatch that /api/chat returned HTTP 500 for every action (feature-flags, " +
+      "list-project-files, GET) while other routes (/api/domains, /api/billing, the new SSE route) returned " +
+      "correct 200/405 responses — isolating the crash to this one route's module. Confirmed the new check " +
+      "catches the regression: temporarily reverted the fix and re-ran `npx tsx scripts/check-platform-deps." +
+      "ts`, which correctly reported 'app/api/chat/route.ts statically loads \"playwright\" via: " +
+      "app/api/chat/route.ts -> services/browser-automation.ts'; restored the fix and confirmed it passes " +
+      "cleanly. Added 5 new unit tests for extractStaticImportSpecs (distinguishing static from dynamic " +
+      "imports). Full suite (183 tests), typecheck, and both check-platform-deps checks all pass.",
+    regressionTest: "scripts/__tests__/check-platform-deps.test.ts — 'extractStaticImportSpecs' describe block; scripts/check-platform-deps.ts's checkStaticImportsOfExcludedPackages() runs on every `npm run verify`",
+    dateFixed: '2026-07-05',
+    symptoms: ['Connection interrupted', 'Build interrupted', 'Retry Build', 'HTTP 500 on /api/chat for every action', 'ERR_MODULE_NOT_FOUND', "Cannot find package 'playwright'"],
+  },
 ];
 
 /**

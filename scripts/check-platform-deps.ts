@@ -101,6 +101,116 @@ export function packageNameOf(spec: string): string {
   return spec.split('/').slice(0, spec.startsWith('@') ? 2 : 1).join('/');
 }
 
+// ─── Static-import-of-excluded-package check ─────────────────────────────────
+// Root cause of a real production outage: app/api/chat/route.ts had a
+// top-level `import { ... } from '@/services/browser-automation'`, and that
+// module itself has a top-level `import { chromium } from 'playwright'`.
+// next.config.js's outputFileTracingExcludes deliberately excludes
+// node_modules/playwright/**, puppeteer/**, and sharp/** from the production
+// bundle (to stay under Amplify's 230MB limit) -- so the moment ANY request
+// hit /api/chat, loading the route module tried to load playwright, which
+// wasn't in the deployed bundle, throwing ERR_MODULE_NOT_FOUND and crashing
+// EVERY action, not just the ones that actually use a browser. The three
+// other playwright-backed modules in this codebase were already correctly
+// loaded via `await import(...)` inside their specific action handlers --
+// which only evaluates, and only fails, when that action actually runs.
+//
+// This check finds any STATIC (top-level, always-evaluated) import chain,
+// through this platform's own @/-prefixed modules only, that reaches a
+// bare-package import of something listed in next.config.js's
+// outputFileTracingExcludes. A DYNAMIC `await import(...)` is exempt, since
+// it's lazy by construction -- that's the actual fix pattern this check enforces.
+
+/** Static-only (ImportDeclaration/ExportDeclaration) specs -- excludes await import()/require() calls. */
+export function extractStaticImportSpecs(filePath: string, content: string): string[] {
+  const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true,
+    filePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const found: string[] = [];
+  function visit(node: ts.Node) {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      found.push(node.moduleSpecifier.text);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return found;
+}
+
+function loadExcludedPackages(): Set<string> {
+  const configPath = join(ROOT, 'next.config.js');
+  let content: string;
+  try { content = readFileSync(configPath, 'utf8'); } catch { return new Set(); }
+  const matches = [...content.matchAll(/['"]node_modules\/([^/'"]+)\/?\*\*['"]/g)];
+  return new Set(matches.map(m => m[1]));
+}
+
+/** Resolves a "@/..." local module spec to an absolute file path on disk, if it exists. */
+function resolveLocalSpec(spec: string): string | null {
+  if (!spec.startsWith('@/')) return null;
+  const base = join(ROOT, spec.slice(2));
+  for (const candidate of [`${base}.ts`, `${base}.tsx`, join(base, 'index.ts'), join(base, 'index.tsx')]) {
+    try { statSync(candidate); return candidate; } catch { /* try next */ }
+  }
+  return null;
+}
+
+export function checkStaticImportsOfExcludedPackages(): { file: string; pkg: string; chain: string[] }[] {
+  const excluded = loadExcludedPackages();
+  if (excluded.size === 0) return [];
+  const files = SOURCE_DIRS.flatMap(d => walk(join(ROOT, d)));
+  const issues: { file: string; pkg: string; chain: string[] }[] = [];
+
+  const staticSpecsCache = new Map<string, string[]>();
+  const getStaticSpecs = (file: string): string[] => {
+    const cached = staticSpecsCache.get(file);
+    if (cached) return cached;
+    let specs: string[] = [];
+    try { specs = extractStaticImportSpecs(file, readFileSync(file, 'utf8')); } catch { /* unreadable — skip */ }
+    staticSpecsCache.set(file, specs);
+    return specs;
+  };
+
+  // BFS through STATIC-only local (@/) import edges from `startFile`, looking
+  // for any bare-package spec that's in the excluded set. Returns the chain
+  // of file paths from startFile to the file with the offending import, or
+  // null if no excluded package is reachable this way.
+  const findExcludedChain = (startFile: string): { pkg: string; chain: string[] } | null => {
+    const seen = new Set<string>([startFile]);
+    const queue: { file: string; chain: string[] }[] = [{ file: startFile, chain: [startFile] }];
+    while (queue.length > 0) {
+      const { file, chain } = queue.shift()!;
+      for (const spec of getStaticSpecs(file)) {
+        if (!spec.startsWith('.') && !spec.startsWith('@/')) {
+          const pkg = packageNameOf(spec);
+          if (excluded.has(pkg)) return { pkg, chain };
+          continue;
+        }
+        const resolved = resolveLocalSpec(spec);
+        if (resolved && !seen.has(resolved)) {
+          seen.add(resolved);
+          queue.push({ file: resolved, chain: [...chain, resolved] });
+        }
+      }
+    }
+    return null;
+  };
+
+  // Only start the search from actual Next.js bundling entry points --
+  // route.ts (API routes), page.tsx, layout.tsx, middleware.ts. A module
+  // like services/browser-automation.ts is SUPPOSED to statically import
+  // playwright (that's its whole purpose); the bug this check exists to
+  // catch is only real when a route/entry point reaches it via a chain of
+  // STATIC imports, since Next.js bundles everything reachable that way
+  // into that route's Lambda regardless of whether the excluded package is
+  // actually invoked at runtime.
+  const entryPoints = files.filter(f => /[\\/](route|page|layout|middleware)\.tsx?$/.test(f));
+  for (const file of entryPoints) {
+    const result = findExcludedChain(file);
+    if (result) issues.push({ file: relative(ROOT, file), pkg: result.pkg, chain: result.chain.map(f => relative(ROOT, f)) });
+  }
+  return issues;
+}
+
 export function checkPlatformDeps(): { file: string; pkg: string }[] {
   const installedDeps = loadInstalledDeps();
   const files = SOURCE_DIRS.flatMap(d => walk(join(ROOT, d)));
@@ -119,11 +229,24 @@ export function checkPlatformDeps(): { file: string; pkg: string }[] {
 
 if (require.main === module) {
   const issues = checkPlatformDeps();
-  if (issues.length === 0) {
+  const excludedImportIssues = checkStaticImportsOfExcludedPackages();
+
+  if (issues.length === 0 && excludedImportIssues.length === 0) {
     console.log('✓ check-platform-deps: every import resolves to an installed dependency, a Node builtin, or a project-local path.');
+    console.log('✓ check-platform-deps: no static import chain reaches an outputFileTracingExcludes-excluded package.');
     process.exit(0);
   }
-  console.error(`✗ check-platform-deps: ${issues.length} import(s) reference a package not in package.json:\n`);
-  for (const { file, pkg } of issues) console.error(`  ${file} imports "${pkg}"`);
+
+  if (issues.length > 0) {
+    console.error(`✗ check-platform-deps: ${issues.length} import(s) reference a package not in package.json:\n`);
+    for (const { file, pkg } of issues) console.error(`  ${file} imports "${pkg}"`);
+  }
+  if (excludedImportIssues.length > 0) {
+    console.error(`\n✗ check-platform-deps: ${excludedImportIssues.length} STATIC import chain(s) reach a package excluded from the production bundle:\n`);
+    for (const { file, pkg, chain } of excludedImportIssues) {
+      console.error(`  ${file} statically loads "${pkg}" via: ${chain.join(' -> ')}`);
+      console.error(`    Fix: use "await import(...)" inside the specific code path that needs it, not a top-level import.`);
+    }
+  }
   process.exit(1);
 }
