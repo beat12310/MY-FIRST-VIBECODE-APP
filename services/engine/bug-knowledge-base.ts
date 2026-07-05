@@ -425,6 +425,45 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'Server start failed after 3 strategies', 'Advanced repair finished — 0 file(s) changed'],
   },
+  {
+    id: 'x-amplify-credentials-fix-bypassed-by-racing-90s-timer',
+    title: 'The x-amplify-credentials fix was correct but got bypassed by an independent, racing 90-second timeout timer that never checked it',
+    category: 'other',
+    rootCause:
+      "The previous fix (see 'generated-app-dev-server-inherits-amplify-hosting-env' above) correctly " +
+      "added isEnvironmentalServerError() checks to the 3-strategy retry loop's own completion logic in " +
+      "app/builder/page.tsx -- but that loop is NOT the only path that can call autoEscalateToBridge for a " +
+      "server-start failure. A SEPARATE 90-second safety-net timer (set up BEFORE the 3-strategy loop even " +
+      "starts) runs independently and calls autoEscalateToBridge unconditionally the moment it fires, with " +
+      "no environmental-error check at all. The full 3-strategy sequence (which can include two rounds of " +
+      "AI calls -- auto-recover, fix-errors) can easily take longer than 90 seconds, so this timer often " +
+      "fires FIRST and escalates before the retry loop's own (correct) skip-logic ever gets a chance to " +
+      "run -- bypassing the previous fix entirely. Confirmed live: the exact same '[x-amplify-credentials] " +
+      "Credential listener could not be started: Error: listen' crash still reached 'Advanced repair' " +
+      "(which correctly changed 0 files) even after the previous fix was deployed and confirmed live via " +
+      "its own successful Amplify job. Separately, root-caused why the underlying env-var-prefix-stripping " +
+      "fix itself likely wasn't sufficient either: NODE_OPTIONS and NODE_PATH don't start with any of " +
+      "AWS_/AMPLIFY_/LAMBDA_/etc, so prefix-based stripping never touched them -- AWS Lambda/Amplify " +
+      "Hosting runtimes commonly inject a forced `--require <instrumentation-module>` via NODE_OPTIONS " +
+      "that applies unconditionally to any process that inherits it, unlike env vars a dependency merely " +
+      "detects.",
+    filesAffected: ['app/builder/page.tsx', 'services/project-runner.ts'],
+    fixApplied:
+      "(1) Added the same isEnvironmentalServerError() check to the 90-second safety-net timer's own " +
+      "handler AND to a third, independent 'preview watchdog' escalation path (server started but never " +
+      "served an HTTP response) -- all three places that can call autoEscalateToBridge for a startup " +
+      "failure now consistently skip it for environmental errors. (2) Added NODE_OPTIONS and NODE_PATH to " +
+      "an exact-name clear list in buildIsolatedDevServerEnv (services/project-runner.ts), alongside the " +
+      "existing prefix-based stripping, removing the likely actual trigger mechanism rather than only " +
+      "reacting to its failure afterward. (3) Extracted the crash-log analysis into analyzeCrashLog(), " +
+      "which now also extracts and reports port numbers mentioned in the crash output (distinct from the " +
+      "intended preview port), surfacing an actual port/process conflict explicitly instead of only the " +
+      "first matching error line.",
+    verificationPerformed: 'Added 6 new unit tests (analyzeCrashLog port-diagnostic extraction; NODE_OPTIONS/NODE_PATH clearing) plus a dedicated end-to-end-shaped regression test feeding a realistic x-amplify-credentials crash log through the full chain (analyzeCrashLog -> isEnvironmentalServerError) and confirming it is correctly classified, without needing a real multi-minute Bedrock build. Full suite (205 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "services/__tests__/project-runner.test.ts — 'analyzeCrashLog' and 'car sales marketplace preview — full crash-to-classification chain' describe blocks",
+    dateFixed: '2026-07-05',
+    symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'Advanced repair finished — 0 file(s) changed', 'same error recurs after a deployed fix', 'escalation happens despite environmental-error detection'],
+  },
 ];
 
 /**

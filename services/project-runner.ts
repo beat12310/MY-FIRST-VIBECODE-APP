@@ -32,6 +32,22 @@ import { findAvailablePort, waitForPort } from './port-detector';
 // app needs none of these for its own (non-AWS-backed) functionality.
 const STRIP_ENV_PREFIXES = ['AWS_', 'AMPLIFY_', 'LAMBDA_', '_X_AMZN_', '_HANDLER', '_AWS_XRAY_'];
 
+// STRIP_ENV_PREFIXES alone was NOT sufficient — confirmed live: the same
+// "[x-amplify-credentials] Credential listener could not be started: Error:
+// listen" crash still occurred after that fix deployed. NODE_OPTIONS and
+// NODE_PATH are the actual likely mechanism: AWS Lambda/Amplify Hosting
+// runtimes commonly inject a forced `--require <instrumentation-module>`
+// via NODE_OPTIONS to auto-instrument EVERY Node.js process for
+// observability/credential-forwarding purposes. Unlike env vars the
+// generated app's OWN dependencies might auto-detect, NODE_OPTIONS is
+// applied unconditionally by Node itself to any process that inherits it —
+// no prefix-based env-var stripping touches it, since the variable name
+// itself doesn't start with AWS_/AMPLIFY_/etc. Explicitly clearing it (and
+// NODE_PATH, which could otherwise leak module resolution to a parent
+// node_modules containing Amplify-adjacent packages) removes the trigger
+// at its source rather than only reacting to its failure afterward.
+const EXACT_VARS_TO_CLEAR = ['NODE_OPTIONS', 'NODE_PATH'];
+
 /**
  * Builds the environment for the generated app's dev-server child process:
  * everything from the current process EXCEPT Amplify-Hosting/Lambda-specific
@@ -42,6 +58,7 @@ export function buildIsolatedDevServerEnv(source: Record<string, string | undefi
   const clean: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(source)) {
     if (STRIP_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) continue;
+    if (EXACT_VARS_TO_CLEAR.includes(key)) continue;
     clean[key] = value;
   }
   // The platform's own process runs with NODE_ENV=production in deployed
@@ -50,6 +67,32 @@ export function buildIsolatedDevServerEnv(source: Record<string, string | undefi
   // object literal -- NODE_ENV is read-only on NodeJS.ProcessEnv and can't
   // be reassigned on an already-typed object) rather than inherited.
   return { ...clean, NODE_ENV: 'development' } as NodeJS.ProcessEnv;
+}
+
+/**
+ * Analyzes a crashed dev server's captured stdout/stderr log: extracts the
+ * most relevant error lines and produces a port diagnostic (requirement:
+ * "show the exact port and process conflict") -- the intended preview port
+ * this attempt tried to use, plus any port number(s) mentioned in the crash
+ * output itself (e.g. "EADDRINUSE: address already in use :::3001", or an
+ * unrelated listener trying a DIFFERENT port than the one Next.js was told
+ * to use). These can differ, which is exactly the kind of mismatch worth
+ * surfacing explicitly rather than only reporting the first matching error
+ * line and leaving the actual port conflict implicit.
+ */
+export function analyzeCrashLog(crashLog: string, port: number): { errorLines: string; portDiagnostic: string; error: string } {
+  const errorLines = crashLog.split('\n')
+    .filter(l => /error|failed|module not found|cannot find|unexpected token|enoent|syntax|listen|credential/i.test(l))
+    .slice(0, 15)
+    .join('\n');
+
+  const mentionedPorts = [...crashLog.matchAll(/:(\d{4,5})\b/g)].map(m => m[1]);
+  const uniqueMentionedPorts = [...new Set(mentionedPorts)];
+  const portDiagnostic = `intended preview port=${port}` +
+    (uniqueMentionedPorts.length > 0 ? `; port(s) mentioned in crash output: ${uniqueMentionedPorts.join(', ')}` : '');
+
+  const error = (errorLines || crashLog.slice(-300) || 'Server exited unexpectedly at startup') + `\n[${portDiagnostic}]`;
+  return { errorLines, portDiagnostic, error };
 }
 
 export interface ValidationResult {
@@ -358,15 +401,12 @@ export async function startDevServer(projectPath: string, force = false): Promis
     if (outcome === 'crashed') {
       await new Promise(r => setTimeout(r, 300)); // let log stream flush
       const crashLog = await readFile(logPath, 'utf-8').catch(() => '');
-      const errorLines = crashLog.split('\n')
-        .filter(l => /error|failed|module not found|cannot find|unexpected token|enoent|syntax/i.test(l))
-        .slice(0, 5)
-        .join('\n');
+      const analysis = analyzeCrashLog(crashLog, port);
       return {
         success: false,
-        logs: [...logs, '❌ Server crashed immediately after launch'],
-        error: errorLines || crashLog.slice(-300) || 'Server exited unexpectedly at startup',
-        crashLog: crashLog.slice(-3000),
+        logs: [...logs, '❌ Server crashed immediately after launch', `🔎 ${analysis.portDiagnostic}`],
+        error: analysis.error,
+        crashLog: crashLog.slice(-6000),
       };
     }
 

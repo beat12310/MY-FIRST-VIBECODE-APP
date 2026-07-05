@@ -5423,6 +5423,20 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
 
       // 90-second safety net — never stay on "Starting Server" indefinitely.
       // If the server hasn't responded, auto-escalate to the bridge instead of just showing an error.
+      //
+      // ROOT CAUSE of a real production bug: this timer runs INDEPENDENTLY
+      // of and RACES AGAINST the 3-strategy retry logic below, which DOES
+      // check isEnvironmentalServerError before ever escalating. The
+      // 3-strategy sequence can easily take longer than 90s once it
+      // involves AI calls (auto-recover, fix-errors), so this timer often
+      // fires FIRST and escalated to the bridge UNCONDITIONALLY — bypassing
+      // that check entirely. Confirmed live: the exact same "[x-amplify-
+      // credentials] Credential listener could not be started: Error:
+      // listen" environmental error kept reaching "Advanced repair" (which
+      // correctly changed 0 files, since there was never anything wrong
+      // with the generated app's code) specifically because THIS timer,
+      // not the 3-strategy path, was the one firing. Now applies the same
+      // check here.
       let _serverStartTimer: ReturnType<typeof setTimeout> | null = setTimeout(async () => {
         _serverStartTimer = null;
         const logData = await api({ action: 'get-server-logs', projectPath: path }).catch(() => ({ logs: '' }));
@@ -5437,6 +5451,19 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           message: '⏱ Server startup timed out — escalating to advanced repair…',
           logs: [...(p?.logs ?? []), '⏱ Startup exceeded 90 seconds', errorLines || 'No error detail captured'],
         }));
+
+        if (isEnvironmentalServerError(rawLog) || isEnvironmentalServerError(errorLines)) {
+          appendLog('⚠️ Startup timeout was caused by an environmental error, not a code problem — skipping advanced repair.');
+          narrate(
+            `⚠️ **Preview couldn't start — environment issue, not a code problem.**\n\n` +
+            `The generated app's files are ready, but the preview server hit a startup issue in this ` +
+            `environment (${errorLines ? errorLines.slice(0, 150) : 'server did not respond within 90s'}). ` +
+            `This is not something an AI code fix can resolve. Try starting the preview again in a moment, ` +
+            `or contact support if this keeps happening.`
+          );
+          return;
+        }
+
         // Auto-escalate: let Claude Code inspect the project and fix the startup failure
         const serverEscPrompt = `The Next.js dev server for the project at ${path} failed to start within 90 seconds.\n\nServer error output:\n${errorLines || 'No error captured'}\n\nInspect the project:\n1. Check for TypeScript errors or missing dependencies\n2. Fix any syntax or import errors in source files\n3. Ensure next.config.js is valid\n4. Run the dev server and confirm it starts successfully\n5. Verify / returns 200\n\nFix all issues so the server starts and the app loads.`;
         autoEscalateToBridge(
@@ -5716,6 +5743,20 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
               ...(diagLines ? [diagLines] : ['No error detail captured from server logs']),
             ],
           }));
+
+          // Same environmental-error check as the server-start paths above —
+          // a third, independent escalation trigger that must not send an
+          // unfixable-by-code error to the AI repair bridge either.
+          if (isEnvironmentalServerError(rawLog) || isEnvironmentalServerError(diagLines)) {
+            appendLog('⚠️ Preview health timeout was caused by an environmental error, not a code problem — skipping advanced repair.');
+            narrate(
+              `⚠️ **Preview couldn't load — environment issue, not a code problem.**\n\n` +
+              `The generated app's files are ready, but the preview server hit a startup issue in this ` +
+              `environment (${diagLines.slice(0, 150) || 'no HTTP response'}). This is not something an AI code ` +
+              `fix can resolve. Try starting the preview again in a moment, or contact support if this keeps happening.`
+            );
+            return;
+          }
 
           // Build a targeted bridge prompt that includes the actual server-log errors
           const watchdogBridgePrompt = [
