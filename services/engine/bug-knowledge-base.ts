@@ -219,25 +219,28 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     symptoms: ['test timed out', 'fetch previewUrl hangs', 'fast CI test taking 90 seconds', 'warmup loop'],
   },
   {
-    id: 'npm-ci-rejects-valid-lockfile-nested-otel-uuid',
-    title: 'npm ci rejected an immediately-fresh, valid package-lock.json over nested @opentelemetry/uuid version drift',
+    id: 'npm-ci-fails-in-github-actions-but-not-locally',
+    title: 'npm ci failed in GitHub Actions (uuid/@opentelemetry/core "missing from lock file") against a lock file that installs cleanly with npm ci locally',
     category: 'other',
     rootCause:
-      "@aws-amplify/backend's CDK-adjacent packages (data-construct, graphql-api-construct) each " +
-      "pull in their OWN duplicated copy of @opentelemetry/* and uuid, some via exact-pinned " +
-      "sub-dependency requirements (e.g. @opentelemetry/resources requiring exactly " +
-      "@opentelemetry/core@2.0.0) that don't match the newer version (2.9.0/2.8.0) npm's normal " +
-      "install resolution hoists/dedupes to. npm install tolerates this via its standard semver-range " +
-      "resolution and produces a correct, working node_modules — confirmed by a full npm run verify " +
-      "pass. npm ci's stricter byte-exact lockfile validation rejects it as 'missing' regardless, " +
-      "even immediately after a from-scratch npm install regenerated the lock file fresh (reproduced " +
-      "twice, with two different missing packages each time, ruling out simple lockfile staleness).",
-    filesAffected: ['.github/workflows/ci.yml', '.github/workflows/scheduled-verification.yml', 'package-lock.json'],
-    fixApplied: "Changed CI's install step from npm ci to npm install. Still deterministic (installs FROM the committed lock file, not a live re-resolution loophole) — just tolerates this specific dependency tree's legitimate version-range flexibility instead of npm ci's stricter check.",
-    verificationPerformed: 'Reproduced the npm ci failure twice locally in a true clean-room test (moved node_modules aside, ran npm ci fresh) even after regenerating package-lock.json from scratch; confirmed npm install succeeds and the full npm run verify (157 tests, typecheck, dependency check) passes against the resulting install.',
-    regressionTest: '(not a permanent automated regression test -- this is an install-tooling compatibility fact about the current dependency tree, revisit if @aws-amplify/backend is upgraded/removed)',
+      "The ORIGINAL, committed package-lock.json (from before this incident) installs cleanly with " +
+      "npm ci locally (confirmed: 1602 packages, zero errors, in a true clean-room test) — but the " +
+      "identical lock file failed in GitHub Actions' Ubuntu runner with 'Missing: uuid@9.0.1'/" +
+      "'@opentelemetry/core@2.0.0 from lock file', pointing to real npm-version or platform-specific " +
+      "resolution differences for this deeply-nested @aws-amplify/backend dependency tree (duplicated, " +
+      "some exact-pinned, @opentelemetry/*/uuid copies under data-construct and graphql-api-construct). " +
+      "MISTAKE MADE WHILE INVESTIGATING: deleted and regenerated package-lock.json from scratch " +
+      "instead of just fixing the workflow's install command — the regenerated lock file introduced a " +
+      "REAL regression (newer, incompatible @aws-sdk/client-amplify/route-53/codecommit versions " +
+      "breaking typecheck: missing StartJobCommand/UpdateAppCommand exports, missing type " +
+      "declarations), only caught because the pre-commit hook's npm run verify correctly blocked the " +
+      "commit. Reverted package-lock.json back to the original, known-good state.",
+    filesAffected: ['.github/workflows/ci.yml', '.github/workflows/scheduled-verification.yml'],
+    fixApplied: "Kept the ORIGINAL package-lock.json untouched. Changed CI's install step from npm ci to npm install, which tolerates the CI-environment-specific resolution difference the same way npm ci does locally, without needing byte-exact lockfile validation to agree across environments.",
+    verificationPerformed: 'Confirmed npm ci succeeds against the reverted lock file in a true clean-room LOCAL test (1602 packages, matching the very first clean-room test before any regeneration); confirmed npm run verify (157 tests, typecheck, dependency check) passes against it; confirmed the actual GitHub Actions CI run succeeds with npm install + the reverted lock file.',
+    regressionTest: '(not a permanent automated regression test -- this is an install-tooling environment-difference fact about the current dependency tree, revisit if @aws-amplify/backend is upgraded/removed)',
     dateFixed: '2026-07-05',
-    symptoms: ['npm error code EUSAGE', 'Missing: ... from lock file', 'npm ci fails in CI but works locally', '@opentelemetry/core', 'uuid@9.0.1'],
+    symptoms: ['npm error code EUSAGE', 'Missing: ... from lock file', 'npm ci fails in CI but works locally', 'Invalid Version', '@opentelemetry/core', 'uuid@9.0.1'],
   },
 ];
 

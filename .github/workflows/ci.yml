@@ -19,7 +19,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          # cache: 'npm' intentionally removed — a stale cache keyed to a
+          # PRIOR package-lock.json (before this session's regeneration) is
+          # one candidate explanation for an "Invalid Version" failure that
+          # reproduces deterministically in this exact CI environment but
+          # not locally; removing the cache rules it out (or fixes it) with
+          # a one-line change, before falling back to deeper forensics.
+      - run: node --version && npm --version
       # npm ci (not npm install) fails on this dependency tree: @aws-amplify/
       # backend's CDK-adjacent packages pull in multiple duplicated,
       # differently-versioned copies of @opentelemetry/* and uuid (some via
@@ -32,6 +38,9 @@ jobs:
       # re-resolution loophole) — it just tolerates this specific tree's
       # legitimate version-range flexibility instead of npm ci's stricter check.
       - run: npm install
+      - name: Dump npm debug log on failure (diagnostic)
+        if: failure()
+        run: cat /home/runner/.npm/_logs/*-debug-0.log || true
       - name: Typecheck
         run: npm run typecheck
       - name: Regression suite
