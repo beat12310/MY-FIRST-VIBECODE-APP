@@ -27,6 +27,18 @@ backend:
     build:
       commands:
         - npm install
+        # Diagnostic: two consecutive real deploy attempts (with AND without
+        # build caching, ruling out stale cache as the cause) both showed
+        # the exact same "audited 618 packages" and "npm error could not
+        # determine executable to run" for ampx, despite package.json's root
+        # devDependencies explicitly declaring @aws-amplify/backend-cli.
+        # These print real, concrete evidence of what actually got installed
+        # (working directory, whether the package directory + its bin
+        # symlink genuinely exist) instead of guessing further.
+        - pwd
+        - echo "--- @aws-amplify/backend-cli in package.json ---" && grep backend-cli package.json || echo "NOT FOUND in package.json"
+        - echo "--- node_modules/@aws-amplify/backend-cli ---" && ls node_modules/@aws-amplify/backend-cli 2>&1 || echo "DIRECTORY MISSING"
+        - echo "--- node_modules/.bin/ampx ---" && ls -la node_modules/.bin/ampx 2>&1 || echo "BIN SYMLINK MISSING"
         - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
 frontend:
   phases:
