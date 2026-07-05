@@ -320,6 +320,26 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['repair: incomplete', 'REPAIR: TIMED OUT', 'no progress across consecutive iterations', 'Resource ... is not represented as a dashboard widget', 'Dynamic detail page is missing breadcrumb navigation', 'remainingInternalIssues 1-3 after repair used all attempts'],
   },
+  {
+    id: 'repair-adaptive-timeout-still-under-budgeted-after-parallelization',
+    title: 'Repair timeout still ran out even after parallelizing batch chunks -- the formula budgeted for ~1 iteration, not the 2-4 a real repair needs',
+    category: 'other',
+    rootCause:
+      "Found by re-running the Golden Project Suite specifically to validate the stubborn-escalation + " +
+      "chunk-parallelization fix (see 'repair-loop-1-2-stragglers-and-batch-timeouts' above). Parallelization " +
+      "genuinely cut a single iteration's cost, but two concrete near-misses in the SAME validation run showed " +
+      "the adaptive timeout formula (REPAIR_PER_EXTRA_FAILURE_MS=8000) was still calibrated for roughly ONE " +
+      "iteration's cost, not the realistic 2-4 iterations a repair needs to actually converge: a 15-failure " +
+      "build missed its 280s budget by 7 seconds after converging 15->2->3->5 across 4 iterations; a " +
+      "27-failure build's first iteration alone (already parallelized) took ~198s against a 376s total " +
+      "budget, leaving only ~178s for a second iteration to finish -- not enough.",
+    filesAffected: ['services/engine/orchestrator.ts'],
+    fixApplied: 'Raised REPAIR_PER_EXTRA_FAILURE_MS from 8_000 to 15_000ms -- gives a 15-failure build ~315s (vs the 287s+ actually needed) and a 27-failure build ~495s (vs iteration 1\'s observed ~198s + real room for further iterations), based on the per-iteration costs actually observed (parallelized first iteration ~130-200s regardless of chunk count; later iterations with fewer remaining failures much faster, ~20-70s).',
+    verificationPerformed: 'Added 4 new unit tests (orchestrator-timeout.test.ts) asserting: small batches keep the exact base timeout; a 15-failure batch now exceeds the real 287s near-miss; a 27-failure batch now exceeds iteration-1-cost + the real remaining-budget shortfall; the cap still holds for very large failure counts. Full suite (163 tests), typecheck, dependency check all pass.',
+    regressionTest: "services/engine/__tests__/orchestrator-timeout.test.ts — 'computeRepairTimeout — adaptive budget calibrated against real multi-iteration repair costs' describe block",
+    dateFixed: '2026-07-05',
+    symptoms: ['REPAIR: TIMED OUT', 'repair timing out just seconds past the adaptive budget', 'ABORT detected before re-verify', 'stopReason=cancelled — orchestrator aborted this stage'],
+  },
 ];
 
 /**

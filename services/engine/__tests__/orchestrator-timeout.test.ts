@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runPipeline, StageTimeoutError, type OrchestratorDeps } from '../orchestrator';
+import { runPipeline, StageTimeoutError, computeRepairTimeout, type OrchestratorDeps } from '../orchestrator';
 import type { AppPlan, BuildResult, VerifyResult, RepairResult } from '../types';
 
 const minimalPlan: AppPlan = {
@@ -100,5 +100,35 @@ describe('orchestrator — verification never hangs (fixed via withTimeout, DEFA
     expect(err.ms).toBe(120_000);
     expect(err.message).toContain('verify');
     expect(err.message).toContain('120000');
+  });
+});
+
+describe('computeRepairTimeout — adaptive budget calibrated against real multi-iteration repair costs', () => {
+  // Confirmed live via the Golden Project Suite's repair-engine validation
+  // run: even AFTER repairer.ts's applyFixBatch started running its chunked
+  // Bedrock calls concurrently (cutting a single iteration's cost
+  // dramatically), the timeout formula was still only budgeting for roughly
+  // ONE iteration -- a real repair typically needs 2-4 to converge. Two
+  // concrete near-misses in the same run: a 15-failure build missed a 280s
+  // budget by 7 seconds after 4 iterations; a 27-failure build's first
+  // iteration alone (already parallelized) took ~198s against a 376s total
+  // budget, leaving only ~178s for a second iteration.
+  it('small batches (<=10 failures) keep the exact base timeout, unchanged', () => {
+    expect(computeRepairTimeout(5, 240_000)).toBe(240_000);
+    expect(computeRepairTimeout(10, 240_000)).toBe(240_000);
+  });
+
+  it('a 15-failure batch gets enough budget to have covered the real 287s near-miss', () => {
+    const timeout = computeRepairTimeout(15, 240_000);
+    expect(timeout).toBeGreaterThan(287_000);
+  });
+
+  it('a 27-failure batch gets enough budget for a slow ~198s first iteration plus a real second iteration', () => {
+    const timeout = computeRepairTimeout(27, 240_000);
+    expect(timeout).toBeGreaterThan(198_000 + 178_000); // first iteration's real cost + more than it got last time for the rest
+  });
+
+  it('still caps at REPAIR_MAX_TIMEOUT_MS for very large failure counts', () => {
+    expect(computeRepairTimeout(500, 240_000, 600_000)).toBe(600_000);
   });
 });

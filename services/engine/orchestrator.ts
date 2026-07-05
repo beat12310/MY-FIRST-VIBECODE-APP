@@ -98,9 +98,25 @@ export const DEFAULT_STAGE_TIMEOUTS: Record<StageName, number> = {
  * Above that, the timeout grows linearly with failure count (more failures
  * → bigger batches per Bedrock call and/or more iterations needed to
  * converge), capped so a single stage can never run unboundedly long.
+ *
+ * REPAIR_PER_EXTRA_FAILURE_MS raised 8_000 -> 15_000 after repairer.ts's
+ * applyFixBatch started running its chunked Bedrock calls CONCURRENTLY
+ * instead of sequentially (see repairer.ts's Promise.allSettled comment) —
+ * that fix cut a single iteration's wall-clock cost dramatically, but the
+ * Golden Project Suite's re-validation run then surfaced the REMAINING gap
+ * live: the formula was still budgeting for roughly ONE iteration, not the
+ * 2-4 iterations a real repair typically needs. Confirmed twice in the same
+ * run: a 15-failure build missed its 280s budget by 7 seconds after
+ * converging 15->2->3->5 across 4 iterations; a 27-failure build's first
+ * iteration alone (already parallelized) took ~198s against a 376s total
+ * budget, leaving only ~178s for a second iteration to finish. 15_000
+ * gives a 15-failure build ~315s and a 27-failure build ~495s -- comfortable
+ * margin for multiple iterations based on the per-iteration costs actually
+ * observed (a parallelized first iteration ~130-200s regardless of chunk
+ * count; later iterations with fewer remaining failures much faster, ~20-70s).
  */
 const REPAIR_SMALL_BATCH_THRESHOLD = 10;
-const REPAIR_PER_EXTRA_FAILURE_MS = 8_000;
+const REPAIR_PER_EXTRA_FAILURE_MS = 15_000;
 const REPAIR_MAX_TIMEOUT_MS = 600_000; // 10 min — matches the 'build' stage's own cap
 
 export function computeRepairTimeout(

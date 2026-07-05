@@ -10,10 +10,30 @@
  * in services/engine/__tests__/e2e-pipeline.test.ts, meant to run on a
  * schedule or by explicit manual trigger only.
  */
+import { readFileSync } from 'fs';
 import { readFile, readdir, stat, mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { runPipeline, defaultOrchestratorDeps } from '../services/engine/orchestrator';
+
+// A standalone `tsx` process does NOT get Next.js's automatic .env.local
+// loading — confirmed live: the Golden Project Suite's very first real run
+// failed all 8 projects instantly with "Missing configuration:
+// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY" despite .env.local having them.
+// Mirrors scripts/bedrock-health.ts's own loader exactly. Only fills in
+// values not already set, so this is a no-op (and harmless) in CI, where
+// aws-actions/configure-aws-credentials already sets these process-wide
+// from the OIDC-assumed role — .env.local is never read there at all.
+try {
+  const raw = readFileSync('.env.local', 'utf8');
+  for (const line of raw.split('\n')) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    const key = m[1];
+    const val = m[2].trim().replace(/^["']|["']$/g, '');
+    if (process.env[key] === undefined) process.env[key] = val;
+  }
+} catch { /* no .env.local (e.g. in CI) — process.env is used as-is */ }
 
 export interface RealRunSummary {
   prompt: string;
