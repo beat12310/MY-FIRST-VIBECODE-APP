@@ -2225,8 +2225,19 @@ function BuilderInner() {
 And these project files:
 ${fileList}
 
-Which ONE file needs to change? Reply with ONLY the relative file path (e.g. app/sell/page.tsx).
-If multiple files need changes, reply "MULTI" and this will be handled by the standard editor.`;
+Respond in EXACTLY this format, nothing else:
+
+INTERPRETATION: <one short, plain-language sentence stating what you believe should change>
+FILE: <the ONE relative file path to change, e.g. app/sell/page.tsx>
+
+If several files need changes together as ONE coordinated edit, reply with FILE: MULTI instead of a
+path (INTERPRETATION is still required).
+
+Only if the request is GENUINELY ambiguous — there are multiple DIFFERENT, unrelated things it could
+plausibly mean, and nothing in the request or file list lets you pick one with reasonable confidence —
+respond instead with EXACTLY:
+AMBIGUOUS: <a short, specific question naming the plausible options, e.g. "There are buttons on both
+the signup page and the contact page — which one did you mean?">`;
 
           const identifyResult = await api({
             action: 'agent-fix',
@@ -2237,15 +2248,38 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
             tier: 'HAIKU',
           }).catch(() => null);
 
-          // Parse the identified file from the AI response — but also check api response for changedFiles
           const rawResponse = identifyResult?.rawAiResponse ?? '';
-          const fileMatch = rawResponse.match(/(?:app|components|lib|services)\/[\w/\-\.]+\.(?:tsx?|jsx?)/);
-          const identifiedFile = fileMatch?.[0] ?? '';
 
-          if (!identifiedFile || rawResponse.includes('MULTI')) {
+          // Genuinely ambiguous — ask the real question and stop. Do NOT touch
+          // any file until the user's next message disambiguates.
+          const ambiguousMatch = rawResponse.match(/AMBIGUOUS:\s*(.+)/i);
+          if (ambiguousMatch) {
+            addStatus('Needs clarification.', 'checking');
+            addMsg('assistant', ambiguousMatch[1].trim());
+            return;
+          }
+
+          const interpretationMatch = rawResponse.match(/INTERPRETATION:\s*(.+)/i);
+          const interpretation = interpretationMatch?.[1]?.trim() ?? '';
+          // FILE: MULTI (structured) or a bare "MULTI" reply (old-format fallback)
+          // both mean "needs several files together" — falls through to the
+          // standard editor unchanged. Otherwise parse the file path from
+          // either the structured FILE: line or (fallback) anywhere in the
+          // response, so a slightly malformed reply still degrades gracefully
+          // instead of silently doing nothing.
+          const isMulti = /FILE:\s*MULTI\b/i.test(rawResponse) || /\bMULTI\b/.test(rawResponse);
+          const fileLineMatch = rawResponse.match(/FILE:\s*((?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?))/i);
+          const fileMatch = fileLineMatch ?? rawResponse.match(/(?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?)/);
+          const identifiedFile = fileMatch?.[1] ?? fileMatch?.[0] ?? '';
+
+          if (!identifiedFile || isMulti) {
             // Can't identify single file — fall through to standard edit
             addStatus('Multiple files affected. Using standard editor…', 'checking');
           } else {
+            // State the interpretation in one sentence before touching anything —
+            // per the audit's "confirm before fixing" requirement. Not a
+            // question; proceeds immediately unless AMBIGUOUS fired above.
+            if (interpretation) addMsg('assistant', `Interpreting this as: ${interpretation}`);
             addStatus(debugMode ? `Surgical edit: ${identifiedFile}` : 'Reading affected file…', 'reading');
 
             // ── Step 2: Inspect real exports from the target file's imports ──
