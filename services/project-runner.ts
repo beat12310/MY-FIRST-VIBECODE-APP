@@ -1,5 +1,6 @@
 import { spawn, execSync } from 'child_process';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { readFile, writeFile, mkdir, rm } from 'fs/promises';
 import { createWriteStream, writeFileSync } from 'fs';
 import { createConnection } from 'net';
@@ -35,26 +36,30 @@ const STRIP_ENV_PREFIXES = ['AWS_', 'AMPLIFY_', 'LAMBDA_', '_X_AMZN_', '_HANDLER
 // STRIP_ENV_PREFIXES alone was NOT sufficient — confirmed live: the same
 // "[x-amplify-credentials] Credential listener could not be started: Error:
 // listen" crash still occurred after that fix deployed. NODE_OPTIONS and
-// NODE_PATH are the actual likely mechanism: AWS Lambda/Amplify Hosting
-// runtimes commonly inject a forced `--require <instrumentation-module>`
-// via NODE_OPTIONS to auto-instrument EVERY Node.js process for
-// observability/credential-forwarding purposes. Unlike env vars the
-// generated app's OWN dependencies might auto-detect, NODE_OPTIONS is
-// applied unconditionally by Node itself to any process that inherits it —
-// no prefix-based env-var stripping touches it, since the variable name
-// itself doesn't start with AWS_/AMPLIFY_/etc. Explicitly clearing it (and
-// NODE_PATH, which could otherwise leak module resolution to a parent
-// node_modules containing Amplify-adjacent packages) removes the trigger
-// at its source rather than only reacting to its failure afterward.
+// NODE_PATH are a plausible mechanism (AWS Lambda/Amplify Hosting runtimes
+// commonly inject a forced `--require <instrumentation-module>` via
+// NODE_OPTIONS to auto-instrument every Node.js process), so both are
+// cleared by exact name. But this ALSO turned out not to be sufficient —
+// confirmed live a second time, AND confirmed the generated app's code is
+// completely innocent: the identical generated project (same package.json,
+// same source files) started cleanly in 2.9s in a clean local environment
+// with no Amplify context at all. The exact trigger inside AWS Amplify
+// Hosting's production compute could not be directly inspected (no shell
+// access to that environment), so after two rounds of trying to PREVENT
+// it, this takes the resilience approach instead (see
+// buildPreviewResilienceShim below): let it fail, but don't let that
+// failure crash the whole preview.
 const EXACT_VARS_TO_CLEAR = ['NODE_OPTIONS', 'NODE_PATH'];
 
 /**
  * Builds the environment for the generated app's dev-server child process:
  * everything from the current process EXCEPT Amplify-Hosting/Lambda-specific
  * variables, which would otherwise leak this platform's own AWS hosting
- * context into a project that has no business knowing about it.
+ * context into a project that has no business knowing about it. When
+ * `shimPath` is provided, NODE_OPTIONS is set (not just cleared) to
+ * `--require <shimPath>` so the resilience shim loads in the child process.
  */
-export function buildIsolatedDevServerEnv(source: Record<string, string | undefined> = process.env): NodeJS.ProcessEnv {
+export function buildIsolatedDevServerEnv(source: Record<string, string | undefined> = process.env, shimPath?: string): NodeJS.ProcessEnv {
   const clean: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(source)) {
     if (STRIP_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) continue;
@@ -66,7 +71,66 @@ export function buildIsolatedDevServerEnv(source: Record<string, string | undefi
   // development mode regardless, so this is set explicitly (via a fresh
   // object literal -- NODE_ENV is read-only on NodeJS.ProcessEnv and can't
   // be reassigned on an already-typed object) rather than inherited.
-  return { ...clean, NODE_ENV: 'development' } as NodeJS.ProcessEnv;
+  return {
+    ...clean,
+    NODE_ENV: 'development',
+    ...(shimPath ? { NODE_OPTIONS: `--require ${shimPath}` } : {}),
+  } as NodeJS.ProcessEnv;
+}
+
+/**
+ * Source for the preview-resilience shim (see buildIsolatedDevServerEnv's
+ * shimPath). Deliberately written to a temp file at runtime by
+ * writePreviewResilienceShim() rather than shipped as a static file in
+ * this platform's own source tree: a file ONLY ever referenced via a raw
+ * path string passed to NODE_OPTIONS --require (never a real
+ * import/require statement in any traced code) is invisible to Next.js's
+ * build-time output file tracer and would silently be excluded from the
+ * deployed serverless bundle -- exactly the class of bug already found
+ * and fixed once this session for playwright/next.config.js's
+ * outputFileTracingExcludes. Writing it at runtime sidesteps bundling
+ * entirely: the file is guaranteed to exist on disk the moment it's
+ * needed, regardless of what got traced/bundled at build time.
+ *
+ * Deliberately narrow: only suppresses this ONE known-safe-to-ignore
+ * error pattern. Any other uncaught exception/unhandled rejection still
+ * crashes the process exactly as Node's default behavior would -- this is
+ * not a general error-swallower, which would hide real bugs in the
+ * generated app.
+ */
+const PREVIEW_RESILIENCE_SHIM_SOURCE = `
+const SUPPRESS_PATTERN = /x-amplify-credentials|credential listener/i;
+function isSuppressible(err) {
+  const msg = (err && err.message) || String(err || '');
+  return SUPPRESS_PATTERN.test(msg);
+}
+process.on('uncaughtException', (err) => {
+  if (isSuppressible(err)) {
+    console.warn('[preview-resilience-shim] Suppressed non-fatal credential-listener error (preview continues): ' + (err && err.message));
+    return;
+  }
+  console.error(err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  if (isSuppressible(reason)) {
+    console.warn('[preview-resilience-shim] Suppressed non-fatal credential-listener rejection (preview continues): ' + (reason && reason.message));
+    return;
+  }
+  console.error('Unhandled rejection:', reason);
+  process.exit(1);
+});
+`;
+
+/** Writes the resilience shim to a stable temp path and returns it. Idempotent -- safe to call before every server start. */
+export function writePreviewResilienceShim(): string {
+  const shimPath = join(tmpdir(), 'dwomoh-preview-resilience-shim.cjs');
+  try {
+    writeFileSync(shimPath, PREVIEW_RESILIENCE_SHIM_SOURCE, 'utf-8');
+  } catch (e) {
+    logError('Failed to write preview resilience shim (non-fatal — preview continues without it)', e);
+  }
+  return shimPath;
 }
 
 /**
@@ -356,11 +420,12 @@ export async function startDevServer(projectPath: string, force = false): Promis
     const logPath = join(projectPath, '.next-dev.log');
     try { writeFileSync(logPath, `=== dev server started at ${new Date().toISOString()} ===\n`); } catch {}
 
+    const shimPath = writePreviewResilienceShim();
     const proc = spawn(npmCmd, ['run', 'dev', '--', '-p', String(port)], {
       cwd: projectPath,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: buildIsolatedDevServerEnv(),
+      env: buildIsolatedDevServerEnv(process.env, shimPath),
     });
 
     try {

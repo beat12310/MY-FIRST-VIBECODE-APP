@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { buildIsolatedDevServerEnv, analyzeCrashLog } from '../project-runner';
+import { readFileSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { buildIsolatedDevServerEnv, analyzeCrashLog, writePreviewResilienceShim } from '../project-runner';
 import { isEnvironmentalServerError } from '@/lib/server-start-diagnostics';
 
 /**
@@ -81,6 +83,24 @@ describe('buildIsolatedDevServerEnv — the exact live production failure', () =
     expect(env.NODE_PATH).toBeUndefined();
   });
 
+  // ROOT CAUSE: two rounds of trying to PREVENT the x-amplify-credentials
+  // crash (prefix-stripping, then NODE_OPTIONS/NODE_PATH clearing) were
+  // both deployed and the identical crash still occurred live -- and the
+  // generated app's own code was definitively ruled out (the exact same
+  // project started cleanly in 2.9s in a clean local environment). Rather
+  // than continue guessing at an unreachable production-only trigger, this
+  // sets NODE_OPTIONS to load a resilience shim that suppresses ONLY this
+  // known-safe-to-ignore failure instead of letting it crash the process.
+  it('sets NODE_OPTIONS to --require the shim when a shimPath is provided (does not just clear it)', () => {
+    const env = buildIsolatedDevServerEnv({ PATH: '/usr/bin', NODE_OPTIONS: '--some-other-flag' }, '/tmp/my-shim.cjs');
+    expect(env.NODE_OPTIONS).toBe('--require /tmp/my-shim.cjs');
+  });
+
+  it('still clears NODE_OPTIONS entirely when no shimPath is given', () => {
+    const env = buildIsolatedDevServerEnv({ PATH: '/usr/bin', NODE_OPTIONS: '--require /opt/amplify-instrumentation.js' });
+    expect(env.NODE_OPTIONS).toBeUndefined();
+  });
+
   it('defaults to the real process.env when no source is provided', () => {
     const env = buildIsolatedDevServerEnv();
     expect(env.NODE_ENV).toBe('development');
@@ -151,5 +171,51 @@ describe('car sales marketplace preview — full crash-to-classification chain (
     // the builder's retry loop never wastes an AI code-fix cycle or
     // escalates to the repair bridge for it.
     expect(isEnvironmentalServerError(analysis.error)).toBe(true);
+  });
+});
+
+describe('writePreviewResilienceShim — the actual crash-suppression mechanism', () => {
+  it('writes a shim file containing the suppression pattern and process handlers', () => {
+    const shimPath = writePreviewResilienceShim();
+    const content = readFileSync(shimPath, 'utf-8');
+    expect(content).toContain('x-amplify-credentials');
+    expect(content).toContain('uncaughtException');
+    expect(content).toContain('unhandledRejection');
+  });
+
+  it('returns the same stable path on repeated calls (idempotent, safe to call before every server start)', () => {
+    const path1 = writePreviewResilienceShim();
+    const path2 = writePreviewResilienceShim();
+    expect(path1).toBe(path2);
+  });
+
+  // The most direct possible test of the actual mechanism: spawn a REAL
+  // Node.js child process that throws the exact reported error, with the
+  // shim loaded via NODE_OPTIONS=--require, and confirm the process does
+  // NOT crash -- proving this works with Node's real uncaughtException
+  // behavior, not just checking the shim file's text content.
+  it('a real child process throwing the exact reported error does NOT crash when the shim is loaded', () => {
+    const shimPath = writePreviewResilienceShim();
+    const result = spawnSync(process.execPath, [
+      '-e',
+      `throw new Error('[x-amplify-credentials] Credential listener could not be started: Error: listen EACCES: permission denied 127.0.0.1:4566')`,
+    ], {
+      env: { ...process.env, NODE_OPTIONS: `--require ${shimPath}` },
+      encoding: 'utf-8',
+    });
+    expect(result.status).toBe(0); // did NOT crash
+    expect(result.stderr).toContain('Suppressed non-fatal credential-listener error');
+  });
+
+  it('a real child process throwing a GENUINE, unrelated error still crashes normally even with the shim loaded', () => {
+    const shimPath = writePreviewResilienceShim();
+    const result = spawnSync(process.execPath, [
+      '-e',
+      `throw new Error('TypeError: cannot read property of undefined')`,
+    ], {
+      env: { ...process.env, NODE_OPTIONS: `--require ${shimPath}` },
+      encoding: 'utf-8',
+    });
+    expect(result.status).not.toBe(0); // still crashes -- this is not a general error-swallower
   });
 });

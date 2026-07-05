@@ -464,6 +464,43 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'Advanced repair finished — 0 file(s) changed', 'same error recurs after a deployed fix', 'escalation happens despite environmental-error detection'],
   },
+  {
+    id: 'x-amplify-credentials-resilience-shim-after-two-failed-prevention-attempts',
+    title: 'Two rounds of trying to PREVENT the x-amplify-credentials crash both failed live -- pivoted to suppressing its effect instead of its cause',
+    category: 'other',
+    rootCause:
+      "After both previous fixes (env-var prefix stripping, then explicit NODE_OPTIONS/NODE_PATH " +
+      "clearing) were deployed and confirmed live, the user reported the IDENTICAL '[x-amplify-credentials] " +
+      "Credential listener could not be started: Error: listen' crash a third time on the same 'car sales " +
+      "marketplace' prompt. Reproduced the exact build locally (scripts/real-build-runner.ts's runRealBuild " +
+      "with cleanupAfter=false) and definitively ruled out the generated app's own code: package.json had " +
+      "no aws-amplify/@aws-amplify dependency (only @aws-sdk/client-ses and @aws-sdk/client-s3, which the " +
+      "app's own email/storage features legitimately need), a full-project grep for 'amplify' found nothing " +
+      "anywhere in the source, and running `npm install && npm run dev` on the IDENTICAL generated project " +
+      "in a clean local environment succeeded in 2.9s with zero errors. This proves the trigger is 100% " +
+      "specific to AWS Amplify Hosting's production compute environment, via a mechanism that could not be " +
+      "directly inspected (no shell access to that environment) and that neither env-var-prefix stripping " +
+      "nor NODE_OPTIONS/NODE_PATH clearing was able to prevent.",
+    filesAffected: ['services/project-runner.ts', 'services/__tests__/project-runner.test.ts'],
+    fixApplied:
+      "Pivoted from PREVENTING the trigger to SUPPRESSING its effect, per the explicit requirement: 'if " +
+      "the listener fails, do not kill the preview server -- continue with mocked/no-op credentials'. Added " +
+      "writePreviewResilienceShim(): writes a small CommonJS shim to a stable temp path (NOT a static file " +
+      "in this platform's own source tree, since a file only ever referenced via a raw NODE_OPTIONS " +
+      "--require path string -- never a real import/require statement in traced code -- is invisible to " +
+      "Next.js's build-time output file tracer and would silently be excluded from the deployed bundle, " +
+      "exactly the class of bug already found and fixed once this session for playwright). The shim " +
+      "registers uncaughtException/unhandledRejection handlers that suppress ONLY errors matching " +
+      "'x-amplify-credentials'/'credential listener' -- any other error still crashes the process exactly " +
+      "as Node's default behavior would, so this cannot hide genuine bugs in the generated app. " +
+      "buildIsolatedDevServerEnv now accepts a shimPath parameter that SETS (not just clears) NODE_OPTIONS " +
+      "to `--require <shimPath>` when provided; startDevServer calls writePreviewResilienceShim() and " +
+      "passes its result before every spawn.",
+    verificationPerformed: 'Reproduced the exact generated project locally and confirmed it starts cleanly (ruling out generated-app code as the cause) -- see rootCause above. Added 6 new unit tests including the most direct possible verification: spawning a REAL Node.js child process that throws the exact reported error with the shim loaded via NODE_OPTIONS, confirming it does NOT crash (exit code 0) and logs the suppression; and a second child process confirming a genuine, unrelated error still crashes normally with the shim loaded (proving this is not a general error-swallower). Full suite (211 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "services/__tests__/project-runner.test.ts — 'writePreviewResilienceShim — the actual crash-suppression mechanism' describe block",
+    dateFixed: '2026-07-05',
+    symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'identical crash recurs after multiple deployed fixes', 'generated app code confirmed innocent', 'works locally but not in production'],
+  },
 ];
 
 /**
