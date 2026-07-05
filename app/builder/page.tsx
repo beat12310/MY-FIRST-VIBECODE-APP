@@ -2205,23 +2205,38 @@ function BuilderInner() {
         && (SURGICAL_SIGNALS.test(userRequest) || wordCount <= 12)
         && !featureSpecBlock; // feature planner already ran = treat as additive, not surgical
 
-      if (isSurgical && currentProject) {
-        try {
-          addStatus('Identifying affected file…', 'reading');
+      // ── Single-item resolve+apply+verify, shared by the single-edit path
+      // below AND the multi-item split path further down. Identical logic to
+      // what previously lived inline in the single-edit block — extracted so
+      // a bundled multi-fix message ("fix the signup button color, remove
+      // the duplicate footer, and the pricing image is too big") can run the
+      // exact same identify/interpret/ambiguous/apply/re-verify sequence
+      // once per item instead of only ever handling the message as a whole.
+      type SurgicalItemResult =
+        | { status: 'fixed'; file: string; interpretation: string; issues: string[] }
+        | { status: 'ambiguous'; question: string }
+        | { status: 'needs_broader_edit' }
+        | { status: 'not_found' };
 
-          // ── Step 1: Ask AI to identify the target file ──────────────────────
-          // We send the request + project file list so the AI picks the right file.
-          const projectFiles = await api({
-            action: 'list-project-files',
-            projectPath: currentProject.projectPath,
-          }).catch(() => null);
+      const resolveAndApplySurgicalItem = async (
+        itemText: string,
+        onInterpretation?: (text: string) => void,
+      ): Promise<SurgicalItemResult> => {
+        if (!currentProject) return { status: 'not_found' };
 
-          const fileList = (projectFiles?.files as string[] ?? [])
-            .filter((f: string) => !f.includes('node_modules') && !f.startsWith('.next'))
-            .slice(0, 60)
-            .join('\n');
+        // ── Step 1: Ask AI to identify the target file ──────────────────────
+        // We send the request + project file list so the AI picks the right file.
+        const projectFiles = await api({
+          action: 'list-project-files',
+          projectPath: currentProject.projectPath,
+        }).catch(() => null);
 
-          const identifyPrompt = `Given the user request: "${userRequest}"
+        const fileList = (projectFiles?.files as string[] ?? [])
+          .filter((f: string) => !f.includes('node_modules') && !f.startsWith('.next'))
+          .slice(0, 60)
+          .join('\n');
+
+        const identifyPrompt = `Given the user request: "${itemText}"
 And these project files:
 ${fileList}
 
@@ -2239,134 +2254,235 @@ respond instead with EXACTLY:
 AMBIGUOUS: <a short, specific question naming the plausible options, e.g. "There are buttons on both
 the signup page and the contact page — which one did you mean?">`;
 
-          const identifyResult = await api({
+        const identifyResult = await api({
+          action: 'agent-fix',
+          projectPath: currentProject.projectPath,
+          errorContext: identifyPrompt,
+          targetFiles: [],
+          strategy: 'targeted',
+          tier: 'HAIKU',
+        }).catch(() => null);
+
+        const rawResponse = identifyResult?.rawAiResponse ?? '';
+
+        // Genuinely ambiguous — the caller surfaces the real question and
+        // does NOT touch any file until the user's next message disambiguates.
+        const ambiguousMatch = rawResponse.match(/AMBIGUOUS:\s*(.+)/i);
+        if (ambiguousMatch) return { status: 'ambiguous', question: ambiguousMatch[1].trim() };
+
+        const interpretationMatch = rawResponse.match(/INTERPRETATION:\s*(.+)/i);
+        const interpretation = interpretationMatch?.[1]?.trim() ?? '';
+        // FILE: MULTI (structured) or a bare "MULTI" reply (old-format fallback)
+        // both mean "needs several files together" — the caller falls through
+        // to the standard editor (single-item case) or reports it as needing
+        // broader changes (multi-item case). Otherwise parse the file path
+        // from either the structured FILE: line or (fallback) anywhere in the
+        // response, so a slightly malformed reply still degrades gracefully
+        // instead of silently doing nothing.
+        const isMulti = /FILE:\s*MULTI\b/i.test(rawResponse) || /\bMULTI\b/.test(rawResponse);
+        const fileLineMatch = rawResponse.match(/FILE:\s*((?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?))/i);
+        const fileMatch = fileLineMatch ?? rawResponse.match(/(?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?)/);
+        const identifiedFile = fileMatch?.[1] ?? fileMatch?.[0] ?? '';
+
+        if (isMulti) return { status: 'needs_broader_edit' };
+        if (!identifiedFile) return { status: 'not_found' };
+
+        // State the interpretation in one sentence before touching anything —
+        // per the audit's "confirm before fixing" requirement. Not a
+        // question; proceeds immediately unless AMBIGUOUS fired above.
+        if (interpretation) onInterpretation?.(interpretation);
+        addStatus(debugMode ? `Surgical edit: ${identifiedFile}` : 'Reading affected file…', 'reading');
+
+        // ── Step 2: Inspect real exports from the target file's imports ──
+        const exportResult = await api({
+          action: 'inspect-exports',
+          projectPath: currentProject.projectPath,
+          sourceFile: identifiedFile,
+        }).catch(() => null);
+
+        const exportMapBlock = exportResult?.formatted ?? '';
+
+        if (debugMode && exportMapBlock) {
+          addStatus(`Export map:\n${exportMapBlock}`, 'checking');
+        }
+
+        addStatus(debugMode ? `Applying surgical edit to ${identifiedFile}` : 'Applying change…', 'applying');
+
+        // ── Step 3: Apply surgical edit ─────────────────────────────────
+        const surgicalResult = await api({
+          action: 'agent-fix',
+          projectPath: currentProject.projectPath,
+          errorContext: itemText,
+          targetFiles: [identifiedFile],
+          strategy: 'surgical',
+          exportMap: exportMapBlock,
+          tier: 'SONNET',
+        }).catch(() => null);
+
+        if (!(surgicalResult?.fixedCount > 0)) return { status: 'not_found' };
+
+        setEditDetailStep('verifying');
+
+        // ── Post-edit re-verification (same checks the standard edit path
+        // runs at lines ~2861/2975) — the surgical path used to skip this
+        // entirely and report "Done" unconditionally, so a single-file edit
+        // was the one case with no automatic re-check that the rest of the
+        // app (other pages/routes/imports) still works. Kept intentionally
+        // lighter than the standard path's full cascade (no TS-error
+        // auto-repair loop here) — this is strictly the same two checks
+        // named for this fix, surfaced honestly rather than silently swallowed.
+        let missingRoutes: string[] = [];
+        try {
+          addStatus('Scanning navigation links…', 'checking');
+          const routeScan = await api({
+            action: 'scan-missing-routes',
+            projectPath: currentProject.projectPath,
+          });
+          missingRoutes = routeScan?.scanResult?.missingRoutes ?? [];
+        } catch { /* route scan is best-effort — never block the edit flow */ }
+
+        let verifyFailed: string[] = [];
+        const runPort = buildProgress?.port || currentProject.port;
+        if (runPort) {
+          try {
+            addStatus('Testing routes and links…', 'checking');
+            const verifyData = await api({ action: 'verify-app', port: runPort, projectPath: currentProject.projectPath });
+            if (verifyData) setLastVerification(verifyData as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
+            verifyFailed = (verifyData?.checks ?? [])
+              .filter((c: { passed: boolean; softPassed?: boolean }) => !c.passed && !c.softPassed)
+              .map((c: { name: string }) => c.name);
+          } catch { /* verify-app is best-effort — never block the edit flow */ }
+        }
+
+        const issues = [
+          missingRoutes.length > 0 ? `Missing page(s) for: ${missingRoutes.join(', ')}` : '',
+          verifyFailed.length > 0 ? `Route/API check(s) failed: ${verifyFailed.join(', ')}` : '',
+        ].filter(Boolean);
+
+        return { status: 'fixed', file: identifiedFile, interpretation, issues };
+      };
+
+      // ── Multi-item bundled edit detection ─────────────────────────────────
+      // A single message can describe several separate, unrelated fixes at
+      // once (e.g. "fix the signup button color, remove the duplicate
+      // footer, and the pricing image is too big"). Previously this only
+      // ever hit the surgical path's MULTI signal (built for "one
+      // coordinated edit touching several files together"), which doesn't
+      // split anything — it hands the WHOLE message to the standard editor
+      // as one combined AI call, with no per-item resolution, verification,
+      // or reporting. Cheap heuristic pre-filter (connector words + minimum
+      // length) before an AI call actually judges it — same "cheap gate,
+      // then AI decides" pattern the surgical-edit detection above uses —
+      // avoids an extra round-trip for the common single-request case.
+      const MULTI_ITEM_HINT = /(,\s*(?:and\s+)?|;\s*|\band\s+(?:also\s+)?|\balso\b)/i;
+      const looksLikeMultiItem = !isDebugRequest && !featureSpecBlock
+        && !REBUILD_SIGNALS.test(userRequest)
+        && MULTI_ITEM_HINT.test(userRequest)
+        && wordCount > 8;
+
+      if (looksLikeMultiItem && currentProject) {
+        try {
+          const splitPrompt = `Does this message describe ONE thing to fix (even if it needs several files together), or MULTIPLE separate, unrelated things to fix?
+
+Message: "${userRequest}"
+
+If it's genuinely multiple separate things, reply with each one on its own line, prefixed "ITEM: " (plain language, one fix per line, e.g. "ITEM: change the signup button color").
+If it's really just ONE thing, reply with exactly: SINGLE`;
+
+          const splitResult = await api({
             action: 'agent-fix',
             projectPath: currentProject.projectPath,
-            errorContext: identifyPrompt,
+            errorContext: splitPrompt,
             targetFiles: [],
             strategy: 'targeted',
             tier: 'HAIKU',
           }).catch(() => null);
 
-          const rawResponse = identifyResult?.rawAiResponse ?? '';
+          const splitRaw = splitResult?.rawAiResponse ?? '';
+          const items = [...splitRaw.matchAll(/ITEM:\s*(.+)/gi)].map((m: RegExpMatchArray) => m[1].trim()).filter(Boolean);
 
-          // Genuinely ambiguous — ask the real question and stop. Do NOT touch
-          // any file until the user's next message disambiguates.
-          const ambiguousMatch = rawResponse.match(/AMBIGUOUS:\s*(.+)/i);
-          if (ambiguousMatch) {
+          if (items.length >= 2) {
+            addStatus(`Found ${items.length} separate fix(es). Processing each…`, 'checking');
+            addMsg('assistant',
+              `This looks like ${items.length} separate fixes — I'll handle each one individually:\n${items.map((it, i) => `${i + 1}. ${it}`).join('\n')}`
+            );
+
+            const results: { item: string; result: SurgicalItemResult }[] = [];
+            for (const item of items) {
+              addStatus(`Working on: ${item}`, 'applying');
+              try {
+                const result = await resolveAndApplySurgicalItem(item);
+                results.push({ item, result });
+              } catch {
+                results.push({ item, result: { status: 'not_found' } });
+              }
+            }
+
+            if (results.some(r => r.result.status === 'fixed')) {
+              await new Promise(r => setTimeout(r, 1500));
+              setPreviewKey(k => k + 1);
+            }
+            setEditDetailStep('complete');
+
+            const lines = results.map(({ item, result }) => {
+              if (result.status === 'fixed') {
+                const issueNote = result.issues.length > 0 ? ` (⚠️ re-verification found: ${result.issues.join('; ')})` : '';
+                return `✅ Fixed: "${item}" — changed \`${result.file}\`${issueNote}`;
+              }
+              if (result.status === 'ambiguous') return `❓ Ambiguous: "${item}" — ${result.question}`;
+              if (result.status === 'needs_broader_edit') return `⚠️ Needs broader changes: "${item}" — describe this one on its own and I'll use the full editor`;
+              return `❌ Not found: "${item}" — couldn't identify or apply a fix`;
+            });
+
+            addStatus('All items processed.', 'done');
+            addMsg('assistant',
+              `Here's what I found:\n\n${lines.join('\n')}` +
+              (results.some(r => r.result.status === 'ambiguous') ? '\n\nFor anything marked ambiguous, just clarify and I\'ll apply it.' : '')
+            );
+            return;
+          }
+          // SINGLE (or unparseable) — fall through to the normal single-edit flow below.
+        } catch { /* non-critical — fall through to normal edit flow */ }
+      }
+
+      if (isSurgical && currentProject) {
+        try {
+          addStatus('Identifying affected file…', 'reading');
+
+          const result = await resolveAndApplySurgicalItem(
+            userRequest,
+            (text) => addMsg('assistant', `Interpreting this as: ${text}`),
+          );
+
+          if (result.status === 'ambiguous') {
             addStatus('Needs clarification.', 'checking');
-            addMsg('assistant', ambiguousMatch[1].trim());
+            addMsg('assistant', result.question);
             return;
           }
 
-          const interpretationMatch = rawResponse.match(/INTERPRETATION:\s*(.+)/i);
-          const interpretation = interpretationMatch?.[1]?.trim() ?? '';
-          // FILE: MULTI (structured) or a bare "MULTI" reply (old-format fallback)
-          // both mean "needs several files together" — falls through to the
-          // standard editor unchanged. Otherwise parse the file path from
-          // either the structured FILE: line or (fallback) anywhere in the
-          // response, so a slightly malformed reply still degrades gracefully
-          // instead of silently doing nothing.
-          const isMulti = /FILE:\s*MULTI\b/i.test(rawResponse) || /\bMULTI\b/.test(rawResponse);
-          const fileLineMatch = rawResponse.match(/FILE:\s*((?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?))/i);
-          const fileMatch = fileLineMatch ?? rawResponse.match(/(?:app|components|lib|services)\/[\w/\-.]+\.(?:tsx?|jsx?)/);
-          const identifiedFile = fileMatch?.[1] ?? fileMatch?.[0] ?? '';
-
-          if (!identifiedFile || isMulti) {
-            // Can't identify single file — fall through to standard edit
-            addStatus('Multiple files affected. Using standard editor…', 'checking');
-          } else {
-            // State the interpretation in one sentence before touching anything —
-            // per the audit's "confirm before fixing" requirement. Not a
-            // question; proceeds immediately unless AMBIGUOUS fired above.
-            if (interpretation) addMsg('assistant', `Interpreting this as: ${interpretation}`);
-            addStatus(debugMode ? `Surgical edit: ${identifiedFile}` : 'Reading affected file…', 'reading');
-
-            // ── Step 2: Inspect real exports from the target file's imports ──
-            const exportResult = await api({
-              action: 'inspect-exports',
-              projectPath: currentProject.projectPath,
-              sourceFile: identifiedFile,
-            }).catch(() => null);
-
-            const exportMapBlock = exportResult?.formatted ?? '';
-
-            if (debugMode && exportMapBlock) {
-              addStatus(`Export map:\n${exportMapBlock}`, 'checking');
+          if (result.status === 'fixed') {
+            await new Promise(r => setTimeout(r, 1500));
+            setPreviewKey(k => k + 1);
+            setEditDetailStep('complete');
+            if (result.issues.length === 0) {
+              addStatus('Change applied.', 'done');
+              addMsg('assistant',
+                `Done ✅\n\nChanged \`${result.file}\`.\n\nIf something looks off, just describe the next adjustment.`
+              );
+            } else {
+              addStatus('Change applied, but re-verification found issues.', 'error');
+              addMsg('assistant',
+                `Changed \`${result.file}\`, but re-verification found something else may be affected:\n\n${result.issues.join('\n')}\n\nLet me know if you'd like me to look into this.`
+              );
             }
-
-            addStatus(debugMode ? `Applying surgical edit to ${identifiedFile}` : 'Applying change…', 'applying');
-
-            // ── Step 3: Apply surgical edit ─────────────────────────────────
-            const surgicalResult = await api({
-              action: 'agent-fix',
-              projectPath: currentProject.projectPath,
-              errorContext: userRequest,
-              targetFiles: [identifiedFile],
-              strategy: 'surgical',
-              exportMap: exportMapBlock,
-              tier: 'SONNET',
-            }).catch(() => null);
-
-            if (surgicalResult?.fixedCount > 0) {
-              await new Promise(r => setTimeout(r, 1500));
-              setPreviewKey(k => k + 1);
-              setEditDetailStep('verifying');
-
-              // ── Post-edit re-verification (same checks the standard edit
-              // path runs at lines ~2861/2975) — the surgical path used to
-              // skip this entirely and report "Done" unconditionally, so a
-              // single-file edit was the one case with no automatic re-check
-              // that the rest of the app (other pages/routes/imports) still
-              // works. Kept intentionally lighter than the standard path's
-              // full cascade (no TS-error auto-repair loop here) — this is
-              // strictly the same two checks named for this fix, surfaced
-              // honestly rather than silently swallowed.
-              let missingRoutes: string[] = [];
-              try {
-                addStatus('Scanning navigation links…', 'checking');
-                const routeScan = await api({
-                  action: 'scan-missing-routes',
-                  projectPath: currentProject.projectPath,
-                });
-                missingRoutes = routeScan?.scanResult?.missingRoutes ?? [];
-              } catch { /* route scan is best-effort — never block the edit flow */ }
-
-              let verifyFailed: string[] = [];
-              const runPort = buildProgress?.port || currentProject.port;
-              if (runPort) {
-                try {
-                  addStatus('Testing routes and links…', 'checking');
-                  const verifyData = await api({ action: 'verify-app', port: runPort, projectPath: currentProject.projectPath });
-                  if (verifyData) setLastVerification(verifyData as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
-                  verifyFailed = (verifyData?.checks ?? [])
-                    .filter((c: { passed: boolean; softPassed?: boolean }) => !c.passed && !c.softPassed)
-                    .map((c: { name: string }) => c.name);
-                } catch { /* verify-app is best-effort — never block the edit flow */ }
-              }
-
-              setEditDetailStep('complete');
-              if (missingRoutes.length === 0 && verifyFailed.length === 0) {
-                addStatus('Change applied.', 'done');
-                addMsg('assistant',
-                  `Done ✅\n\nChanged \`${identifiedFile}\`.\n\nIf something looks off, just describe the next adjustment.`
-                );
-              } else {
-                addStatus('Change applied, but re-verification found issues.', 'error');
-                const issues = [
-                  missingRoutes.length > 0 ? `Missing page(s) for: ${missingRoutes.join(', ')}` : '',
-                  verifyFailed.length > 0 ? `Route/API check(s) failed: ${verifyFailed.join(', ')}` : '',
-                ].filter(Boolean).join('\n');
-                addMsg('assistant',
-                  `Changed \`${identifiedFile}\`, but re-verification found something else may be affected:\n\n${issues}\n\nLet me know if you'd like me to look into this.`
-                );
-              }
-              return;
-            }
-
-            // Surgical produced no changes — fall through
-            addStatus('Applying via standard editor…', 'checking');
+            return;
           }
+
+          // 'needs_broader_edit' or 'not_found' — fall through to standard edit
+          addStatus(
+            result.status === 'needs_broader_edit' ? 'Multiple files affected. Using standard editor…' : 'Applying via standard editor…',
+            'checking'
+          );
         } catch { /* non-critical — fall through to standard edit */ }
       }
 
