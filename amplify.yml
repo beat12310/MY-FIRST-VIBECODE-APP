@@ -12,39 +12,27 @@ version: 1
 # dependency tree's cross-environment resolution difference where npm ci
 # is not.
 #
-# node_modules/.npm removed from cache.paths (and --cache/--prefer-offline
-# removed from both npm install calls) after two consecutive real
-# deployment attempts (jobs 22, 23) failed identically on "npx ampx
-# pipeline-deploy" -> "npm error could not determine executable to run",
-# with the exact same suspiciously-low "audited 618 packages" count both
-# times despite package.json declaring far more — consistent with a stale/
-# corrupted cached node_modules being restored rather than a fresh install.
-# There's no AWS CLI command to directly clear Amplify's build cache (only
-# a Console UI toggle); forcing every build to install from scratch is the
-# verifiable alternative.
+# --include=dev is required on BOTH installs below. Root cause, confirmed
+# with a live diagnostic dump (job #25): NODE_ENV=production is set as an
+# app-level environment variable here, and plain `npm install` (unlike
+# `npm ci`, which is what originally ran for months without this problem)
+# respects that by silently skipping ALL devDependencies — no error, just
+# a much smaller "audited 618 packages" install. That's exactly why husky
+# was "missing" earlier (masked with `|| exit 0`, itself still correct —
+# git hooks are meaningless in a build container) and why
+# @aws-amplify/backend-cli's `ampx` binary was never installed at all,
+# which IS fatal since the backend phase's whole job is to run it.
 backend:
   phases:
     build:
       commands:
-        - npm install
-        # Diagnostic: two consecutive real deploy attempts (with AND without
-        # build caching, ruling out stale cache as the cause) both showed
-        # the exact same "audited 618 packages" and "npm error could not
-        # determine executable to run" for ampx, despite package.json's root
-        # devDependencies explicitly declaring @aws-amplify/backend-cli.
-        # These print real, concrete evidence of what actually got installed
-        # (working directory, whether the package directory + its bin
-        # symlink genuinely exist) instead of guessing further.
-        - pwd
-        - echo "--- @aws-amplify/backend-cli in package.json ---" && grep backend-cli package.json || echo "NOT FOUND in package.json"
-        - echo "--- node_modules/@aws-amplify/backend-cli ---" && ls node_modules/@aws-amplify/backend-cli 2>&1 || echo "DIRECTORY MISSING"
-        - echo "--- node_modules/.bin/ampx ---" && ls -la node_modules/.bin/ampx 2>&1 || echo "BIN SYMLINK MISSING"
+        - npm install --include=dev
         - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
 frontend:
   phases:
     preBuild:
       commands:
-        - npm install
+        - npm install --include=dev
     build:
       commands:
         - npm run build
