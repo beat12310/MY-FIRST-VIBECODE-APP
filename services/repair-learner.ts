@@ -93,25 +93,59 @@ OUTPUT a JSON object (no markdown, raw JSON only):
 }`;
 }
 
+/**
+ * Parses one model response into an ExtractedPattern, or null if it isn't
+ * usable. Logs the raw response (truncated) before attempting to parse --
+ * this is the one place in the codebase that actually asks the model for
+ * raw JSON (buildPatternExtractionPrompt says "OUTPUT a JSON object...raw
+ * JSON only"), unlike the main build/generation pipeline, which uses a
+ * delimiter format specifically to avoid JSON parsing entirely. Uses
+ * lib/json-parser.ts's parseJSON -- the same tolerant extractor (markdown
+ * fence stripping, bracket-matching instead of a naive first-{-to-last-}
+ * regex, truncation recovery, trailing-comma stripping) already proven
+ * elsewhere in this codebase -- instead of the previous inline
+ * /\{[\s\S]*\}/ regex + bare JSON.parse, which had no recovery path at all
+ * for markdown fences, truncated output, or trailing commas.
+ */
+async function tryParsePattern(raw: string): Promise<ExtractedPattern | null> {
+  console.log(`[repair-learner] raw model response (${raw.length} chars): ${raw.length > 500 ? `${raw.slice(0, 500)}… (truncated)` : raw}`);
+
+  const { parseJSON } = await import('@/lib/json-parser');
+  const result = parseJSON(raw);
+  if (!result.success) {
+    console.warn(`[repair-learner] could not parse JSON from model response: ${result.error}`);
+    return null;
+  }
+
+  const parsed = result.data as ExtractedPattern;
+  if (!parsed || !parsed.errorPattern || !parsed.rootCause || !parsed.fixApproach) {
+    console.warn('[repair-learner] parsed JSON is missing required fields (errorPattern/rootCause/fixApproach)');
+    return null;
+  }
+  return parsed;
+}
+
 async function extractPattern(
   ctx: RepairContext,
   callAI: (prompt: string, tier: 'HAIKU' | 'SONNET') => Promise<string>,
 ): Promise<ExtractedPattern | null> {
   if (!ctx.errorText.trim()) return null;
 
+  const prompt = buildPatternExtractionPrompt(ctx);
+
   try {
-    const prompt = buildPatternExtractionPrompt(ctx);
     const raw = await callAI(prompt, 'HAIKU');
+    const parsed = await tryParsePattern(raw);
+    if (parsed) return parsed;
 
-    // Find the JSON block
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const parsed = JSON.parse(jsonMatch[0]) as ExtractedPattern;
-
-    // Validate minimum fields
-    if (!parsed.errorPattern || !parsed.rootCause || !parsed.fixApproach) return null;
-    return parsed;
-  } catch {
+    // Invalid/unparseable JSON — re-ask once with the exact failure fed
+    // back, instead of silently giving up on the first bad response.
+    console.warn('[repair-learner] first response was not valid JSON — re-asking once');
+    const retryPrompt = `${prompt}\n\nYour previous response could not be parsed as JSON:\n${raw.slice(0, 300)}\n\nReturn ONLY the raw JSON object — no markdown code fences, no explanation, no text before or after it.`;
+    const retryRaw = await callAI(retryPrompt, 'HAIKU');
+    return await tryParsePattern(retryRaw);
+  } catch (e) {
+    console.warn(`[repair-learner] pattern extraction failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
 }

@@ -9,6 +9,7 @@ import { interpretCommand, getActionLabel } from '@/lib/nl-command-interpreter';
 import { detectIntent, type MessageIntent } from '@/lib/intent-classifier';
 import { decideProjectOpenRouting, reportsRoutingProblem } from '@/lib/repair-routing';
 import { saveOpenProject, clearOpenProject, loadOpenProject } from '@/lib/project-session-storage';
+import { parseApiResponse, truncateForLog } from '@/lib/safe-json-response';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -673,7 +674,8 @@ function BuilderInner() {
     setDisplayed(prev => [...prev, { role: 'status', content, statusType }]);
   }, []);
 
-  const api = useCallback(async (body: Record<string, unknown>) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const api = useCallback(async (body: Record<string, unknown>): Promise<any> => {
     let token = await getToken();
     // Same Amplify session-hydration race as runBuildPipelineViaEngine's
     // token fetch: a signed-in user can get an empty token on the very first
@@ -693,7 +695,21 @@ function BuilderInner() {
       },
       body: JSON.stringify(body),
     });
-    return res.json();
+
+    // A build request commonly runs for minutes (build + repair + verify).
+    // res.json() used to be called directly here with no guard -- any
+    // non-JSON response along the way (a serverless timeout/crash page from
+    // the hosting infrastructure, a proxy error, a truncated body) threw
+    // "Unexpected token ... is not valid JSON", an uncaught error that
+    // crashed the whole build with a cryptic, browser-only message. Reading
+    // as text first (never throws) and logging it before parsing turns that
+    // into a clear, safe, catchable result instead.
+    const rawText = await res.text();
+    const parsed = parseApiResponse(rawText, res.status, res.ok);
+    if (!parsed.success && !rawText.trim().startsWith('{')) {
+      console.error(`[api] non-JSON response for action="${body.action}" (status ${res.status}): ${truncateForLog(rawText)}`);
+    }
+    return parsed;
   }, [getToken, user]);
 
   // ── Claude Code Bridge ────────────────────────────────────────────────────
