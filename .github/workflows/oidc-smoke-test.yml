@@ -24,9 +24,13 @@ jobs:
       - name: Confirm assumed identity
         run: aws sts get-caller-identity
       - name: Confirm the granted bedrock:InvokeModel permission actually works (minimal 1-token call)
+        # Must use the cross-region INFERENCE PROFILE id (matches lib/constants.ts's
+        # BEDROCK_MODELS.HAIKU), not the bare foundation-model id -- this account
+        # requires it ("on-demand throughput isn't supported" otherwise), confirmed
+        # live on the first smoke-test run.
         run: |
           aws bedrock-runtime invoke-model \
-            --model-id anthropic.claude-haiku-4-5-20251001-v1:0 \
+            --model-id us.anthropic.claude-haiku-4-5-20251001-v1:0 \
             --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
             --cli-binary-format raw-in-base64-out \
             /tmp/bedrock-response.json
