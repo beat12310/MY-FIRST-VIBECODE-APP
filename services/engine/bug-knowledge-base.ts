@@ -263,6 +263,28 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['npm error code EUSAGE', 'Missing: esbuild@0.28.1 from lock file', 'Amplify BUILD step failed', 'production deployment failing'],
   },
+  {
+    id: 'amplify-npm-install-skips-devdependencies-under-node-env-production',
+    title: 'Switching amplify.yml from npm ci to npm install silently dropped every devDependency, breaking ampx and husky',
+    category: 'other',
+    rootCause:
+      "NODE_ENV=production is set as an app-level Amplify environment variable (needed by the Next.js " +
+      "app itself at runtime). npm ci does not skip devDependencies under NODE_ENV=production in this " +
+      "npm version, which is why the original amplify.yml worked for months. But plain npm install DOES " +
+      "silently skip all devDependencies under NODE_ENV=production — no error, just a much smaller " +
+      "install (consistently 'audited 618 packages' across three separate attempts, with and without " +
+      "build caching, ruling out stale cache as the cause). Confirmed with a live diagnostic dump added " +
+      "to amplify.yml (job #25): node_modules/@aws-amplify/backend-cli and its ampx bin symlink were " +
+      "both completely absent after a 'successful' npm install, which is why 'npx ampx pipeline-deploy' " +
+      "(required to deploy the Gen2 backend) failed with 'could not determine executable to run', and " +
+      "why husky failed the same way one deploy attempt earlier.",
+    filesAffected: ['amplify.yml'],
+    fixApplied: 'Added --include=dev to both npm install commands in amplify.yml (backend.phases.build, frontend.phases.preBuild), forcing devDependencies to install regardless of NODE_ENV.',
+    verificationPerformed: 'Confirmed via a real production deployment (job #26): SUCCEED end-to-end (backend pipeline-deploy + frontend next build + deploy + verify all completed); confirmed dwomohvibe.com and www.dwomohvibe.com both return HTTP 200 with the correct page title.',
+    regressionTest: '(not a permanent automated regression test -- amplify.yml is infrastructure-as-config, not application code; revisit alongside the two related npm-ci entries if @aws-amplify/backend is upgraded/removed)',
+    dateFixed: '2026-07-05',
+    symptoms: ['npm error could not determine executable to run', 'husky: command not found', 'audited 618 packages', 'node_modules/@aws-amplify/backend-cli missing', 'Amplify BUILD step failed after switching npm ci to npm install'],
+  },
 ];
 
 /**
