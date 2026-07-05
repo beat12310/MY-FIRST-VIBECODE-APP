@@ -242,6 +242,27 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['npm error code EUSAGE', 'Missing: ... from lock file', 'npm ci fails in CI but works locally', 'Invalid Version', '@opentelemetry/core', 'uuid@9.0.1'],
   },
+  {
+    id: 'amplify-yml-npm-ci-same-cross-environment-failure',
+    title: "amplify.yml's committed build spec also used npm ci, hitting the identical cross-environment failure in production",
+    category: 'other',
+    rootCause:
+      "The repo's root-level amplify.yml (which AWS Amplify prefers over the app-level buildSpec when " +
+      "present) used npm ci in both its 'backend' and 'frontend' phases — completely independent of, " +
+      "and undiscovered by, the earlier GitHub Actions ci.yml fix. This had worked for months (all prior " +
+      "CodeCommit-triggered production deployments succeeded) but broke the moment this session added " +
+      "vitest/husky/zod to package.json, for the exact same reason already root-caused for GitHub " +
+      "Actions: npm ci's strict lockfile validation rejects a nested esbuild version dependency that " +
+      "npm install tolerates. Found only after switching the Amplify app's connected repository from " +
+      "CodeCommit to GitHub and triggering a real deployment (job #20) to verify the switch worked — " +
+      "the BUILD step failed with the identical 'Missing: esbuild@0.28.1 from lock file' error.",
+    filesAffected: ['amplify.yml'],
+    fixApplied: 'Changed both npm ci occurrences in amplify.yml (backend.phases.build, frontend.phases.preBuild) to npm install, matching the already-proven fix in .github/workflows/ci.yml and scheduled-verification.yml.',
+    verificationPerformed: 'Confirmed via the Amplify job logs (job #20 BUILD step) that this was the exact same error signature as the earlier GitHub Actions incident; re-ran npm run verify locally after the fix (157 tests, typecheck, dependency check all pass).',
+    regressionTest: '(not a permanent automated regression test -- amplify.yml is infrastructure-as-config, not application code; revisit alongside the ci.yml entry if @aws-amplify/backend is upgraded/removed)',
+    dateFixed: '2026-07-05',
+    symptoms: ['npm error code EUSAGE', 'Missing: esbuild@0.28.1 from lock file', 'Amplify BUILD step failed', 'production deployment failing'],
+  },
 ];
 
 /**
