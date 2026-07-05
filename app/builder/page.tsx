@@ -2277,11 +2277,56 @@ If multiple files need changes, reply "MULTI" and this will be handled by the st
             if (surgicalResult?.fixedCount > 0) {
               await new Promise(r => setTimeout(r, 1500));
               setPreviewKey(k => k + 1);
+              setEditDetailStep('verifying');
+
+              // ── Post-edit re-verification (same checks the standard edit
+              // path runs at lines ~2861/2975) — the surgical path used to
+              // skip this entirely and report "Done" unconditionally, so a
+              // single-file edit was the one case with no automatic re-check
+              // that the rest of the app (other pages/routes/imports) still
+              // works. Kept intentionally lighter than the standard path's
+              // full cascade (no TS-error auto-repair loop here) — this is
+              // strictly the same two checks named for this fix, surfaced
+              // honestly rather than silently swallowed.
+              let missingRoutes: string[] = [];
+              try {
+                addStatus('Scanning navigation links…', 'checking');
+                const routeScan = await api({
+                  action: 'scan-missing-routes',
+                  projectPath: currentProject.projectPath,
+                });
+                missingRoutes = routeScan?.scanResult?.missingRoutes ?? [];
+              } catch { /* route scan is best-effort — never block the edit flow */ }
+
+              let verifyFailed: string[] = [];
+              const runPort = buildProgress?.port || currentProject.port;
+              if (runPort) {
+                try {
+                  addStatus('Testing routes and links…', 'checking');
+                  const verifyData = await api({ action: 'verify-app', port: runPort, projectPath: currentProject.projectPath });
+                  if (verifyData) setLastVerification(verifyData as { verified: boolean; summary: string; checks: Array<{ name: string; passed: boolean; recordCount?: number; error?: string }> });
+                  verifyFailed = (verifyData?.checks ?? [])
+                    .filter((c: { passed: boolean; softPassed?: boolean }) => !c.passed && !c.softPassed)
+                    .map((c: { name: string }) => c.name);
+                } catch { /* verify-app is best-effort — never block the edit flow */ }
+              }
+
               setEditDetailStep('complete');
-              addStatus('Change applied.', 'done');
-              addMsg('assistant',
-                `Done ✅\n\nChanged \`${identifiedFile}\`.\n\nIf something looks off, just describe the next adjustment.`
-              );
+              if (missingRoutes.length === 0 && verifyFailed.length === 0) {
+                addStatus('Change applied.', 'done');
+                addMsg('assistant',
+                  `Done ✅\n\nChanged \`${identifiedFile}\`.\n\nIf something looks off, just describe the next adjustment.`
+                );
+              } else {
+                addStatus('Change applied, but re-verification found issues.', 'error');
+                const issues = [
+                  missingRoutes.length > 0 ? `Missing page(s) for: ${missingRoutes.join(', ')}` : '',
+                  verifyFailed.length > 0 ? `Route/API check(s) failed: ${verifyFailed.join(', ')}` : '',
+                ].filter(Boolean).join('\n');
+                addMsg('assistant',
+                  `Changed \`${identifiedFile}\`, but re-verification found something else may be affected:\n\n${issues}\n\nLet me know if you'd like me to look into this.`
+                );
+              }
               return;
             }
 
