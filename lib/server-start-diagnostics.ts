@@ -38,6 +38,38 @@ export function isEnvironmentalServerError(errorMsg: string): boolean {
   return ENVIRONMENTAL_SERVER_ERROR_PATTERNS.some(re => re.test(errorMsg));
 }
 
+// A crash with NO captured detail at all is just as unfixable-by-AI as a
+// recognized environmental error — arguably more so, since there is
+// LITERALLY NOTHING for a code-fix strategy to act on. Confirmed live: a
+// crash that produced an empty/near-empty log fell through
+// isEnvironmentalServerError's keyword matching (nothing to match against)
+// and was escalated to "Advanced repair" anyway, which correctly reported
+// "0 file(s) changed" -- there was no code-level evidence of anything to
+// fix, environmental or otherwise. This is what the fallback text
+// ("Server exited unexpectedly at startup", "No error detail captured")
+// looks like once analyzeCrashLog's portDiagnostic suffix is stripped off.
+const GENERIC_NO_DETAIL_PATTERNS: RegExp[] = [
+  /^server exited unexpectedly/i,
+  /^no error captured/i,
+  /^no error detail captured/i,
+];
+
+/**
+ * True when a server-start error gives NO real, specific evidence of a code
+ * problem -- either a recognized environmental error, or just a generic,
+ * contentless "it crashed" message with nothing else to go on. Both cases
+ * mean escalating to an AI code-repair cycle cannot possibly help.
+ */
+export function hasNoActionableCodeEvidence(errorMsg: string): boolean {
+  if (!errorMsg || !errorMsg.trim()) return true;
+  if (isEnvironmentalServerError(errorMsg)) return true;
+  // Strip the "[intended preview port=...]" diagnostic suffix that
+  // analyzeCrashLog always appends, even to an otherwise-empty crash,
+  // before checking whether what's LEFT is itself just a generic fallback.
+  const withoutPortDiag = errorMsg.replace(/\n?\[intended preview port=.*?\]\s*$/i, '').trim();
+  return GENERIC_NO_DETAIL_PATTERNS.some(re => re.test(withoutPortDiag));
+}
+
 /**
  * True when two consecutive server-start failures report the exact same
  * error text — a sign that whatever the last retry attempt changed had no

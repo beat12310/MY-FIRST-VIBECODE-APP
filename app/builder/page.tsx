@@ -10,7 +10,7 @@ import { detectIntent, type MessageIntent } from '@/lib/intent-classifier';
 import { decideProjectOpenRouting, reportsRoutingProblem } from '@/lib/repair-routing';
 import { saveOpenProject, clearOpenProject, loadOpenProject } from '@/lib/project-session-storage';
 import { parseApiResponse, truncateForLog } from '@/lib/safe-json-response';
-import { isEnvironmentalServerError, isIdenticalRepeatedError } from '@/lib/server-start-diagnostics';
+import { isEnvironmentalServerError, hasNoActionableCodeEvidence, isIdenticalRepeatedError } from '@/lib/server-start-diagnostics';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -5452,12 +5452,18 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           logs: [...(p?.logs ?? []), '⏱ Startup exceeded 90 seconds', errorLines || 'No error detail captured'],
         }));
 
-        if (isEnvironmentalServerError(rawLog) || isEnvironmentalServerError(errorLines)) {
-          appendLog('⚠️ Startup timeout was caused by an environmental error, not a code problem — skipping advanced repair.');
+        if (hasNoActionableCodeEvidence(rawLog) || hasNoActionableCodeEvidence(errorLines)) {
+          // Covers BOTH a recognized environmental error AND a crash with no
+          // captured detail at all — confirmed live: an empty/generic crash
+          // log matched neither the previous environmental patterns nor any
+          // code-error pattern, so it fell through to "Advanced repair"
+          // anyway, which correctly reported 0 files changed since there was
+          // no code-level evidence of anything to fix either way.
+          appendLog('⚠️ Startup timeout had no actionable code-level evidence — skipping advanced repair.');
           narrate(
             `⚠️ **Preview couldn't start — environment issue, not a code problem.**\n\n` +
             `The generated app's files are ready, but the preview server hit a startup issue in this ` +
-            `environment (${errorLines ? errorLines.slice(0, 150) : 'server did not respond within 90s'}). ` +
+            `environment (${errorLines ? errorLines.slice(0, 150) : 'server did not respond within 90s, and no error output was captured'}). ` +
             `This is not something an AI code fix can resolve. Try starting the preview again in a moment, ` +
             `or contact support if this keeps happening.`
           );
@@ -5505,8 +5511,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         // repair" cycle for nothing, since the AI correctly found no code
         // to fix. Skip straight to one clean retry instead of wasting the
         // AI-classification round trip on something it cannot address.
-        if (isEnvironmentalServerError(errorMsg)) {
-          appendLog('⚠️ Detected an environmental server-start error — skipping AI code-fix strategies (not a code problem).');
+        if (hasNoActionableCodeEvidence(errorMsg)) {
+          appendLog('⚠️ Detected an environmental or contentless server-start error — skipping AI code-fix strategies (not a code problem).');
           narrate('⚠️ The preview server hit an environment-level startup issue, not a bug in your generated app. Retrying once with a clean restart…');
           await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
           serverData = await api({ action: 'start-server', projectPath: path, force: true });
@@ -5528,8 +5534,8 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         // cycle targets the generated app's source, which still isn't the
         // problem. Skip it rather than burning another full retry + AI
         // round trip that cannot change the outcome.
-        if (isEnvironmentalServerError(errorMsg2) || isIdenticalRepeatedError(firstErrorMsg, errorMsg2)) {
-          appendLog('⚠️ Server start failed again with the same/environmental error — skipping further code-fix retries.');
+        if (hasNoActionableCodeEvidence(errorMsg2) || isIdenticalRepeatedError(firstErrorMsg, errorMsg2)) {
+          appendLog('⚠️ Server start failed again with the same/environmental/contentless error — skipping further code-fix retries.');
         } else {
           // Strategy 2: fix remaining TypeScript errors, clear .next cache, retry
           appendLog('⚠️ Strategy 2: AI code fix + cache clear + retry…');
@@ -5554,12 +5560,19 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       if (!serverData.port) {
         _clearServerTimer();
         const crashDetail: string = serverData.error || '';
-        const isEnvironmental = isEnvironmentalServerError(crashDetail);
-        appendLog(`⚠️ Server could not start after 3 strategies — ${isEnvironmental ? 'environmental error, not escalating to code repair' : 'escalating to advanced repair'}`);
+        // hasNoActionableCodeEvidence (not just isEnvironmentalServerError)
+        // — confirmed live: a crash with an EMPTY/generic log matched no
+        // known environmental keyword either, so it fell through to
+        // "Advanced repair" anyway, which correctly reported 0 files
+        // changed since there was no code-level evidence of anything to
+        // fix, environmental or otherwise. Escalating to AI code repair is
+        // equally unjustified in both cases.
+        const isEnvironmental = hasNoActionableCodeEvidence(crashDetail);
+        appendLog(`⚠️ Server could not start after 3 strategies — ${isEnvironmental ? 'no actionable code-level evidence, not escalating to code repair' : 'escalating to advanced repair'}`);
         setBuildProgress(p => ({
           ...p!,
           step: 'error',
-          message: `⚠️ ${projectName} — ${isEnvironmental ? 'preview server environment issue' : 'escalating to advanced repair…'}`,
+          message: `⚠️ ${projectName} — ${isEnvironmental ? 'preview server startup issue' : 'escalating to advanced repair…'}`,
           logs: [...(p?.logs ?? []), `⚠️ ${crashDetail || 'Server start failed after 3 strategies'}`, isEnvironmental ? '⚠️ Not a code issue — repair skipped' : '🔧 Advanced repair starting…'],
         }));
         // Save project record first so the sidebar shows it
@@ -5580,11 +5593,16 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
           // Do NOT escalate to the AI code-repair bridge — it targets the
           // generated app's source, which was never the problem here, and
           // would just report "0 files changed" again (confirmed live).
+          // ALWAYS show the real captured detail (even if it's just "no
+          // output captured") instead of a generic "everything's fine"
+          // impression — per explicit requirement, never imply the code
+          // passed checks without also surfacing the real startup failure.
           narrate(
-            `⚠️ **Preview couldn't start — environment issue, not a code problem.**\n\n` +
-            `The generated app's files are ready, but the preview server hit a startup issue in this ` +
-            `environment (${crashDetail.slice(0, 150)}). This is not something an AI code fix can resolve. ` +
-            `Try starting the preview again in a moment, or contact support if this keeps happening.`
+            `⚠️ **Preview couldn't start.**\n\n` +
+            `The generated app's files are ready and TypeScript checks passed, but the preview server did ` +
+            `not start successfully.\n\n**Real startup error:**\n\`\`\`\n${crashDetail || 'The server process exited with no output captured — this is itself the diagnostic: nothing was written to stdout/stderr before it exited.'}\n\`\`\`\n\n` +
+            `This is not something an AI code fix can resolve. Try starting the preview again in a moment, ` +
+            `or contact support if this keeps happening.`
           );
           return;
         }
@@ -5744,11 +5762,12 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
             ],
           }));
 
-          // Same environmental-error check as the server-start paths above —
-          // a third, independent escalation trigger that must not send an
-          // unfixable-by-code error to the AI repair bridge either.
-          if (isEnvironmentalServerError(rawLog) || isEnvironmentalServerError(diagLines)) {
-            appendLog('⚠️ Preview health timeout was caused by an environmental error, not a code problem — skipping advanced repair.');
+          // Same environmental-error / no-actionable-evidence check as the
+          // server-start paths above — a third, independent escalation
+          // trigger that must not send an unfixable-by-code error to the AI
+          // repair bridge either.
+          if (hasNoActionableCodeEvidence(rawLog) || hasNoActionableCodeEvidence(diagLines)) {
+            appendLog('⚠️ Preview health timeout had no actionable code-level evidence — skipping advanced repair.');
             narrate(
               `⚠️ **Preview couldn't load — environment issue, not a code problem.**\n\n` +
               `The generated app's files are ready, but the preview server hit a startup issue in this ` +

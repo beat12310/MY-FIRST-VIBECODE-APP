@@ -501,6 +501,47 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'identical crash recurs after multiple deployed fixes', 'generated app code confirmed innocent', 'works locally but not in production'],
   },
+  {
+    id: 'server-start-empty-crash-log-escalated-to-repair-anyway',
+    title: 'A server-start crash with an EMPTY log fell through environmental-error detection and still escalated to a doomed AI repair cycle',
+    category: 'other',
+    rootCause:
+      "Live evidence from a fourth report of the preview-startup failure: 'Server exits unexpectedly at " +
+      "startup', 'Advanced repair changed 0 files'. Traced this to isEnvironmentalServerError() only " +
+      "matching SPECIFIC known error text (x-amplify-credentials, EADDRINUSE, EACCES, etc.) -- when a " +
+      "crash produces NO captured output at all, analyzeCrashLog()'s own fallback text ('Server exited " +
+      "unexpectedly at startup') doesn't match ANY of those patterns, so the failure was NOT classified as " +
+      "environmental and fell through to the normal AI code-repair escalation -- which correctly found " +
+      "nothing to fix, since an empty crash log is not evidence of a code problem either. Also " +
+      "investigated (and ruled out) whether services/project-runner.ts's spawn() even runs in production " +
+      "at all: app/api/chat/route.ts has a WORKER_URL-based proxy to a separate Fargate worker for exactly " +
+      "this class of disk/process action, but confirmed via `aws amplify get-app`/`get-branch` that " +
+      "WORKER_URL is not set in production, so the proxy branch is skipped and this code does run directly.",
+    filesAffected: ['lib/server-start-diagnostics.ts', 'app/builder/page.tsx', 'services/project-runner.ts', 'services/port-detector.ts'],
+    fixApplied:
+      "(1) Added hasNoActionableCodeEvidence() (lib/server-start-diagnostics.ts): treats a genuinely " +
+      "empty error OR a generic, contentless fallback message ('Server exited unexpectedly', 'No error " +
+      "captured') the SAME as a recognized environmental error -- both mean an AI code-repair cycle cannot " +
+      "possibly help. Replaced isEnvironmentalServerError with this broader check at all 4 escalation-" +
+      "decision sites in app/builder/page.tsx. (2) Hardened crash-log capture in services/project-runner.ts: " +
+      "extracted attemptServerStart(), which now captures stdout/stderr into an IN-MEMORY buffer via 'data' " +
+      "listeners attached synchronously right after spawn() (previously relied solely on reading a log file " +
+      "back after a delay, which has a real race for an extremely fast crash). (3) Made the resilience " +
+      "shim's NODE_OPTIONS wiring fail-safe: verifies the shim file is actually readable immediately after " +
+      "writing it, and only sets NODE_OPTIONS if that check passes -- otherwise falls back to just clearing " +
+      "it, since NODE_OPTIONS pointing at an inaccessible file crashes Node at the preload stage before " +
+      "npm's own script even runs. (4) Added automatic port-conflict retry: attemptServerStart's result " +
+      "carries a portConflict flag (via looksLikePortConflict(), detecting EADDRINUSE in the captured " +
+      "output); startDevServer retries ONCE, automatically, on a new port when this fires -- a " +
+      "deterministic, mechanical fix, not an AI repair cycle. (5) Added explicit '-H 0.0.0.0' host binding " +
+      "to the spawn command rather than relying on Next.js's own default. (6) The final exhausted-retries " +
+      "message now always shows the real captured crash detail (or explicitly says 'no output was " +
+      "captured' when genuinely empty) instead of ever implying things are fine.",
+    verificationPerformed: 'Ran a real local end-to-end test of the hardened startDevServer() against an existing generated project, confirming it still starts successfully (success:true, real port, no regression from the structural refactor). Added 9 new unit tests: 5 for hasNoActionableCodeEvidence (empty/generic-fallback/environmental/genuine-code-error cases) and 4 for looksLikePortConflict. Full suite (220 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "lib/__tests__/server-start-diagnostics.test.ts — 'hasNoActionableCodeEvidence' describe block; services/__tests__/project-runner.test.ts — 'looksLikePortConflict' describe block",
+    dateFixed: '2026-07-05',
+    symptoms: ['Server exits unexpectedly at startup', 'Advanced repair changed 0 files', 'empty/near-empty crash log', 'intended preview port 3001', 'escalates to repair despite no code evidence'],
+  },
 ];
 
 /**

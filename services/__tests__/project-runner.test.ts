@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { spawnSync } from 'child_process';
-import { buildIsolatedDevServerEnv, analyzeCrashLog, writePreviewResilienceShim } from '../project-runner';
+import { buildIsolatedDevServerEnv, analyzeCrashLog, writePreviewResilienceShim, looksLikePortConflict } from '../project-runner';
 import { isEnvironmentalServerError } from '@/lib/server-start-diagnostics';
 
 /**
@@ -217,5 +217,23 @@ describe('writePreviewResilienceShim — the actual crash-suppression mechanism'
       encoding: 'utf-8',
     });
     expect(result.status).not.toBe(0); // still crashes -- this is not a general error-swallower
+  });
+});
+
+describe('looksLikePortConflict — drives the automatic port-retry (requirement: auto-select a free port)', () => {
+  it('recognizes EADDRINUSE mentioning the same port', () => {
+    expect(looksLikePortConflict('Error: listen EADDRINUSE: address already in use :::3001', 3001)).toBe(true);
+  });
+
+  it('recognizes a bare EADDRINUSE even without an explicit port number nearby', () => {
+    expect(looksLikePortConflict('npm error EADDRINUSE', 3001)).toBe(true);
+  });
+
+  it('does NOT flag an unrelated error as a port conflict', () => {
+    expect(looksLikePortConflict('TS2305: Module has no exported member "auth"', 3001)).toBe(false);
+  });
+
+  it('does NOT flag an empty crash log as a port conflict', () => {
+    expect(looksLikePortConflict('', 3001)).toBe(false);
   });
 });
