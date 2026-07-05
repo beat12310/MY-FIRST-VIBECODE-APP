@@ -102,6 +102,20 @@ export async function repair(
   // a stall and gave up 3 iterations early. A true stall is when the exact
   // SAME set of failures persists across an iteration with no change.
   let prevRemainingKeys: Set<string> | null = null;
+  // Which failures (by "area::detail") this loop is ABOUT to attempt this
+  // iteration — checked at the START of the NEXT iteration to find failures
+  // that already survived one full fix attempt ("stubborn"). Confirmed live
+  // (Golden Project Suite, 4 of 8 real-world builds): a batch fix routinely
+  // resolves 18-22 of ~20-25 failures in one call, but the SAME 1-3 stragglers
+  // (dashboard-widget coverage, breadcrumb navigation) kept surviving
+  // identically across every remaining iteration until maxAttempts was
+  // exhausted — even though everything ELSE in the same batch got fixed
+  // correctly every time. The existing "batch produced nothing → per-failure
+  // retry" escalation below never helps here because the batch ISN'T
+  // producing nothing — it's producing partial progress that happens to
+  // always skip the same one or two targets.
+  let lastAttemptedKeys: Set<string> | null = null;
+  const failureKey = (f: ClassifiedFailure) => `${f.area}::${f.detail}`;
 
   outer: while (attempts < maxAttempts) {
     if (signal?.aborted) {
@@ -119,59 +133,105 @@ export async function repair(
     // Task 2 + 3: log why this attempt starts and which verifier failures triggered it.
     log(`iteration ${attempts}/${maxAttempts} START — triggered by ${toFix.length} failure(s): ${targeted.join(' | ')}`);
 
+    // Split into failures that already survived the immediately preceding
+    // iteration's fix attempt ("stubborn") vs everything else ("fresh").
+    // Iteration 1 always has lastAttemptedKeys === null, so everything is fresh.
+    const stubborn = lastAttemptedKeys ? toFix.filter(f => lastAttemptedKeys!.has(failureKey(f))) : [];
+    const fresh = lastAttemptedKeys ? toFix.filter(f => !lastAttemptedKeys!.has(failureKey(f))) : toFix;
+    lastAttemptedKeys = new Set(toFix.map(failureKey));
+
     const iterChanged = new Set<string>();
-    if (deps.applyFixBatch) {
-      // Batched path: fix this whole iteration's failures in as few Bedrock
-      // calls as possible instead of one round-trip per failure.
-      if (signal?.aborted) {
-        stopReason = 'cancelled — orchestrator aborted this stage';
-        log(`ABORT detected before iteration ${attempts} batch fix — EXIT (${stopReason})`);
-        iterations.push({ attempt: attempts, targeted, changedFiles: [] });
-        break outer;
-      }
-      log(`  → batch-fixing ${toFix.length} failure(s) in as few call(s) as possible`);
-      try {
-        const res = await deps.applyFixBatch(plan, toFix, projectPath, signal);
-        res.changedFiles.forEach(c => { changedFiles.add(c); iterChanged.add(c); });
-        log(`    applyFixBatch changed ${res.changedFiles.length} file(s): ${res.changedFiles.join(', ') || '(none)'}`);
-      } catch (e) {
+
+    // ── Stubborn escalation: ALWAYS a focused, single-failure fix ───────────
+    // Bypasses applyFixBatch entirely for these — a simpler, single-target
+    // prompt is exactly what the batch-produced-nothing escalation further
+    // below already relies on succeeding where a multi-file batch didn't;
+    // applying that same reasoning proactively (before waiting for a whole
+    // iteration to produce zero progress) is what actually closes out the
+    // last 1-2 stragglers instead of re-feeding them into the same batch
+    // call that already failed to address them once.
+    if (stubborn.length > 0) {
+      log(`  ${stubborn.length} failure(s) survived the previous iteration's fix attempt — escalating to focused single-file repair: ${stubborn.map(describe).join(' | ')}`);
+      for (const failure of stubborn) {
         if (signal?.aborted) {
           stopReason = 'cancelled — orchestrator aborted this stage';
-          log(`ABORT during applyFixBatch — EXIT (${stopReason})`);
+          log(`ABORT detected mid-iteration ${attempts} (before re-fixing "${failure.detail}") — EXIT (${stopReason})`);
           iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
           break outer;
         }
-        log(`    applyFixBatch error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
-      }
-    } else {
-      for (const failure of toFix) {
-        // Checked BEFORE every single fix (not just between iterations) — this is
-        // the exact point where a live run kept calling Bedrock for several more
-        // fixes after the orchestrator had already reported the stage as timed out.
-        if (signal?.aborted) {
-          stopReason = 'cancelled — orchestrator aborted this stage';
-          log(`ABORT detected mid-iteration ${attempts} (before fixing "${failure.detail}") — EXIT (${stopReason})`);
-          iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
-          break outer;
-        }
-        log(`  → fixing (${failure.area}) ${failure.detail}`);
+        log(`  → re-fixing (stubborn, ${failure.area}) ${failure.detail}`);
         try {
           const res = await deps.applyFix(plan, failure, projectPath, signal);
           res.changedFiles.forEach(c => { changedFiles.add(c); iterChanged.add(c); });
-          log(`    applyFix changed ${res.changedFiles.length} file(s): ${res.changedFiles.join(', ') || '(none)'}`);
+          log(`    applyFix (stubborn) changed ${res.changedFiles.length} file(s): ${res.changedFiles.join(', ') || '(none)'}`);
         } catch (e) {
           if (signal?.aborted) {
             stopReason = 'cancelled — orchestrator aborted this stage';
-            log(`ABORT during applyFix for "${failure.detail}" — EXIT (${stopReason})`);
+            log(`ABORT during stubborn applyFix for "${failure.detail}" — EXIT (${stopReason})`);
             iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
             break outer;
           }
-          log(`    applyFix error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+          log(`    applyFix (stubborn) error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
     }
 
-    // ── Strategy escalation: batch produced nothing → retry per-failure ────────
+    // ── Fresh failures: the existing batch-or-per-failure strategy ──────────
+    const freshChanged = new Set<string>();
+    if (fresh.length > 0) {
+      if (deps.applyFixBatch) {
+        // Batched path: fix this whole iteration's failures in as few Bedrock
+        // calls as possible instead of one round-trip per failure.
+        if (signal?.aborted) {
+          stopReason = 'cancelled — orchestrator aborted this stage';
+          log(`ABORT detected before iteration ${attempts} batch fix — EXIT (${stopReason})`);
+          iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
+          break outer;
+        }
+        log(`  → batch-fixing ${fresh.length} failure(s) in as few call(s) as possible`);
+        try {
+          const res = await deps.applyFixBatch(plan, fresh, projectPath, signal);
+          res.changedFiles.forEach(c => { changedFiles.add(c); iterChanged.add(c); freshChanged.add(c); });
+          log(`    applyFixBatch changed ${res.changedFiles.length} file(s): ${res.changedFiles.join(', ') || '(none)'}`);
+        } catch (e) {
+          if (signal?.aborted) {
+            stopReason = 'cancelled — orchestrator aborted this stage';
+            log(`ABORT during applyFixBatch — EXIT (${stopReason})`);
+            iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
+            break outer;
+          }
+          log(`    applyFixBatch error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else {
+        for (const failure of fresh) {
+          // Checked BEFORE every single fix (not just between iterations) — this is
+          // the exact point where a live run kept calling Bedrock for several more
+          // fixes after the orchestrator had already reported the stage as timed out.
+          if (signal?.aborted) {
+            stopReason = 'cancelled — orchestrator aborted this stage';
+            log(`ABORT detected mid-iteration ${attempts} (before fixing "${failure.detail}") — EXIT (${stopReason})`);
+            iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
+            break outer;
+          }
+          log(`  → fixing (${failure.area}) ${failure.detail}`);
+          try {
+            const res = await deps.applyFix(plan, failure, projectPath, signal);
+            res.changedFiles.forEach(c => { changedFiles.add(c); iterChanged.add(c); freshChanged.add(c); });
+            log(`    applyFix changed ${res.changedFiles.length} file(s): ${res.changedFiles.join(', ') || '(none)'}`);
+          } catch (e) {
+            if (signal?.aborted) {
+              stopReason = 'cancelled — orchestrator aborted this stage';
+              log(`ABORT during applyFix for "${failure.detail}" — EXIT (${stopReason})`);
+              iterations.push({ attempt: attempts, targeted, changedFiles: [...iterChanged] });
+              break outer;
+            }
+            log(`    applyFix error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      }
+    }
+
+    // ── Strategy escalation: fresh batch produced nothing → retry per-failure ──
     // A whole-iteration batch call can fail to produce ANY usable edit for
     // reasons that don't apply equally to every failure in it — one bad path
     // in a multi-file response, a single malformed edit block, a truncated
@@ -179,10 +239,12 @@ export async function repair(
     // one target instead of several) can still succeed. Retry once, per
     // failure, before concluding the whole iteration is unfixable — this is
     // what turns "no code changes produced" from an immediate dead end into
-    // an actual second attempt with a different strategy.
-    if (iterChanged.size === 0 && deps.applyFixBatch && !signal?.aborted) {
-      log(`  batch produced no changes — escalating to per-failure retry for ${toFix.length} failure(s)`);
-      for (const failure of toFix) {
+    // an actual second attempt with a different strategy. Gated on freshChanged
+    // (not the overall iterChanged) so this still fires even when the stubborn
+    // escalation above DID make progress — those are unrelated signals.
+    if (fresh.length > 0 && freshChanged.size === 0 && deps.applyFixBatch && !signal?.aborted) {
+      log(`  batch produced no changes — escalating to per-failure retry for ${fresh.length} failure(s)`);
+      for (const failure of fresh) {
         if (signal?.aborted) break;
         try {
           const res = await deps.applyFix(plan, failure, projectPath, signal);
@@ -629,9 +691,28 @@ export async function defaultRepairerDeps(opts: {
       const files = await opts.readProjectFiles(projectPath);
       const inventory = files.filter(f => /^(?:src\/)?(components|lib|app\/api)\//.test(f.path)).map(f => f.path).sort();
 
-      for (let i = 0; i < needsModel.length; i += BATCH_CHUNK_SIZE) {
-        if (signal?.aborted) return { changedFiles };
-        const chunk = needsModel.slice(i, i + BATCH_CHUNK_SIZE);
+      if (signal?.aborted) return { changedFiles };
+
+      // Build every chunk's prompt up front, then fire all the chunks'
+      // Bedrock calls CONCURRENTLY (Promise.allSettled) instead of one
+      // after another. This is the actual fix for "REPAIR: TIMED OUT" on
+      // real-world builds with 20+ failures needing a model fix: a single
+      // chunked call routinely takes 65-140+ seconds (confirmed live, Golden
+      // Project Suite), so 3-4 chunks run SEQUENTIALLY (the previous
+      // behavior) could alone consume 260-560+ seconds — the ENTIRE adaptive
+      // repair timeout — before even finishing iteration 1's fixes, let
+      // alone re-verifying or attempting a 2nd iteration. Running them
+      // concurrently instead cuts that to roughly one chunk's wall-clock
+      // time regardless of how many chunks there are. File writes below
+      // still happen sequentially (in chunk order) after every call has
+      // resolved, so this changes nothing about apply-order/correctness —
+      // only how long the loop spends waiting on Bedrock.
+      const chunks: ClassifiedFailure[][] = [];
+      for (let i = 0; i < needsModel.length; i += BATCH_CHUNK_SIZE) chunks.push(needsModel.slice(i, i + BATCH_CHUNK_SIZE));
+
+      const { searchKnowledgeBase, formatKnowledgeHint } = await import('./bug-knowledge-base');
+
+      const chunkResults = await Promise.allSettled(chunks.map(async (chunk) => {
         const targets = chunk.map(f => describeTarget(plan, f));
         const targetPaths = new Set(targets.map(t => t.targetPath).filter((p): p is string => !!p));
 
@@ -652,7 +733,6 @@ export async function defaultRepairerDeps(opts: {
 
         // Same knowledge-base lookup as the single-failure applyFix path
         // above, applied per-failure in the batch.
-        const { searchKnowledgeBase, formatKnowledgeHint } = await import('./bug-knowledge-base');
         const problems = chunk.map((failure, idx) => {
           const { targetPath, purpose, routeLabel } = targets[idx];
           const current = targetPath ? files.find(f => pathsMatch(f.path, targetPath)) : undefined;
@@ -677,8 +757,20 @@ export async function defaultRepairerDeps(opts: {
           `Now output the complete corrected/created content for EACH of the ${chunk.length} files above.`,
         ].join('\n\n');
 
+        const raw = await buildWithAI(prompt, system, 'SONNET', signal);
+        return { chunk, targetPaths, raw };
+      }));
+
+      for (const result of chunkResults) {
+        if (signal?.aborted) return { changedFiles }; // preserve fixes already applied before cancellation
+        if (result.status === 'rejected') {
+          // Non-fatal: this chunk failed, but don't lose changedFiles from other
+          // chunks or the free fast-path fixes already applied above.
+          console.log(`[repairer][batch] chunk failed (non-fatal): ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+          continue;
+        }
+        const { chunk, targetPaths, raw } = result.value;
         try {
-          const raw = await buildWithAI(prompt, system, 'SONNET', signal);
           const edits = parseEditFormat(raw);
           // Safety filter: only accept edits matching one of the requested targets —
           // batching must not open the door to unrequested fan-out edits. Uses
@@ -694,13 +786,10 @@ export async function defaultRepairerDeps(opts: {
           const satisfied = new Set(scoped.flatMap(e => [...targetPaths].filter(t => pathsMatch(e.path, t))));
           const unsatisfied = [...targetPaths].filter(t => !satisfied.has(t));
           if (unsatisfied.length > 0) {
-            console.log(`[repairer][batch] model response did not include a usable fix for: ${unsatisfied.join(', ')} (returned paths: ${edits.map(e => e.path).join(', ') || '(none)'})`);
+            console.log(`[repairer][batch] model response did not include a usable fix for: ${unsatisfied.join(', ')} (returned paths: ${edits.map(e => e.path).join(', ') || '(none)'}, chunk size ${chunk.length})`);
           }
         } catch (e) {
-          if (signal?.aborted) return { changedFiles }; // preserve fixes already applied before cancellation
-          // Non-fatal: this chunk failed, but don't lose changedFiles from earlier
-          // chunks or the free fast-path fixes already applied above.
-          console.log(`[repairer][batch] chunk of ${chunk.length} failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+          console.log(`[repairer][batch] chunk of ${chunk.length} failed to apply (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
 

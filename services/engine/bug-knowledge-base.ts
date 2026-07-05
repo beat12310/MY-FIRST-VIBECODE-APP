@@ -285,6 +285,41 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['npm error could not determine executable to run', 'husky: command not found', 'audited 618 packages', 'node_modules/@aws-amplify/backend-cli missing', 'Amplify BUILD step failed after switching npm ci to npm install'],
   },
+  {
+    id: 'repair-loop-1-2-stragglers-and-batch-timeouts',
+    title: 'Repair loop reliably left 1-2 issues unresolved (dashboard widgets, breadcrumbs) or timed out mid-first-iteration on 20+ failure builds',
+    category: 'other',
+    rootCause:
+      "Found via the Golden Project Suite's first full 8-project run: 0/8 real-world apps fully passed. " +
+      "Two distinct causes converged on the same symptom. (1) A batched fix call routinely resolved 18-22 " +
+      "of ~20-25 failures in one Bedrock round trip, but the SAME 1-3 stragglers (most often dashboard-" +
+      "widget coverage and breadcrumb navigation, both of which have a fast-path check that legitimately " +
+      "declines and falls through to the model for arbitrary/AI-authored layouts) kept surviving " +
+      "identically across every remaining iteration until maxAttempts was exhausted -- even though " +
+      "everything else in the same batch got fixed correctly every time. The existing 'batch produced " +
+      "nothing -> per-failure retry' escalation never helped here because the batch WASN'T producing " +
+      "nothing; it was producing real partial progress that happened to always skip the same target(s). " +
+      "(2) BATCH_CHUNK_SIZE=8 failures per Bedrock call, chunks processed SEQUENTIALLY -- a single chunked " +
+      "call routinely took 65-140+ seconds live, so a 20-25 failure iteration needing 3-4 chunks could " +
+      "alone consume 260-560+ seconds, which is the ENTIRE adaptive repair timeout, before even finishing " +
+      "iteration 1's fixes, let alone re-verifying or attempting a 2nd iteration -- confirmed live as " +
+      "'REPAIR: TIMED OUT' on 3 of the 8 golden projects.",
+    filesAffected: ['services/engine/repairer.ts'],
+    fixApplied:
+      "(1) repair()'s main loop now tracks which failures (by area::detail) were targeted in the " +
+      "immediately preceding iteration; any that survive get classified 'stubborn' and are ALWAYS routed " +
+      "to a focused, single-failure applyFix call on the next iteration -- bypassing the batch entirely, " +
+      "instead of being fed back into another identical multi-file batch call that already failed to " +
+      "address them once. (2) applyFixBatch's chunk loop now fires every chunk's Bedrock call " +
+      "CONCURRENTLY via Promise.allSettled instead of one after another, then applies all resulting edits " +
+      "sequentially afterward (unchanged apply-order/correctness, only the wait time changes) -- cutting " +
+      "a multi-chunk iteration's wall-clock cost from roughly (chunk count x per-chunk latency) down to " +
+      "about one chunk's latency regardless of failure count.",
+    verificationPerformed: 'Added 2 new unit tests (repair-retry.test.ts) simulating the exact observed shape (a failure that survives one full batch iteration must be escalated to per-failure repair on the next, and resolve; a failure fixed on its very FIRST attempt must never be escalated). Full suite (159 tests), typecheck, and dependency check all pass.',
+    regressionTest: "services/engine/__tests__/repair-retry.test.ts — 'escalates a failure that survives a batch fix to a focused single-file repair on the next iteration' and 'does NOT escalate a failure to per-failure repair on its very first appearance'",
+    dateFixed: '2026-07-05',
+    symptoms: ['repair: incomplete', 'REPAIR: TIMED OUT', 'no progress across consecutive iterations', 'Resource ... is not represented as a dashboard widget', 'Dynamic detail page is missing breadcrumb navigation', 'remainingInternalIssues 1-3 after repair used all attempts'],
+  },
 ];
 
 /**

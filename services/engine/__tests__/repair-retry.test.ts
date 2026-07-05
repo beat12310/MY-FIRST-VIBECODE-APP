@@ -135,6 +135,63 @@ describe('repair() — bounded retry loop (fixed: unbounded Bedrock retries agai
     expect(result.stopReason).toContain('skipped');
   });
 
+  it('escalates a failure that survives a batch fix to a focused single-file repair on the next iteration', async () => {
+    // Confirmed live via the Golden Project Suite (8 real-world app builds):
+    // a batch fix routinely resolved 18-22 of ~20-25 failures, but the same
+    // 1-2 stragglers (dashboard-widget coverage, breadcrumb navigation) kept
+    // surviving identically every iteration, exhausting maxAttempts with the
+    // build otherwise fully working. This reproduces that shape: iteration 1
+    // batch-fixes the "fresh" failure but never actually resolves the
+    // "stubborn" one; iteration 2 must escalate the stubborn one straight to
+    // a focused per-failure applyFix (bypassing the batch it already
+    // survived) instead of feeding it back into another identical batch call.
+    const stubbornFailure = failure('Dynamic detail page is missing breadcrumb navigation: app/blog/[id]/page.tsx');
+    const freshFailure = failure('Planned file missing: app/api/comments/route.ts');
+    let verifyCallCount = 0;
+    let stubbornPerFailureCalls = 0;
+    const deps: RepairerDeps = {
+      applyFix: async (_plan, f) => {
+        if (f.detail === stubbornFailure.detail) stubbornPerFailureCalls++;
+        return { changedFiles: ['some-file.tsx'] };
+      },
+      // Simulates a batch call that resolves the fresh failure but never
+      // actually produces a usable fix for the stubborn one, every time.
+      applyFixBatch: async (_plan, fails) => ({
+        changedFiles: fails.filter(f => f.detail !== stubbornFailure.detail).map(() => 'app/api/comments/route.ts'),
+      }),
+      verify: async () => {
+        verifyCallCount++;
+        if (verifyCallCount === 1) return verifyResultWith([stubbornFailure]); // fresh resolved, stubborn remains
+        return verifyResultWith([]); // resolved after the stubborn escalation on iteration 2
+      },
+      maxAttempts: 5,
+    };
+
+    const result = await repair(minimalPlan, '/tmp/test-project', verifyResultWith([stubbornFailure, freshFailure]), deps);
+
+    expect(stubbornPerFailureCalls).toBeGreaterThan(0); // stubborn escalation path was actually exercised
+    expect(result.attempts).toBe(2);
+    expect(result.resolved).toBe(true);
+  });
+
+  it('does NOT escalate a failure to per-failure repair on its very first appearance (only after it survives an iteration)', async () => {
+    let batchCalls = 0;
+    let perFailureCalls = 0;
+    const theFailure = failure('Resource /api/billing is not represented as a dashboard widget: app/dashboard/page.tsx');
+    const deps: RepairerDeps = {
+      applyFix: async () => { perFailureCalls++; return { changedFiles: [] }; },
+      applyFixBatch: async () => { batchCalls++; return { changedFiles: ['app/dashboard/page.tsx'] }; },
+      verify: async () => verifyResultWith([]), // resolved immediately after the batch fix
+      maxAttempts: 5,
+    };
+
+    const result = await repair(minimalPlan, '/tmp/test-project', verifyResultWith([theFailure]), deps);
+
+    expect(batchCalls).toBe(1);
+    expect(perFailureCalls).toBe(0); // never escalated -- it was fixed on the very first attempt
+    expect(result.resolved).toBe(true);
+  });
+
   it('respects a signal aborted before the first iteration starts', async () => {
     const controller = new AbortController();
     controller.abort();
