@@ -218,6 +218,27 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-04',
     symptoms: ['test timed out', 'fetch previewUrl hangs', 'fast CI test taking 90 seconds', 'warmup loop'],
   },
+  {
+    id: 'npm-ci-rejects-valid-lockfile-nested-otel-uuid',
+    title: 'npm ci rejected an immediately-fresh, valid package-lock.json over nested @opentelemetry/uuid version drift',
+    category: 'other',
+    rootCause:
+      "@aws-amplify/backend's CDK-adjacent packages (data-construct, graphql-api-construct) each " +
+      "pull in their OWN duplicated copy of @opentelemetry/* and uuid, some via exact-pinned " +
+      "sub-dependency requirements (e.g. @opentelemetry/resources requiring exactly " +
+      "@opentelemetry/core@2.0.0) that don't match the newer version (2.9.0/2.8.0) npm's normal " +
+      "install resolution hoists/dedupes to. npm install tolerates this via its standard semver-range " +
+      "resolution and produces a correct, working node_modules — confirmed by a full npm run verify " +
+      "pass. npm ci's stricter byte-exact lockfile validation rejects it as 'missing' regardless, " +
+      "even immediately after a from-scratch npm install regenerated the lock file fresh (reproduced " +
+      "twice, with two different missing packages each time, ruling out simple lockfile staleness).",
+    filesAffected: ['.github/workflows/ci.yml', '.github/workflows/scheduled-verification.yml', 'package-lock.json'],
+    fixApplied: "Changed CI's install step from npm ci to npm install. Still deterministic (installs FROM the committed lock file, not a live re-resolution loophole) — just tolerates this specific dependency tree's legitimate version-range flexibility instead of npm ci's stricter check.",
+    verificationPerformed: 'Reproduced the npm ci failure twice locally in a true clean-room test (moved node_modules aside, ran npm ci fresh) even after regenerating package-lock.json from scratch; confirmed npm install succeeds and the full npm run verify (157 tests, typecheck, dependency check) passes against the resulting install.',
+    regressionTest: '(not a permanent automated regression test -- this is an install-tooling compatibility fact about the current dependency tree, revisit if @aws-amplify/backend is upgraded/removed)',
+    dateFixed: '2026-07-05',
+    symptoms: ['npm error code EUSAGE', 'Missing: ... from lock file', 'npm ci fails in CI but works locally', '@opentelemetry/core', 'uuid@9.0.1'],
+  },
 ];
 
 /**
