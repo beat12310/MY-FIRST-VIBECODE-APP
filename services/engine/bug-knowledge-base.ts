@@ -387,6 +387,44 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['Connection interrupted', 'Build interrupted', 'Retry Build', 'HTTP 500 on /api/chat for every action', 'ERR_MODULE_NOT_FOUND', "Cannot find package 'playwright'"],
   },
+  {
+    id: 'generated-app-dev-server-inherits-amplify-hosting-env',
+    title: 'Generated app preview server crashed with "[x-amplify-credentials] Credential listener could not be started: Error: listen" -- the dev server inherited the platform\'s own AWS Amplify Hosting environment',
+    category: 'other',
+    rootCause:
+      "Found live on production (a real 'car sales marketplace' build): after the JSON-parsing and " +
+      "playwright-import-crash fixes, builds progressed past generation and npm install, then got stuck " +
+      "at preview/server start with '[x-amplify-credentials] Credential listener could not be started: " +
+      "Error: listen'. services/project-runner.ts's startDevServer spawns the generated app's `npm run dev` " +
+      "as a child process WITHOUT an explicit `env` option -- Node's child_process.spawn() defaults to " +
+      "inheriting the ENTIRE parent process environment. In production this platform itself runs on AWS " +
+      "Amplify Hosting's SSR compute, which injects Amplify/Lambda-specific variables (AWS_APP_ID, " +
+      "AWS_BRANCH, _HANDLER, AWS_LAMBDA_FUNCTION_NAME, etc.) that have nothing to do with the generated " +
+      "app -- but their mere presence made something in the dependency tree try to auto-start a local " +
+      "credential-forwarding listener for Amplify backend resource access, which the generated app never " +
+      "needs (it uses its own lib/managed/auth.ts + better-sqlite3, never AWS Amplify/Cognito backend " +
+      "resources). That listener failed with 'Error: listen' under the Lambda sandbox's restricted " +
+      "networking, crashing the dev server on EVERY attempt -- the builder's 3-strategy retry loop then " +
+      "burned all 3 attempts (including two AI code-fix cycles) retrying with the identical, equally " +
+      "poisoned environment, surfacing to the user as 'Advanced repair finished — 0 file(s) changed' " +
+      "since the AI correctly found nothing wrong with the generated app's actual code.",
+    filesAffected: ['services/project-runner.ts', 'lib/server-start-diagnostics.ts', 'app/builder/page.tsx'],
+    fixApplied:
+      "(1) Added buildIsolatedDevServerEnv() to services/project-runner.ts: strips AWS_/AMPLIFY_/LAMBDA_/" +
+      "_HANDLER/_X_AMZN_/_AWS_XRAY_-prefixed variables before spawning the generated app's dev server, and " +
+      "explicitly sets NODE_ENV=development regardless of the platform's own NODE_ENV=production -- the " +
+      "generated app's dev server now never sees this platform's own AWS hosting context. (2) Added " +
+      "lib/server-start-diagnostics.ts's isEnvironmentalServerError() + isIdenticalRepeatedError(): the " +
+      "builder's 3-strategy retry loop now detects when a server-start failure is environmental (a " +
+      "listener/port/permission issue, not a code problem) or identical to the previous attempt, and skips " +
+      "the AI code-fix strategies entirely instead of wasting them on something no code change can address " +
+      "-- and skips escalating to the AI repair bridge too, showing an honest 'environment issue, not a " +
+      "code problem' message instead of a doomed repair cycle.",
+    verificationPerformed: 'Added 11 new unit tests (5 for buildIsolatedDevServerEnv confirming AWS_/AMPLIFY_/LAMBDA_ stripping while preserving PATH/HOME/other vars; 6 for isEnvironmentalServerError/isIdenticalRepeatedError covering the exact reported error text plus EADDRINUSE/EACCES variants, and confirming genuine code errors are never misclassified as environmental). Full suite (199 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "services/__tests__/project-runner.test.ts — 'buildIsolatedDevServerEnv' describe block; lib/__tests__/server-start-diagnostics.test.ts — 'isEnvironmentalServerError' and 'isIdenticalRepeatedError' describe blocks",
+    dateFixed: '2026-07-05',
+    symptoms: ['x-amplify-credentials', 'Credential listener could not be started', 'Error: listen', 'Server start failed after 3 strategies', 'Advanced repair finished — 0 file(s) changed'],
+  },
 ];
 
 /**

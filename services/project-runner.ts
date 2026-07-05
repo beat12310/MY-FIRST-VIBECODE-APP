@@ -8,6 +8,50 @@ import { GENERATED_ROOT } from '@/lib/workspace-paths';
 import { logError } from '@/lib/error-handler';
 import { findAvailablePort, waitForPort } from './port-detector';
 
+// ── Generated-app dev-server environment isolation ──────────────────────────
+// Root cause of a real production failure: spawn() below did not pass an
+// explicit `env`, so the generated app's dev server (a child process)
+// inherited the ENTIRE platform process's environment by Node's default
+// behavior. In production this platform itself runs on AWS Amplify Hosting's
+// SSR compute, which injects Amplify/Lambda-specific variables (AWS_APP_ID,
+// AWS_BRANCH, _HANDLER, AWS_LAMBDA_FUNCTION_NAME, etc.) that have nothing to
+// do with the generated app — but their mere presence makes something in the
+// dependency tree (an Amplify SSR adapter's auto-configuration) try to start
+// a local "x-amplify-credentials" listener for backend-resource access the
+// generated app never needs (it uses its own lib/managed/auth.ts + better-
+// sqlite3, never AWS Amplify/Cognito backend resources). That listener then
+// fails with "Error: listen" under the Lambda sandbox's restricted
+// networking, crashing the dev server on every attempt — confirmed live:
+// "Server start failed after 3 strategies" on a real production build,
+// where all 3 retries hit the identical environmental error, since retrying
+// with the same inherited (and equally poisoned) environment can never help.
+//
+// Fix: strip Amplify/Lambda/AWS-hosting-specific variables before spawning,
+// so the generated app's dev server never sees them and the credential-
+// listener auto-detection never fires in the first place — the generated
+// app needs none of these for its own (non-AWS-backed) functionality.
+const STRIP_ENV_PREFIXES = ['AWS_', 'AMPLIFY_', 'LAMBDA_', '_X_AMZN_', '_HANDLER', '_AWS_XRAY_'];
+
+/**
+ * Builds the environment for the generated app's dev-server child process:
+ * everything from the current process EXCEPT Amplify-Hosting/Lambda-specific
+ * variables, which would otherwise leak this platform's own AWS hosting
+ * context into a project that has no business knowing about it.
+ */
+export function buildIsolatedDevServerEnv(source: Record<string, string | undefined> = process.env): NodeJS.ProcessEnv {
+  const clean: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (STRIP_ENV_PREFIXES.some(prefix => key.startsWith(prefix))) continue;
+    clean[key] = value;
+  }
+  // The platform's own process runs with NODE_ENV=production in deployed
+  // environments; the generated app's PREVIEW must run `next dev` in
+  // development mode regardless, so this is set explicitly (via a fresh
+  // object literal -- NODE_ENV is read-only on NodeJS.ProcessEnv and can't
+  // be reassigned on an already-typed object) rather than inherited.
+  return { ...clean, NODE_ENV: 'development' } as NodeJS.ProcessEnv;
+}
+
 export interface ValidationResult {
   valid: boolean;
   errors: string[];
@@ -273,6 +317,7 @@ export async function startDevServer(projectPath: string, force = false): Promis
       cwd: projectPath,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: buildIsolatedDevServerEnv(),
     });
 
     try {

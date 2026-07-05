@@ -10,6 +10,7 @@ import { detectIntent, type MessageIntent } from '@/lib/intent-classifier';
 import { decideProjectOpenRouting, reportsRoutingProblem } from '@/lib/repair-routing';
 import { saveOpenProject, clearOpenProject, loadOpenProject } from '@/lib/project-session-storage';
 import { parseApiResponse, truncateForLog } from '@/lib/safe-json-response';
+import { isEnvironmentalServerError, isIdenticalRepeatedError } from '@/lib/server-start-diagnostics';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -5462,49 +5463,77 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
       // in the verification loop because the new files aren't recompiled yet.
       await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
       let serverData = await api({ action: 'start-server', projectPath: path, force: true });
+      let firstErrorMsg = '';
 
       if (!serverData.port) {
         const errorMsg = serverData.error || 'Server failed to start';
+        firstErrorMsg = errorMsg;
         appendLog(`⚠️ Strategy 1 failed: ${errorMsg}`);
 
-        // Strategy 1: classify error → apply fix → retry
-        const recovery1 = await api({ action: 'auto-recover', projectPath: path, errorText: errorMsg });
-        if (recovery1.fixed) {
-          narrate(`🔧 ${recovery1.userMessage} Retrying the server…`);
-          (recovery1.actions ?? []).forEach((a: string) => appendLog(a));
-          serverData = await api({ action: 'start-server', projectPath: path });
+        // An environmental error (e.g. a listener/port/permission failure in
+        // the execution environment, not the generated app's own code) can
+        // never be fixed by editing source files — confirmed live:
+        // "[x-amplify-credentials] Credential listener could not be
+        // started: Error: listen" burned all 3 strategies and an "Advanced
+        // repair" cycle for nothing, since the AI correctly found no code
+        // to fix. Skip straight to one clean retry instead of wasting the
+        // AI-classification round trip on something it cannot address.
+        if (isEnvironmentalServerError(errorMsg)) {
+          appendLog('⚠️ Detected an environmental server-start error — skipping AI code-fix strategies (not a code problem).');
+          narrate('⚠️ The preview server hit an environment-level startup issue, not a bug in your generated app. Retrying once with a clean restart…');
+          await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
+          serverData = await api({ action: 'start-server', projectPath: path, force: true });
+        } else {
+          // Strategy 1: classify error → apply fix → retry
+          const recovery1 = await api({ action: 'auto-recover', projectPath: path, errorText: errorMsg });
+          if (recovery1.fixed) {
+            narrate(`🔧 ${recovery1.userMessage} Retrying the server…`);
+            (recovery1.actions ?? []).forEach((a: string) => appendLog(a));
+            serverData = await api({ action: 'start-server', projectPath: path });
+          }
         }
       }
 
       if (!serverData.port) {
-        // Strategy 2: fix remaining TypeScript errors, clear .next cache, retry
-        appendLog('⚠️ Strategy 2: AI code fix + cache clear + retry…');
-        narrate('🔧 Server start failed — fixing remaining code issues, clearing build cache, and retrying…');
-        try {
-          const valData = await api({ action: 'validate', projectPath: path });
-          if (!valData.valid && (valData.errors?.length ?? 0) > 0) {
-            const fileNames = (valData.errors ?? [])
-              .map((e: string) => e.match(/generated-projects\/[^/]+\/(.+?)\(\d+,\d+\)/)?.[1] ?? '')
-              .filter(Boolean).slice(0, 4);
-            await api({ action: 'fix-errors', projectPath: path, errors: valData.errors ?? [], filePaths: fileNames });
-            appendLog('🔧 Code fixes applied');
-          }
-        } catch { /* non-critical */ }
-        // Clear .next so the fixed code compiles from scratch
-        await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
-        appendLog('🧹 Build cache cleared');
-        serverData = await api({ action: 'start-server', projectPath: path, force: true });
+        const errorMsg2 = serverData.error || '';
+        // Same unfixable class of error persisted through the retry (or is
+        // identical to the first attempt's) — Strategy 2's AI code-fix
+        // cycle targets the generated app's source, which still isn't the
+        // problem. Skip it rather than burning another full retry + AI
+        // round trip that cannot change the outcome.
+        if (isEnvironmentalServerError(errorMsg2) || isIdenticalRepeatedError(firstErrorMsg, errorMsg2)) {
+          appendLog('⚠️ Server start failed again with the same/environmental error — skipping further code-fix retries.');
+        } else {
+          // Strategy 2: fix remaining TypeScript errors, clear .next cache, retry
+          appendLog('⚠️ Strategy 2: AI code fix + cache clear + retry…');
+          narrate('🔧 Server start failed — fixing remaining code issues, clearing build cache, and retrying…');
+          try {
+            const valData = await api({ action: 'validate', projectPath: path });
+            if (!valData.valid && (valData.errors?.length ?? 0) > 0) {
+              const fileNames = (valData.errors ?? [])
+                .map((e: string) => e.match(/generated-projects\/[^/]+\/(.+?)\(\d+,\d+\)/)?.[1] ?? '')
+                .filter(Boolean).slice(0, 4);
+              await api({ action: 'fix-errors', projectPath: path, errors: valData.errors ?? [], filePaths: fileNames });
+              appendLog('🔧 Code fixes applied');
+            }
+          } catch { /* non-critical */ }
+          // Clear .next so the fixed code compiles from scratch
+          await api({ action: 'clear-cache', projectPath: path }).catch(() => {});
+          appendLog('🧹 Build cache cleared');
+          serverData = await api({ action: 'start-server', projectPath: path, force: true });
+        }
       }
 
       if (!serverData.port) {
         _clearServerTimer();
         const crashDetail: string = serverData.error || '';
-        appendLog(`⚠️ Server could not start after 3 strategies — escalating to advanced repair`);
+        const isEnvironmental = isEnvironmentalServerError(crashDetail);
+        appendLog(`⚠️ Server could not start after 3 strategies — ${isEnvironmental ? 'environmental error, not escalating to code repair' : 'escalating to advanced repair'}`);
         setBuildProgress(p => ({
           ...p!,
           step: 'error',
-          message: `⚠️ ${projectName} — escalating to advanced repair…`,
-          logs: [...(p?.logs ?? []), `⚠️ ${crashDetail || 'Server start failed after 3 strategies'}`, '🔧 Advanced repair starting…'],
+          message: `⚠️ ${projectName} — ${isEnvironmental ? 'preview server environment issue' : 'escalating to advanced repair…'}`,
+          logs: [...(p?.logs ?? []), `⚠️ ${crashDetail || 'Server start failed after 3 strategies'}`, isEnvironmental ? '⚠️ Not a code issue — repair skipped' : '🔧 Advanced repair starting…'],
         }));
         // Save project record first so the sidebar shows it
         const savedProject: ProjectMeta = {
@@ -5519,6 +5548,20 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         setCurrentProject(savedProject);
         setBuilderContext({ projectName: savedProject.name, stage: 'complete', active: true });
         await refreshProjects();
+
+        if (isEnvironmental) {
+          // Do NOT escalate to the AI code-repair bridge — it targets the
+          // generated app's source, which was never the problem here, and
+          // would just report "0 files changed" again (confirmed live).
+          narrate(
+            `⚠️ **Preview couldn't start — environment issue, not a code problem.**\n\n` +
+            `The generated app's files are ready, but the preview server hit a startup issue in this ` +
+            `environment (${crashDetail.slice(0, 150)}). This is not something an AI code fix can resolve. ` +
+            `Try starting the preview again in a moment, or contact support if this keeps happening.`
+          );
+          return;
+        }
+
         // Auto-escalate: bridge inspects source, fixes errors, restarts server
         const crashEscPrompt = `The Next.js dev server for the project at ${path} failed to start after 3 strategies.\n\nError: ${crashDetail || 'unknown'}\n\nInspect the project:\n1. Fix all TypeScript errors (run npx tsc --noEmit)\n2. Fix missing imports or incorrect package names\n3. Fix next.config.js if it references non-existent files\n4. Fix any syntax errors in source files\n5. Ensure all dependencies in package.json are installed\n\nAfter fixing, confirm the project compiles cleanly.`;
         autoEscalateToBridge(
