@@ -1,0 +1,44 @@
+[
+  {
+    "prompt": "Build a football prediction app where users can predict match results and see who has the most correct predictions on a leaderboard",
+    "timestamp": "2026-07-06T07:08:19.962Z",
+    "durationMs": 7156,
+    "success": false,
+    "buildStatus": "failed",
+    "verifyStatus": "not_run",
+    "repairStatus": "not_run",
+    "previewStatus": "unavailable",
+    "fileCount": 0,
+    "routeCount": 0,
+    "remainingInternalIssues": 0,
+    "summary": "Clarification needed: What kind of app is \"a football prediction app where users ca\"? For example: an online store, a booking system, a dashboard/CRM, a marketplace, a blog, or something else?"
+  },
+  {
+    "prompt": "I want a website where people can book appointments with local hairdressers, with a calendar and reminders",
+    "timestamp": "2026-07-06T07:08:27.058Z",
+    "durationMs": 7095,
+    "success": false,
+    "buildStatus": "failed",
+    "verifyStatus": "not_run",
+    "repairStatus": "not_run",
+    "previewStatus": "unavailable",
+    "fileCount": 0,
+    "routeCount": 0,
+    "remainingInternalIssues": 0,
+    "summary": "Blocked: Bedrock health check failed — model='us.anthropic.claude-sonnet-4-6' region=us-east-1. Error: The security token included in the request is invalid.. Fix: Model ID 'us.anthropic.claude-sonnet-4-6' may be invalid/unavailable in us-east-1. Verify BEDROCK_MODEL_SONNET and AWS_REGION (Anthropic Bedrock IDs look like 'us.anthropic.claude-…-v1:0')."
+  },
+  {
+    "prompt": "Create a simple expense tracker with categories, monthly totals, and a chart",
+    "timestamp": "2026-07-06T07:08:34.171Z",
+    "durationMs": 7113,
+    "success": false,
+    "buildStatus": "failed",
+    "verifyStatus": "not_run",
+    "repairStatus": "not_run",
+    "previewStatus": "unavailable",
+    "fileCount": 0,
+    "routeCount": 0,
+    "remainingInternalIssues": 0,
+    "summary": "Blocked: Bedrock health check failed — model='us.anthropic.claude-sonnet-4-6' region=us-east-1. Error: The security token included in the request is invalid.. Fix: Model ID 'us.anthropic.claude-sonnet-4-6' may be invalid/unavailable in us-east-1. Verify BEDROCK_MODEL_SONNET and AWS_REGION (Anthropic Bedrock IDs look like 'us.anthropic.claude-…-v1:0')."
+  }
+]
