@@ -579,6 +579,78 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-07',
     symptoms: ['next: command not found', 'sh: line 1: next: command not found', 'npm install incomplete — continuing with available packages', 'Advanced repair changed 0 files', 'package.json has correct deps but server still crashes'],
   },
+  {
+    id: 'stale-project-folder-reused-across-builds',
+    title: 'A new build\'s preview showed an unrelated PRIOR project ("ExamGuide" instead of a car sales marketplace) — generateProject reused the same folder across builds',
+    category: 'other',
+    rootCause:
+      "Live evidence: user built a car sales marketplace on localhost, but the preview opened an " +
+      "unrelated prior project's login/signup page instead, with verification reporting 404s on /auth/" +
+      "signin, /auth/signup, /auth/forgot-password and a 401 on POST /api/auth/login. Traced this to " +
+      "services/project-generator.ts's generateProject(): the target folder name was just `projectName` " +
+      "as-is UNLESS the caller opted into a `freshFolder` option (added earlier this session for the new " +
+      "engine pipeline, but the comment explicitly says 'existing callers omit this and behavior is " +
+      "unchanged') — and generateProject never wipes the target directory first, it only writes the files " +
+      "in its own `files` array. app/api/chat/route.ts's `action:'create'` handler (generateProject's ONLY " +
+      "caller, confirmed via grep, used exclusively for fresh creation, never repair/edit) was still on the " +
+      "legacy no-freshFolder path. If a new build's AI-chosen projectName happened to collide with (or " +
+      "reuse) an earlier build's folder name, the new generation would write INTO that existing folder, " +
+      "and any file from the OLD project not present in the new generation's file list would remain on " +
+      "disk and get served by the dev server alongside the new files — explaining both the stale preview " +
+      "content and the 404s (the new project's own auth pages, at whatever path it used, were correctly " +
+      "generated, but requests to the specific /auth/* paths hit neither project's content).",
+    filesAffected: ['app/api/chat/route.ts', 'services/project-generator.ts'],
+    fixApplied:
+      "app/api/chat/route.ts's `action:'create'` now always passes `freshFolder: true` with a unique " +
+      "buildId (timestamp + random suffix) to generateProject — every new build gets a genuinely isolated " +
+      "folder, eliminating the collision class entirely regardless of how projectName was chosen. " +
+      "result.projectPath (the actual unique path) is what's used for all downstream operations; " +
+      "result.projectName (unchanged, still the clean input string) is what's displayed to the user, so " +
+      "this is purely additive to the folder path, not user-visible. Also added a defensive guard in " +
+      "generateProject itself: when freshFolder is set, it now checks the computed baseDir does not " +
+      "already exist before writing anything, and throws a clear error if it does (an effectively " +
+      "impossible buildId collision) rather than silently reproducing the exact bug this option exists to " +
+      "prevent.",
+    verificationPerformed: 'Added 4 regression tests: (1) freshFolder produces different paths for the IDENTICAL projectName used twice, (2) a second build with the same projectName never contains the first build\'s content (and vice versa) — the exact class of bug reported, (3) the collision guard throws if a buildId is deliberately reused, (4) confirms the legacy (no freshFolder) path\'s behavior is unchanged for any future caller that might still use it. Full suite (243 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "services/__tests__/project-generator-isolation.test.ts — 'generateProject — folder isolation' describe block",
+    dateFixed: '2026-07-07',
+    symptoms: ['preview shows a different/unrelated app than the current prompt', 'stale login/signup page from a prior project', 'auth routes 404 despite auth being present', 'wrong project title/content in preview'],
+  },
+  {
+    id: 'auth-pages-404-canonical-path-not-guaranteed',
+    title: '/auth/signin, /auth/signup, /auth/forgot-password all 404 even though the app clearly has auth — deterministic injection only covered API routes, never pages',
+    category: 'other',
+    rootCause:
+      "Same live incident as stale-project-folder-reused-across-builds: verification reported 404s on " +
+      "/auth/signin, /auth/signup, /auth/forgot-password. Independent of the folder-isolation bug, this " +
+      "is also a genuine, separate gap: services/engine/auth-template.ts's buildAuthRoutes() (injected " +
+      "unconditionally whenever an app has auth) only ever wrote the 4 API routes (register/login/logout/" +
+      "me) — it never generated the user-facing PAGE components. Page existence relied entirely on the AI's " +
+      "own generation, which legitimately (and unpredictably) used paths like /login instead of /auth/" +
+      "signin — both satisfy AUTH_PAGE_PATTERNS' broad detection used to decide 'does this app need auth " +
+      "injected', but only one satisfies what verification and user navigation actually request. There was " +
+      "also no forgot-password flow at all: no page, and no API route, despite " +
+      "lib/managed/auth.ts already exporting createOTP/verifyOTP with a 'reset-password' purpose and " +
+      "lib/managed/email.ts already exporting sendPasswordResetEmail — the backend primitives existed, " +
+      "unused, in every generated project.",
+    filesAffected: ['services/engine/auth-template.ts', 'services/project-generator.ts'],
+    fixApplied:
+      "Added buildAuthPages() (services/engine/auth-template.ts): canonical, always-working page " +
+      "components for app/auth/signin/page.tsx, app/auth/signup/page.tsx, app/auth/forgot-password/" +
+      "page.tsx — simple Tailwind forms calling the existing /api/auth/login and /api/auth/register " +
+      "contracts. Added 2 new API routes to buildAuthRoutes(): forgot-password (calls the already-injected " +
+      "createOTP + sendPasswordResetEmail) and reset-password (calls the already-injected verifyOTP + " +
+      "hashPassword, then updates managed_users.password_hash directly) — wiring together infrastructure " +
+      "that already existed in every project but was never connected to an endpoint. Wired buildAuthPages() " +
+      "into injectDeterministicAuthRoutes(): only injects a page at a canonical path if NOT already present " +
+      "there, so any AI-authored page at that exact path is never clobbered, while pages at OTHER paths " +
+      "(e.g. /login) are left alone too — this only fills gaps, guaranteeing the canonical paths " +
+      "verification/users expect always resolve, coexisting with whatever else the AI generated.",
+    verificationPerformed: "Added 9 regression tests: buildAuthPages() produces exactly the 3 expected canonical paths and each posts to the correct API endpoint; the canonical /auth/* pages are correctly treated as public (not gated) by deriveProtectedRoutes; forgot-password route uses the already-injected createOTP/sendPasswordResetEmail contract and never leaks whether an email is registered (same response either way); reset-password route verifies the OTP BEFORE writing the new password hash (order-of-operations check). Updated the existing 'produces exactly the 4 expected auth routes' test to reflect the new 6-route count. Full suite (243 tests), typecheck, and both check-platform-deps checks all pass.",
+    regressionTest: "services/engine/__tests__/auth-and-crud-templates.test.ts — 'canonical auth PAGE routes' and 'forgot-password / reset-password API routes' describe blocks",
+    dateFixed: '2026-07-07',
+    symptoms: ['GET /auth/signin 404', 'GET /auth/signup 404', 'GET /auth/forgot-password 404', 'app has auth but canonical auth pages are missing', 'no forgot-password flow despite backend primitives existing'],
+  },
 ];
 
 /**

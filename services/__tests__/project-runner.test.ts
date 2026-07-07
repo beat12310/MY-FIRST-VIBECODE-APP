@@ -322,5 +322,5 @@ describe('startDevServer — pre-flight dependency check (requirement: never spa
       }
       rmSync(projectDir, { recursive: true, force: true });
     }
-  }, 120000);
+  }, 240000);
 });

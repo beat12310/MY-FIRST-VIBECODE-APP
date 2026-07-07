@@ -124,6 +124,55 @@ export async function GET(req: NextRequest) {
 }
 `;
 
+// Backed by infrastructure already injected into every project by
+// project-generator.ts's injectManagedServices — createOTP/verifyOTP
+// (lib/managed/auth.ts) and sendPasswordResetEmail (lib/managed/email.ts)
+// already exist and are fully wired for exactly this purpose; only the API
+// routes connecting them were missing.
+const FORGOT_PASSWORD_ROUTE = `import { NextRequest, NextResponse } from 'next/server';
+import { createOTP, getUserByEmail } from '@/lib/managed/auth';
+import { sendPasswordResetEmail } from '@/lib/managed/email';
+
+export async function POST(req: NextRequest) {
+  const { email } = await req.json();
+  if (!email) return NextResponse.json({ error: 'Email is required' }, { status: 400 });
+
+  // Always return the same success response regardless of whether the
+  // account exists — prevents leaking which emails are registered.
+  const user = getUserByEmail(email);
+  if (user) {
+    const code = createOTP(email, 'reset-password');
+    await sendPasswordResetEmail(email, code);
+  }
+  return NextResponse.json({ message: 'If an account exists for that email, a reset code has been sent.' });
+}
+`;
+
+const RESET_PASSWORD_ROUTE = `import { NextRequest, NextResponse } from 'next/server';
+import { verifyOTP, hashPassword, getUserByEmail } from '@/lib/managed/auth';
+import { db } from '@/lib/managed/db';
+
+export async function POST(req: NextRequest) {
+  const { email, code, newPassword } = await req.json();
+  if (!email || !code || !newPassword) {
+    return NextResponse.json({ error: 'Email, code, and new password are required' }, { status: 400 });
+  }
+  if (newPassword.length < 6) {
+    return NextResponse.json({ error: 'Password must be at least 6 characters' }, { status: 400 });
+  }
+
+  const valid = verifyOTP(email, code, 'reset-password');
+  if (!valid) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
+
+  const user = getUserByEmail(email);
+  if (!user) return NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
+
+  const password_hash = await hashPassword(newPassword);
+  db.run('UPDATE managed_users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', password_hash, user.id);
+  return NextResponse.json({ message: 'Password reset successfully' });
+}
+`;
+
 /** Route paths + content this template always produces (fixed, not plan-dependent). */
 export function buildAuthRoutes(): AuthFile[] {
   return [
@@ -131,6 +180,268 @@ export function buildAuthRoutes(): AuthFile[] {
     { filePath: 'app/api/auth/login/route.ts', content: LOGIN_ROUTE },
     { filePath: 'app/api/auth/logout/route.ts', content: LOGOUT_ROUTE },
     { filePath: 'app/api/auth/me/route.ts', content: ME_ROUTE },
+    { filePath: 'app/api/auth/forgot-password/route.ts', content: FORGOT_PASSWORD_ROUTE },
+    { filePath: 'app/api/auth/reset-password/route.ts', content: RESET_PASSWORD_ROUTE },
+  ];
+}
+
+const SIGNIN_PAGE = `'use client';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+
+export default function SignInPage() {
+  const router = useRouter();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Login failed'); return; }
+      router.push('/dashboard');
+      router.refresh();
+    } catch {
+      setError('Network error. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 py-12 bg-gray-50">
+      <div className="w-full max-w-md">
+        <h1 className="text-2xl font-bold text-center mb-6">Sign in</h1>
+        <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow p-8 space-y-4">
+          <div>
+            <label htmlFor="email" className="block text-sm font-medium mb-1">Email</label>
+            <input id="email" type="email" required value={email} onChange={e => setEmail(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label htmlFor="password" className="block text-sm font-medium mb-1">Password</label>
+            <input id="password" type="password" required value={password} onChange={e => setPassword(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          {error && <div className="text-sm text-red-600">{error}</div>}
+          <button type="submit" disabled={loading}
+            className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-semibold rounded-lg">
+            {loading ? 'Signing in…' : 'Sign in'}
+          </button>
+          <div className="flex justify-between text-sm">
+            <Link href="/auth/signup" className="text-blue-600 hover:underline">Create an account</Link>
+            <Link href="/auth/forgot-password" className="text-blue-600 hover:underline">Forgot password?</Link>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+`;
+
+const SIGNUP_PAGE = `'use client';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import Link from 'next/link';
+
+export default function SignUpPage() {
+  const router = useRouter();
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, name }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Registration failed'); return; }
+      router.push('/dashboard');
+      router.refresh();
+    } catch {
+      setError('Network error. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 py-12 bg-gray-50">
+      <div className="w-full max-w-md">
+        <h1 className="text-2xl font-bold text-center mb-6">Create an account</h1>
+        <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow p-8 space-y-4">
+          <div>
+            <label htmlFor="name" className="block text-sm font-medium mb-1">Name</label>
+            <input id="name" type="text" value={name} onChange={e => setName(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label htmlFor="email" className="block text-sm font-medium mb-1">Email</label>
+            <input id="email" type="email" required value={email} onChange={e => setEmail(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label htmlFor="password" className="block text-sm font-medium mb-1">Password</label>
+            <input id="password" type="password" required minLength={6} value={password} onChange={e => setPassword(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          {error && <div className="text-sm text-red-600">{error}</div>}
+          <button type="submit" disabled={loading}
+            className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-semibold rounded-lg">
+            {loading ? 'Creating account…' : 'Sign up'}
+          </button>
+          <div className="text-sm text-center">
+            <Link href="/auth/signin" className="text-blue-600 hover:underline">Already have an account? Sign in</Link>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+`;
+
+const FORGOT_PASSWORD_PAGE = `'use client';
+import { useState } from 'react';
+import Link from 'next/link';
+
+export default function ForgotPasswordPage() {
+  const [step, setStep] = useState<'request' | 'reset' | 'done'>('request');
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [error, setError] = useState('');
+  const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const requestCode = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const res = await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Something went wrong'); return; }
+      setMessage(data.message);
+      setStep('reset');
+    } catch {
+      setError('Network error. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const resetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(''); setLoading(true);
+    try {
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code, newPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Reset failed'); return; }
+      setStep('done');
+    } catch {
+      setError('Network error. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 py-12 bg-gray-50">
+      <div className="w-full max-w-md">
+        <h1 className="text-2xl font-bold text-center mb-6">Reset your password</h1>
+        <div className="bg-white rounded-xl shadow p-8 space-y-4">
+          {step === 'request' && (
+            <form onSubmit={requestCode} className="space-y-4">
+              <p className="text-sm text-gray-600">Enter your email and we'll send you a reset code.</p>
+              <div>
+                <label htmlFor="email" className="block text-sm font-medium mb-1">Email</label>
+                <input id="email" type="email" required value={email} onChange={e => setEmail(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              {error && <div className="text-sm text-red-600">{error}</div>}
+              <button type="submit" disabled={loading}
+                className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-semibold rounded-lg">
+                {loading ? 'Sending…' : 'Send reset code'}
+              </button>
+            </form>
+          )}
+          {step === 'reset' && (
+            <form onSubmit={resetPassword} className="space-y-4">
+              <p className="text-sm text-gray-600">{message}</p>
+              <div>
+                <label htmlFor="code" className="block text-sm font-medium mb-1">Reset code</label>
+                <input id="code" type="text" required value={code} onChange={e => setCode(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              <div>
+                <label htmlFor="newPassword" className="block text-sm font-medium mb-1">New password</label>
+                <input id="newPassword" type="password" required minLength={6} value={newPassword} onChange={e => setNewPassword(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              {error && <div className="text-sm text-red-600">{error}</div>}
+              <button type="submit" disabled={loading}
+                className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-semibold rounded-lg">
+                {loading ? 'Resetting…' : 'Reset password'}
+              </button>
+            </form>
+          )}
+          {step === 'done' && (
+            <div className="text-center space-y-4">
+              <p className="text-sm text-gray-700">Your password has been reset successfully.</p>
+              <Link href="/auth/signin" className="inline-block w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg">
+                Sign in
+              </Link>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+`;
+
+/**
+ * Canonical, always-working page routes for /auth/signin, /auth/signup,
+ * /auth/forgot-password. Root cause these exist for: a real production
+ * failure where a generated app's own AI-produced pages (if any) lived at
+ * inconsistent paths (e.g. /login instead of /auth/signin — both match
+ * AUTH_PAGE_PATTERNS' broad detection, but only one satisfies what
+ * verification/navigation actually requests), so GET /auth/signin,
+ * /auth/signup, and /auth/forgot-password all 404'd even though auth was
+ * present in the app. These templates guarantee the canonical paths always
+ * resolve; they coexist with (never remove) any additional pages the AI
+ * generated at other paths.
+ */
+export function buildAuthPages(): AuthFile[] {
+  return [
+    { filePath: 'app/auth/signin/page.tsx', content: SIGNIN_PAGE },
+    { filePath: 'app/auth/signup/page.tsx', content: SIGNUP_PAGE },
+    { filePath: 'app/auth/forgot-password/page.tsx', content: FORGOT_PASSWORD_PAGE },
   ];
 }
 

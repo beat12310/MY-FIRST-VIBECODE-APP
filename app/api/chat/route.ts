@@ -1385,7 +1385,24 @@ Start with [START_PROJECT] immediately. No explanation, no preamble.`,
         }
       }
 
-      const result = await generateProject(projectData.projectName, projectData.files);
+      // freshFolder: true guarantees a genuinely unique folder for every new
+      // build. Root cause of a real production failure: without this, the
+      // folder name was just projectName as-is — if a new prompt's AI-chosen
+      // project name happened to match (or be reused/stale from) an earlier
+      // build's name, generateProject would write INTO that same existing
+      // folder rather than a fresh one. It doesn't wipe the target directory
+      // first (see project-generator.ts — it only writes the files in its
+      // own `files` array), so any file from the OLD project not overwritten
+      // by the new generation's file list would remain on disk and get
+      // served by the dev server — confirmed live: a "car sales marketplace"
+      // build's preview showed an unrelated prior project's login/signup
+      // page. This is the ONLY call site of generateProject (used
+      // exclusively for fresh creation, never repair/edit), so there is no
+      // legitimate case for reusing an existing folder here.
+      const result = await generateProject(projectData.projectName, projectData.files, {
+        freshFolder: true,
+        buildId: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      });
 
       // ── GUARD: refuse to persist a project with no real Next.js entry point ───
       // Investigated live: several projects in the manifest turned out to be

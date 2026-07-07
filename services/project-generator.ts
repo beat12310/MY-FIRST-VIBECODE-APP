@@ -1719,7 +1719,7 @@ async function injectDeterministicAuthRoutes(
   );
   if (!needsAuth) return;
 
-  const { buildAuthRoutes, buildMiddleware, deriveProtectedRoutes } = await import('./engine/auth-template');
+  const { buildAuthRoutes, buildAuthPages, buildMiddleware, deriveProtectedRoutes } = await import('./engine/auth-template');
   const { fileToRoute } = await import('./engine/verifier');
   const { dirname } = await import('path');
 
@@ -1730,6 +1730,24 @@ async function injectDeterministicAuthRoutes(
     const existing = files.find(existing => existing.path === f.filePath);
     if (existing) existing.content = f.content; else files.push({ path: f.filePath, content: f.content });
     logs.push(`🔐 Auth contract: replaced ${f.filePath} with the deterministic template (matches lib/managed/auth.ts exactly)`);
+  }
+
+  // Root cause this closes: the AI's own login/signup pages (if any) can
+  // legitimately live at a DIFFERENT path (e.g. /login, matched broadly by
+  // AUTH_PAGE_PATTERNS above) than the canonical /auth/signin, /auth/signup,
+  // /auth/forgot-password paths verification and users actually navigate
+  // to — confirmed live: all three 404'd even though the app clearly had
+  // auth. Only injected when NOT already present at the exact canonical
+  // path, so an AI-authored page there is never clobbered — this only
+  // fills gaps, coexisting with whatever else the AI generated elsewhere.
+  for (const f of buildAuthPages()) {
+    const alreadyPresent = files.some(existing => existing.path === f.filePath);
+    if (alreadyPresent) continue;
+    const absPath = join(baseDir, f.filePath);
+    await mkdir(dirname(absPath), { recursive: true });
+    await writeFile(absPath, f.content, 'utf-8');
+    files.push({ path: f.filePath, content: f.content });
+    logs.push(`🔐 Auth page: added ${f.filePath} (canonical path was missing)`);
   }
 
   const pageRoutes = files
@@ -2010,6 +2028,23 @@ export async function generateProject(
       ? `${projectName}-${opts.buildId ?? Date.now().toString(36)}`
       : projectName;
     const baseDir = join(GENERATED_ROOT, folderName);
+
+    // Defensive check: freshFolder's whole purpose is guaranteeing an
+    // isolated workspace per build — if the computed path already exists on
+    // disk despite that (an astronomically unlikely buildId collision, or a
+    // caller-supplied buildId that wasn't actually unique), writing into it
+    // would silently reproduce the exact cross-project content mixing this
+    // option exists to prevent. Fail loudly instead of proceeding.
+    if (opts.freshFolder) {
+      const { access: accessFreshCheck } = await import('fs/promises');
+      const alreadyExists = await accessFreshCheck(baseDir).then(() => true).catch(() => false);
+      if (alreadyExists) {
+        throw createError(
+          ErrorCode.FILE_CREATE_ERROR,
+          `freshFolder was requested but ${baseDir} already exists — refusing to write into a non-isolated workspace. This indicates a buildId collision; retry with a new buildId.`
+        );
+      }
+    }
 
     logs.push(`📂 Project directory: ${baseDir}`);
 
