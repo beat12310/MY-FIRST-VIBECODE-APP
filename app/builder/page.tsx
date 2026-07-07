@@ -5313,6 +5313,54 @@ This image will be used as the ${role || 'design asset'} in your project. Mentio
         } catch { /* non-critical — validation loop will catch remaining issues */ }
       }
 
+      // ── 3.6 Core runtime dependency check — next/react/react-dom ─────────────
+      // ROOT CAUSE of a real production failure: pre-scan-imports deliberately
+      // SKIP_PKGS-excludes next/react/react-dom (they're always expected to be
+      // in package.json already), so they were NEVER included in
+      // preScanPackages and thus never re-verified above. When the initial
+      // 3-tier npm install failed to actually land `next` for any reason (the
+      // "npm install incomplete — continuing with available packages" path a
+      // few lines above this proceeds regardless), nothing caught it until
+      // the dev server itself crashed with "next: command not found" —
+      // confirmed live. These are the one thing every generated Next.js app
+      // needs to even attempt a preview, so they get their own unconditional
+      // check regardless of what pre-scan found.
+      const CORE_RUNTIME_PKGS = ['next', 'react', 'react-dom'];
+      try {
+        const coreCheck = await api({ action: 'check-installed', projectPath: path, packages: CORE_RUNTIME_PKGS });
+        if (coreCheck.missing?.length > 0) {
+          appendLog(`⚠️ Core dependenc${coreCheck.missing.length > 1 ? 'ies' : 'y'} missing after install: ${coreCheck.missing.join(', ')} — reinstalling…`);
+          narrate(`📦 ${coreCheck.missing.join(', ')} — required for every preview — didn't install correctly. Reinstalling now…`);
+          const coreReinstall = await api({ action: 'install', projectPath: path, flags: ['--force'] });
+          if (coreReinstall.success) {
+            const recheck = await api({ action: 'check-installed', projectPath: path, packages: CORE_RUNTIME_PKGS });
+            if (recheck.missing?.length > 0) {
+              // Per explicit requirement: do not continue to preview
+              // pretending dependencies are ready — halt with the real error.
+              appendLog(`❌ ${recheck.missing.join(', ')} still missing after reinstall — cannot start preview.`);
+              narrate(
+                `⚠️ **Preview can't start — dependency installation failed.**\n\n` +
+                `\`${recheck.missing.join(', ')}\` could not be installed after two attempts. ` +
+                `Real install output:\n\`\`\`\n${(coreReinstall.logs ?? []).slice(-15).join('\n') || 'no install output captured'}\n\`\`\`\n\n` +
+                `This is a dependency installation problem, not a bug in the generated code — an AI code fix cannot resolve it. ` +
+                `Try building again in a moment, or contact support if this keeps happening.`
+              );
+              return;
+            }
+            appendLog(`✅ Core dependencies reinstalled successfully`);
+          } else {
+            appendLog(`❌ Reinstall failed — cannot start preview.`);
+            narrate(
+              `⚠️ **Preview can't start — dependency installation failed.**\n\n` +
+              `\`${coreCheck.missing.join(', ')}\` could not be installed.\n\nReal install output:\n\`\`\`\n${(coreReinstall.logs ?? []).slice(-15).join('\n') || 'no install output captured'}\n\`\`\`\n\n` +
+              `This is a dependency installation problem, not a bug in the generated code — an AI code fix cannot resolve it. ` +
+              `Try building again in a moment, or contact support if this keeps happening.`
+            );
+            return;
+          }
+        }
+      } catch { /* non-critical probe failure -- fall through to validation, which will also catch missing deps */ }
+
       setBuildDetailStep('testing');
       narrate("Dependencies installed. Testing the app now — running TypeScript validation across all generated files…");
       setStep('validating', '🔍 Checking TypeScript…', '✅ Dependencies ready');

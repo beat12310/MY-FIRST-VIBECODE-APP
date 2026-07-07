@@ -370,6 +370,21 @@ export function looksLikePortConflict(text: string, port: number): boolean {
 }
 
 /**
+ * True if the crash text indicates a missing dependency/binary rather than a
+ * genuine code problem or environmental restriction — e.g. "next: command
+ * not found" (npm install reported success/partial-success without `next`
+ * actually landing in node_modules). This needs its own retry path: an AI
+ * code-fix cycle can't install a package, and treating it as "environmental,
+ * give up" would be equally wrong since reinstalling IS the fix.
+ */
+export function looksLikeMissingDependency(text: string): boolean {
+  if (!text) return false;
+  return /command not found/i.test(text)
+    || /cannot find module ['"]next['"]|cannot find module ['"]react/i.test(text)
+    || /MODULE_NOT_FOUND/.test(text) && /next|react/i.test(text);
+}
+
+/**
  * One spawn attempt on a specific port. Extracted from startDevServer so a
  * port conflict discovered only at spawn time (a genuine race beyond what
  * findAvailablePort's own pre-check can catch) can be retried once,
@@ -387,7 +402,29 @@ export function looksLikePortConflict(text: string, port: number): boolean {
  */
 async function attemptServerStart(
   projectPath: string, port: number, logs: string[],
-): Promise<ServerResult & { portConflict?: boolean }> {
+): Promise<ServerResult & { portConflict?: boolean; missingDependency?: boolean }> {
+  // Pre-flight: confirm `next` is actually installed BEFORE spawning `npm run
+  // dev` (which invokes `next dev` from package.json's "dev" script). Root
+  // cause of a real production failure: npm install can report success (or
+  // "fail, continue with available packages") without `next` actually
+  // landing in node_modules, and nothing downstream verified this before
+  // attempting to start the server — it just crashed with "next: command
+  // not found" (sh trying to resolve a bare `next` that node_modules/.bin
+  // never provided). Checking here means a doomed spawn attempt is never
+  // even made — the caller gets an immediate, clear, actionable result
+  // instead of a generic crash to diagnose after the fact.
+  const nextBinExists = await readFile(join(projectPath, 'node_modules', 'next', 'package.json'), 'utf-8')
+    .then(() => true).catch(() => false);
+  if (!nextBinExists) {
+    logs.push(`❌ next is not installed in node_modules — cannot start preview.`);
+    return {
+      success: false,
+      logs,
+      error: 'next is not installed in node_modules/. Run npm install (or a targeted `npm install next react react-dom`) before starting the preview.',
+      missingDependency: true,
+    };
+  }
+
   logs.push(`⚙️ Starting dev server on port ${port}…`);
 
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -469,12 +506,14 @@ async function attemptServerStart(
     const crashLog = memoryLog.trim() ? memoryLog : fileLog;
     const analysis = analyzeCrashLog(crashLog, port);
     const portConflict = looksLikePortConflict(crashLog, port);
+    const missingDependency = looksLikeMissingDependency(crashLog);
     return {
       success: false,
       logs: [...logs, '❌ Server crashed immediately after launch', `🔎 ${analysis.portDiagnostic}`],
       error: analysis.error,
       crashLog: crashLog.slice(-6000),
       portConflict,
+      missingDependency,
     };
   }
 
@@ -536,7 +575,30 @@ export async function startDevServer(projectPath: string, force = false): Promis
     // Now find a free port — 3001 should be available again
     const initialPort = await findAvailablePort(PROJECT_CONFIG.PORT_RANGE_START + 1);
     const attempt1 = await attemptServerStart(projectPath, initialPort, logs);
-    if (attempt1.success || !attempt1.portConflict) return attempt1;
+    if (attempt1.success) return attempt1;
+
+    // Confirmed live: "next: command not found" — npm install had reported
+    // success/partial-success without `next` actually landing in
+    // node_modules, and nothing verified this before starting the preview.
+    // An AI code-fix cycle cannot install a package, so this gets its own
+    // deterministic retry: reinstall, then try starting once more, rather
+    // than either escalating to code repair or giving up as "environmental".
+    if (attempt1.missingDependency) {
+      logs.push('🔁 Missing core dependency detected at server start — reinstalling and retrying once…');
+      const reinstall = await installDependencies(projectPath, ['--force']);
+      logs.push(...reinstall.logs);
+      if (!reinstall.success) {
+        return {
+          success: false,
+          logs,
+          error: `Dependency reinstall failed: ${reinstall.error || 'unknown npm install error'}. Cannot start preview until dependencies install successfully.`,
+        };
+      }
+      const retryAfterInstall = await attemptServerStart(projectPath, initialPort, logs);
+      return retryAfterInstall;
+    }
+
+    if (!attempt1.portConflict) return attempt1;
 
     // Requirement: "if port 3001 is busy, auto-select a free port" — this is
     // a deterministic, mechanical retry, not an AI code-repair cycle. Only

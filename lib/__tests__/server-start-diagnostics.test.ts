@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isEnvironmentalServerError, isIdenticalRepeatedError, hasNoActionableCodeEvidence } from '../server-start-diagnostics';
+import { isEnvironmentalServerError, isIdenticalRepeatedError, hasNoActionableCodeEvidence, isMissingDependencyError } from '../server-start-diagnostics';
 
 /**
  * Regression coverage for a real live-production incident: a generated
@@ -89,5 +89,40 @@ describe('hasNoActionableCodeEvidence — closes the "empty crash log" gap', () 
   it('does NOT flag a genuine, specific code error as having no actionable evidence', () => {
     expect(hasNoActionableCodeEvidence('TS2305: Module has no exported member "auth"\n[intended preview port=3001]')).toBe(false);
     expect(hasNoActionableCodeEvidence('SyntaxError: Unexpected token )')).toBe(false);
+  });
+
+  it('treats a missing-dependency error the same as having no actionable evidence for AI code repair', () => {
+    expect(hasNoActionableCodeEvidence('sh: line 1: next: command not found')).toBe(true);
+  });
+});
+
+/**
+ * Regression coverage for a real live-production failure: a generated car
+ * sales marketplace's package.json correctly listed next/react/react-dom,
+ * but the dev server crashed with "sh: line 1: next: command not found" --
+ * npm install had reported success/partial-success without `next` actually
+ * landing in node_modules. An AI code-repair cycle can't install a
+ * package, so this must be classified the same as an unfixable-by-code
+ * error, not escalated for a doomed "Advanced repair" cycle.
+ */
+describe('isMissingDependencyError — the exact live production failure', () => {
+  it('recognizes the exact reported error text', () => {
+    expect(isMissingDependencyError('sh: line 1: next: command not found')).toBe(true);
+  });
+
+  it('recognizes "Cannot find module \'next\'"', () => {
+    expect(isMissingDependencyError("Error: Cannot find module 'next'")).toBe(true);
+  });
+
+  it('recognizes the pre-flight check\'s own error text', () => {
+    expect(isMissingDependencyError('next is not installed in node_modules/. Run npm install...')).toBe(true);
+  });
+
+  it('does NOT flag a genuine code problem as a missing dependency', () => {
+    expect(isMissingDependencyError('TS2305: Module has no exported member "auth"')).toBe(false);
+  });
+
+  it('does not throw and returns false for an empty error message', () => {
+    expect(isMissingDependencyError('')).toBe(false);
   });
 });

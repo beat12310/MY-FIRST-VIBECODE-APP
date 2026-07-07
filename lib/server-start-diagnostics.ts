@@ -54,15 +54,38 @@ const GENERIC_NO_DETAIL_PATTERNS: RegExp[] = [
   /^no error detail captured/i,
 ];
 
+// Confirmed live: "next: command not found" -- npm install reported
+// success (or "failed, continuing with available packages") without `next`
+// actually landing in node_modules, and the dev server crashed trying to
+// run a bare `next` that node_modules/.bin never provided. This is
+// EQUALLY unfixable by an AI code-repair cycle (editing source files
+// cannot install a package) as a recognized environmental error --
+// services/project-runner.ts's startDevServer already attempts one
+// automatic reinstall-and-retry internally; if the error still surfaces
+// here, that retry already failed, so further AI-repair attempts are
+// just as futile as escalating on an environmental error.
+const MISSING_DEPENDENCY_PATTERNS: RegExp[] = [
+  /command not found/i,
+  /cannot find module ['"]next['"]|cannot find module ['"]react/i,
+  /is not installed in node_modules/i,
+];
+
+export function isMissingDependencyError(errorMsg: string): boolean {
+  if (!errorMsg) return false;
+  return MISSING_DEPENDENCY_PATTERNS.some(re => re.test(errorMsg));
+}
+
 /**
  * True when a server-start error gives NO real, specific evidence of a code
- * problem -- either a recognized environmental error, or just a generic,
- * contentless "it crashed" message with nothing else to go on. Both cases
- * mean escalating to an AI code-repair cycle cannot possibly help.
+ * problem -- either a recognized environmental error, a missing-dependency
+ * error, or just a generic, contentless "it crashed" message with nothing
+ * else to go on. All three cases mean escalating to an AI code-repair
+ * cycle cannot possibly help.
  */
 export function hasNoActionableCodeEvidence(errorMsg: string): boolean {
   if (!errorMsg || !errorMsg.trim()) return true;
   if (isEnvironmentalServerError(errorMsg)) return true;
+  if (isMissingDependencyError(errorMsg)) return true;
   // Strip the "[intended preview port=...]" diagnostic suffix that
   // analyzeCrashLog always appends, even to an otherwise-empty crash,
   // before checking whether what's LEFT is itself just a generic fallback.

@@ -542,6 +542,43 @@ export const BUG_KNOWLEDGE_BASE: BugKnowledgeEntry[] = [
     dateFixed: '2026-07-05',
     symptoms: ['Server exits unexpectedly at startup', 'Advanced repair changed 0 files', 'empty/near-empty crash log', 'intended preview port 3001', 'escalates to repair despite no code evidence'],
   },
+  {
+    id: 'next-command-not-found-missing-dependency-not-verified-before-preview',
+    title: '"next: command not found" — npm install reported success without `next` actually landing in node_modules, and nothing verified this before starting preview',
+    category: 'other',
+    rootCause:
+      "Live evidence: a generated car sales marketplace's package.json correctly listed next/react/" +
+      "react-dom (confirmed the generation-time template already includes these), but the dev server " +
+      "crashed at startup with 'sh: line 1: next: command not found'. Traced this to app/builder/page.tsx's " +
+      "3-tier install escalation: when all 3 attempts fail, it EXPLICITLY logs 'npm install incomplete — " +
+      "continuing with available packages' and proceeds anyway. The only post-install verification " +
+      "(action:'check-installed') only checked preScanPackages -- and app/api/chat/route.ts's pre-scan-" +
+      "imports deliberately SKIP_PKGS-excludes next/react/react-dom from that list (they're assumed to " +
+      "already be in package.json), so the CORE runtime packages were never re-verified after install, no " +
+      "matter how the install actually went. services/project-runner.ts's startDevServer then spawned `npm " +
+      "run dev` unconditionally, which crashed trying to resolve a bare `next` that node_modules/.bin never " +
+      "provided.",
+    filesAffected: ['app/builder/page.tsx', 'services/project-runner.ts', 'lib/server-start-diagnostics.ts'],
+    fixApplied:
+      "(1) app/builder/page.tsx: added an unconditional post-install check for next/react/react-dom " +
+      "specifically (independent of preScanPackages) — if missing, attempts one targeted `npm install " +
+      "--force` reinstall; if STILL missing afterward, halts and shows the real npm install output instead " +
+      "of proceeding to validate/start-server pretending dependencies are ready. (2) services/project-" +
+      "runner.ts: added a pre-flight check in attemptServerStart() that verifies node_modules/next/" +
+      "package.json exists BEFORE spawning `npm run dev` — if missing, returns an immediate, clear, " +
+      "actionable error instead of a doomed spawn attempt that crashes with a generic shell error. (3) " +
+      "startDevServer now detects this case (via the new looksLikeMissingDependency(), matching 'command " +
+      "not found'/'Cannot find module' patterns in a crash log) and automatically reinstalls + retries ONCE " +
+      "— a deterministic, mechanical fix, not an AI code-repair cycle, matching the same pattern already " +
+      "established for port conflicts. (4) lib/server-start-diagnostics.ts: added isMissingDependencyError(), " +
+      "wired into hasNoActionableCodeEvidence() — if the error persists after the internal reinstall retry, " +
+      "the builder's escalation logic correctly skips a doomed 'Advanced repair' cycle (editing source files " +
+      "cannot install an npm package).",
+    verificationPerformed: 'Added a real (non-mocked) integration test: a minimal fixture project with a correct package.json (next/react/react-dom listed) but NO node_modules at all — startDevServer() detects the missing dependency, runs a real npm install, and starts the server successfully, proving the exact reported scenario end-to-end without needing a slow/non-deterministic AI-driven build. Added 9 additional unit tests for looksLikeMissingDependency and isMissingDependencyError. Full suite (231 tests), typecheck, and both check-platform-deps checks all pass.',
+    regressionTest: "services/__tests__/project-runner.test.ts — 'startDevServer — pre-flight dependency check' describe block; lib/__tests__/server-start-diagnostics.test.ts — 'isMissingDependencyError' describe block",
+    dateFixed: '2026-07-07',
+    symptoms: ['next: command not found', 'sh: line 1: next: command not found', 'npm install incomplete — continuing with available packages', 'Advanced repair changed 0 files', 'package.json has correct deps but server still crashes'],
+  },
 ];
 
 /**
